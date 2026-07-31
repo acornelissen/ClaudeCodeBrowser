@@ -216,7 +216,7 @@ async function handleCommand(message) {
         result = await waitForElement(tabId, data);
         break;
       case "getTabs":
-        result = await getAllTabs();
+        result = await getAllTabs(data);
         break;
       case "createTab":
         result = await createNewTab(data);
@@ -568,37 +568,57 @@ async function waitForElement(tabId, data) {
 }
 
 // Tab management
-async function getAllTabs() {
+async function getAllTabs(options = {}) {
   try {
-    const tabs = await browser.tabs.query({});
+    // Default scope: the window Claude is actually driving, not every
+    // window/tab in the user's browser. With dozens of tabs open, querying
+    // {} and returning full metadata per tab blows past response size
+    // limits. Opt into the wider view explicitly when needed.
+    const currentWindowOnly = options.current_window_only !== false;
+    const includeFavicon = options.include_favicon === true;
+    const urlPattern = options.url_pattern ? new RegExp(options.url_pattern) : null;
+    const limit = Number.isInteger(options.limit) ? options.limit : 50;
+
+    const queryOpts = currentWindowOnly ? { currentWindow: true } : {};
+    let tabs = await browser.tabs.query(queryOpts);
     const windows = await browser.windows.getAll();
     const windowMap = new Map(windows.map(w => [w.id, w]));
 
+    const totalMatched = urlPattern ? tabs.filter(t => urlPattern.test(t.url)).length : tabs.length;
+    if (urlPattern) {
+      tabs = tabs.filter(t => urlPattern.test(t.url));
+    }
+
+    const truncated = tabs.length > limit;
+    const pageTabs = tabs.slice(0, limit);
+
     return {
       success: true,
-      tabs: tabs.map(t => {
+      tabs: pageTabs.map(t => {
         const win = windowMap.get(t.windowId);
-        return {
+        const base = {
           id: t.id,
           url: t.url,
           title: t.title,
           active: t.active,
           windowId: t.windowId,
-          index: t.index,
           pinned: t.pinned,
-          highlighted: t.highlighted,
           status: t.status,  // "loading" or "complete"
-          discarded: t.discarded,  // tab unloaded to save memory
-          incognito: t.incognito,
-          audible: t.audible,  // playing audio
-          mutedInfo: t.mutedInfo,
-          favIconUrl: t.favIconUrl,
-          windowFocused: win?.focused || false,
-          windowState: win?.state  // "normal", "minimized", "maximized", "fullscreen"
+          audible: t.audible  // playing audio
         };
+        if (includeFavicon) {
+          base.favIconUrl = t.favIconUrl;
+        }
+        if (!currentWindowOnly) {
+          base.windowFocused = win?.focused || false;
+        }
+        return base;
       }),
+      returnedTabs: pageTabs.length,
+      truncated,
+      scope: currentWindowOnly ? 'current_window' : 'all_windows',
       windowCount: windows.length,
-      totalTabs: tabs.length,
+      totalTabs: totalMatched,
       summary: {
         active: tabs.filter(t => t.active).length,
         loading: tabs.filter(t => t.status === 'loading').length,
