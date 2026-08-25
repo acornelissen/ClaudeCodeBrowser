@@ -117,7 +117,7 @@ OBSERVE_TOOLS = {
     'browser_get_console_logs', 'browser_get_network_logs',
     'browser_clear_logs', 'browser_highlight', 'browser_scroll',
     'browser_hover', 'browser_focus_tab', 'browser_safety_status',
-    'browser_request_approval', 'browser_audit_page',
+    'browser_request_approval', 'browser_audit_page', 'browser_solve_captcha',
 }
 
 # Tools that run arbitrary JavaScript in the page. Subject to the

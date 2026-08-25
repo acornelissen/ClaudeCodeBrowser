@@ -283,6 +283,28 @@ class HeadlessBrowser:
                     'error': 'No human is present in headless mode; use the '
                              'confirm_token flow for protected actions instead.'}
 
+        elif action == 'solveCaptcha':
+            # Detect what's there, but a captcha is by design a human check —
+            # headless mode has no human and this project does not auto-solve.
+            detection = await page.evaluate(_DETECT_CAPTCHA_JS)
+            if args.get('detect_only'):
+                return {'success': True, **detection}
+            widgets = detection.get('widgets', [])
+            tokened = [w for w in widgets if w.get('solved') is not None]
+            if tokened and all(w.get('solved') for w in tokened):
+                return {'success': True, 'present': True, 'solved': True,
+                        'widgets': widgets, 'message': 'Captcha already solved.'}
+            return {
+                'success': False,
+                'present': detection.get('present', False),
+                'widgets': detection.get('widgets', []),
+                'needs_human': True,
+                'error': ('A captcha requires a human to solve and none is present '
+                          'in headless mode. Re-run this step in attended mode '
+                          '(the Firefox extension) so the person can complete it.')
+                          if detection.get('present') else 'No captcha detected.'
+            }
+
         elif action == 'hover':
             selector = args.get('selector', '')
             await page.hover(selector)
@@ -428,6 +450,28 @@ class HeadlessBrowser:
 
         else:
             return {'success': False, 'error': f'Unsupported headless action: {action}'}
+
+
+# Captcha detection, mirroring the extension's content-script heuristics.
+_DETECT_CAPTCHA_JS = r"""
+(function() {
+  const widgets = [];
+  const tokened = (name) => {
+    const el = document.querySelector('textarea[name="'+name+'"], input[name="'+name+'"]');
+    return !!(el && el.value && el.value.length > 0);
+  };
+  if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], #g-recaptcha-response'))
+    widgets.push({type:'recaptcha', solved: tokened('g-recaptcha-response') || !!document.querySelector('.recaptcha-checkbox-checked')});
+  if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"], textarea[name="h-captcha-response"]'))
+    widgets.push({type:'hcaptcha', solved: tokened('h-captcha-response')});
+  if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]'))
+    widgets.push({type:'turnstile', solved: tokened('cf-turnstile-response')});
+  if (widgets.length === 0 &&
+      document.querySelector('img[src*="captcha" i], input[name*="captcha" i], [id*="captcha" i], [class*="captcha" i]'))
+    widgets.push({type:'generic', solved: null});
+  return {present: widgets.length > 0, widgets: widgets};
+})()
+"""
 
 
 # Module-level singleton

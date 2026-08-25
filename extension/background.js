@@ -258,6 +258,9 @@ async function handleCommand(message) {
       case "requestApproval":
         result = await requestApproval(tabId, data);
         break;
+      case "solveCaptcha":
+        result = await solveCaptcha(tabId, data);
+        break;
       // Element interaction and dynamic-content commands implemented by the
       // content script — forwarded as-is
       case "getValue":
@@ -443,6 +446,26 @@ async function requestApproval(tabId, data = {}) {
     // Notifications unavailable — the in-page banner still works
   }
   return sendToContentScript(tabId, { action: "requestApproval", ...data });
+}
+
+// Captcha handoff: notify the human (unless it's a detect-only probe), then
+// let the content script show the solve banner and wait for completion
+async function solveCaptcha(tabId, data = {}) {
+  if (!data.detectOnly) {
+    try {
+      if (browser.notifications) {
+        await browser.notifications.create({
+          type: "basic",
+          title: "Captcha needs solving",
+          message: "Claude paused on a captcha and needs you to solve it.",
+          iconUrl: browser.runtime.getURL("icons/icon-48.png")
+        });
+      }
+    } catch (e) {
+      // Notifications unavailable — the in-page banner still works
+    }
+  }
+  return sendToContentScript(tabId, { action: "solveCaptcha", ...data });
 }
 
 // History navigation (Back/Forward buttons)
