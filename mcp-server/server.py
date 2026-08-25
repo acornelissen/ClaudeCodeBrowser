@@ -833,7 +833,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.1.0',
+                'version': '1.2.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -1165,8 +1165,31 @@ def run_http_server():
     server.serve_forever()
 
 
-async def websocket_handler(websocket, path):
-    """Handle WebSocket connections from browser extensions."""
+async def websocket_handler(websocket, path=None):
+    """Handle WebSocket connections from browser extensions.
+
+    path is optional: websockets>=14 no longer passes it to handlers.
+
+    The first frame must be a JSON object carrying the API token; otherwise
+    any local process could register as the browser and receive automation
+    commands or forge responses.
+    """
+    try:
+        first_frame = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+        auth = json.loads(first_frame)
+        authorized = isinstance(auth, dict) and secrets.compare_digest(
+            str(auth.get('token', '')), API_TOKEN)
+    except Exception:
+        authorized = False
+
+    if not authorized:
+        logger.warning("WebSocket connection refused: missing or invalid token")
+        try:
+            await websocket.close(1008, 'auth required')
+        except Exception:
+            pass
+        return
+
     browser_id = f"browser_{id(websocket)}"
     connection_manager.register_browser(browser_id, websocket)
 
@@ -1230,7 +1253,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|           ClaudeCodeBrowser MCP Server v1.1.0                |
+|           ClaudeCodeBrowser MCP Server v1.2.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |

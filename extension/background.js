@@ -919,11 +919,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// Listen for external connections (from MCP server via HTTP)
+// Refuse external messages. Nothing legitimate uses this path — the MCP
+// server reaches the extension via native messaging and HTTP polling, never
+// runtime.sendMessage — and an open forward here would let any co-installed
+// extension run arbitrary commands (including executeScript on any tab),
+// bypassing the API token and the localhost boundary entirely.
 browser.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  handleCommand(message)
-    .then(sendResponse);
-  return true;
+  console.warn("[ClaudeCodeBrowser] Refused external message from", sender?.id);
+  sendResponse({ success: false, error: "External messages are not accepted" });
+  return false;
 });
 
 // Context menu for quick actions

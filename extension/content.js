@@ -73,9 +73,16 @@
     });
   }
 
+  // Interception availability: Firefox's content-script sandbox makes some
+  // page globals (notably window.fetch) read-only. A refused override must
+  // cost only that one capability, never abort this whole script — an
+  // aborted init means the message listener below never registers and every
+  // DOM tool fails with "Receiving end does not exist".
+  const interception = { fetch: false, xhr: false, console: false };
+
   // Network request interceptor (fetch)
   const originalFetch = window.fetch;
-  window.fetch = async function(...args) {
+  const fetchInterceptor = async function(...args) {
     const startTime = Date.now();
     const [resource, init] = args;
     const url = typeof resource === 'string' ? resource : resource.url;
@@ -137,11 +144,19 @@
     }
   };
 
+  try {
+    window.fetch = fetchInterceptor;
+    interception.fetch = true;
+  } catch (e) {
+    // "fetch" is read-only in Firefox's sandbox — network logging for fetch
+    // is unavailable, everything else keeps working
+  }
+
   // XHR interceptor
   const originalXHROpen = XMLHttpRequest.prototype.open;
   const originalXHRSend = XMLHttpRequest.prototype.send;
 
-  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+  const xhrOpenInterceptor = function(method, url, ...rest) {
     this._logData = {
       type: 'xhr',
       method: method,
@@ -151,7 +166,7 @@
     return originalXHROpen.apply(this, [method, url, ...rest]);
   };
 
-  XMLHttpRequest.prototype.send = function(body) {
+  const xhrSendInterceptor = function(body) {
     if (loggingEnabled && this._logData) {
       const startTime = Date.now();
       this._logData.startTime = new Date().toISOString();
@@ -180,8 +195,21 @@
     return originalXHRSend.apply(this, [body]);
   };
 
+  try {
+    XMLHttpRequest.prototype.open = xhrOpenInterceptor;
+    XMLHttpRequest.prototype.send = xhrSendInterceptor;
+    interception.xhr = true;
+  } catch (e) {
+    // XHR prototype not writable in this sandbox — skip XHR logging
+  }
+
   // Initialize console interception (always intercepts, but only logs when enabled)
-  interceptConsole();
+  try {
+    interceptConsole();
+    interception.console = true;
+  } catch (e) {
+    // console not writable in this sandbox — skip console logging
+  }
 
   // Logging control functions
   function startLogging(options = {}) {
@@ -233,7 +261,8 @@
       logs: logs,
       totalCount: consoleLogs.length,
       returnedCount: logs.length,
-      loggingEnabled: loggingEnabled
+      loggingEnabled: loggingEnabled,
+      interceptionAvailable: interception.console
     };
   }
 
@@ -272,7 +301,9 @@
       logs: logs,
       totalCount: networkLogs.length,
       returnedCount: logs.length,
-      loggingEnabled: loggingEnabled
+      loggingEnabled: loggingEnabled,
+      interceptionAvailable: interception.fetch || interception.xhr,
+      interception: { fetch: interception.fetch, xhr: interception.xhr }
     };
   }
 

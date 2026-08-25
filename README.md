@@ -1,9 +1,13 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
+[![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
+[![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#installation)
 
-A Firefox browser automation system for Claude Code that enables AI-powered interaction with web pages. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers.
+A browser automation system for Claude Code that enables AI-powered interaction with web pages — with **built-in safety guards for humans**. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers. Drive your real Firefox through the extension, or run fully headless (Firefox, Chromium, or WebKit) via Playwright.
 
 **Author:** Andre Watson ([@nanogenomic](https://github.com/nanogenomic)) - dre@ligandal.com
 **Organization:** [Ligandal Inc.](https://ligandal.com)
@@ -19,7 +23,20 @@ A Firefox browser automation system for Claude Code that enables AI-powered inte
 - **Page Refresh** - Force refresh tabs after server restarts (bypass cache)
 - **Element Inspection** - Find elements, get page info, highlight elements
 - **JavaScript Execution** - Run arbitrary JS in browser context
+- **Console & Network Logging** - Capture console output and fetch/XHR traffic for debugging
+- **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, audit log ([details](#safety-guards))
+- **Headless Mode** - Unattended automation via Playwright: Firefox, Chromium, or WebKit
 - **MCP Integration** - Model Context Protocol server for Claude Code
+
+## Browser Support
+
+| Browser | Attended (extension) | Headless (Playwright) |
+|---------|---------------------|----------------------|
+| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSER_ENGINE=firefox` (default) |
+| Chromium / Chrome | 🧪 Experimental build via `scripts/build-chrome.sh` (MV3) | ✅ `CLAUDE_BROWSER_ENGINE=chromium` |
+| WebKit (Safari engine) | — | ✅ `CLAUDE_BROWSER_ENGINE=webkit` |
+
+Attended mode drives your real browser with your logged-in sessions. Headless mode launches a fresh, isolated browser — best for CI, servers, and unattended tasks. See [Headless Mode](#headless-mode).
 
 ## Overview
 
@@ -47,30 +64,17 @@ ClaudeCodeBrowser uses a **dual-server architecture** for maximum reliability an
 
 ### Communication Flow
 
-```
-┌─────────────────┐     ┌─────────────────────────────────┐
-│   Claude Code   │────▶│        MCP Server               │
-│   (MCP Client)  │     │  ┌─────────┐  ┌──────────────┐ │
-└─────────────────┘     │  │HTTP:8765│  │WebSocket:8766│ │
-                        │  └────┬────┘  └──────────────┘ │
-                        └───────┼────────────────────────┘
-                                │
-                                ▼
-                        ┌───────────────┐
-                        │ Command Queue │◀───────polling────┐
-                        │  (In-Memory)  │                   │
-                        └───────┬───────┘                   │
-                                │                           │
-                                ▼                           │
-                        ┌───────────────┐          ┌────────┴────────┐
-                        │ Native Host   │◀────────▶│Firefox Extension│
-                        │   (stdio)     │          │(Background + CS)│
-                        └───────────────┘          └────────┬────────┘
-                                                            │
-                                                            ▼
-                                                   ┌─────────────────┐
-                                                   │   Web Page      │
-                                                   └─────────────────┘
+```mermaid
+flowchart TB
+    CC["Claude Code<br/>(MCP client)"] -->|"stdio (MCP)"| SW["stdio_wrapper.py"]
+    SW -->|"HTTP + X-API-Key"| SRV["MCP Server<br/>HTTP :8765 / WebSocket :8766"]
+    SRV --> GUARD{{"Safety Guard<br/>URL rules · confirm tokens · rate limit · audit log"}}
+    GUARD -->|attended| QUEUE["Command queue<br/>(in-memory)"]
+    GUARD -->|"headless mode"| PW["Playwright<br/>Firefox / Chromium / WebKit"]
+    QUEUE <-->|"500ms polling"| NH["Native Host<br/>(stdio)"]
+    NH <--> EXT["Firefox Extension<br/>(background + content scripts)"]
+    EXT --> PAGE["Web Page"]
+    PW --> PAGE2["Web Page (headless)"]
 ```
 
 ### Request Flow (Step by Step)
@@ -160,6 +164,19 @@ The install script handles these automatically, but if you are installing manual
 
 ### Windows Installation
 
+**Quick install (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+This copies the components to `%USERPROFILE%\.claudecodebrowser`, generates the
+`.bat` native-host wrapper with your Python path baked in, writes the native
+messaging manifest, and registers it in the Windows registry. Then load the
+extension (step 1 below) and add the printed MCP config to Claude Code.
+
+**Manual steps:**
+
 1. **Install the Firefox extension:**
    - Open Firefox and go to `about:debugging`
    - Click "This Firefox"
@@ -208,6 +225,41 @@ python3 ~/.claudecodebrowser/mcp-server/stdio_wrapper.py
 The server runs on:
 - HTTP: http://127.0.0.1:8765
 - WebSocket: ws://127.0.0.1:8766
+
+### Headless Mode
+
+Run without any visible browser — ideal for CI, servers, and unattended tasks:
+
+```bash
+pip install playwright
+playwright install firefox        # or: chromium / webkit
+
+CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+Pick the engine with `CLAUDE_BROWSER_ENGINE`:
+
+```bash
+CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSER_ENGINE=webkit   CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+To use a browser you already have (a system install, or a Playwright build at
+a different revision) instead of running `playwright install`, point
+`CLAUDE_BROWSER_EXECUTABLE` at the binary:
+
+```bash
+CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_EXECUTABLE=/usr/bin/chromium \
+  CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+Headless mode supports the core toolset (navigate, screenshot, click, type,
+scroll, element queries, script execution, eval chains, waiting, history,
+keyboard, text extraction) with real multi-tab management — `browser_create_tab`
+returns a `tabId` usable with `tab_id` on every other tool. The same safety
+guards apply. Startup takes ~15 seconds; the server holds the first command
+until the browser is ready (tunable via
+`CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT`, default 45s).
 
 ### Using the Browser Agent
 
@@ -631,7 +683,11 @@ claude mcp remove claudecodebrowser
 - The server only binds to localhost (127.0.0.1) by default
 - All HTTP endpoints except `/health` require the `X-API-Key` token
   (auto-generated at `~/.claudecodebrowser/api_token`, mode 0600)
+- The WebSocket control channel requires the same token as its first frame,
+  so no other local process can register as the browser or forge responses
 - No CORS headers are sent, so web pages cannot reach the API from the browser
+- The extension refuses `runtime.onMessageExternal` messages, so co-installed
+  extensions cannot issue automation commands through it
 - Native messaging is restricted to the specific extension ID
 - A configurable safety guard (see [Safety Guards](#safety-guards)) enforces
   URL restrictions, protected-site confirmation, read-only mode, rate
