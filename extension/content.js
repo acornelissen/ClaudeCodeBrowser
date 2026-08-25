@@ -73,9 +73,16 @@
     });
   }
 
+  // Interception availability: Firefox's content-script sandbox makes some
+  // page globals (notably window.fetch) read-only. A refused override must
+  // cost only that one capability, never abort this whole script — an
+  // aborted init means the message listener below never registers and every
+  // DOM tool fails with "Receiving end does not exist".
+  const interception = { fetch: false, xhr: false, console: false };
+
   // Network request interceptor (fetch)
   const originalFetch = window.fetch;
-  window.fetch = async function(...args) {
+  const fetchInterceptor = async function(...args) {
     const startTime = Date.now();
     const [resource, init] = args;
     const url = typeof resource === 'string' ? resource : resource.url;
@@ -137,11 +144,19 @@
     }
   };
 
+  try {
+    window.fetch = fetchInterceptor;
+    interception.fetch = true;
+  } catch (e) {
+    // "fetch" is read-only in Firefox's sandbox — network logging for fetch
+    // is unavailable, everything else keeps working
+  }
+
   // XHR interceptor
   const originalXHROpen = XMLHttpRequest.prototype.open;
   const originalXHRSend = XMLHttpRequest.prototype.send;
 
-  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+  const xhrOpenInterceptor = function(method, url, ...rest) {
     this._logData = {
       type: 'xhr',
       method: method,
@@ -151,7 +166,7 @@
     return originalXHROpen.apply(this, [method, url, ...rest]);
   };
 
-  XMLHttpRequest.prototype.send = function(body) {
+  const xhrSendInterceptor = function(body) {
     if (loggingEnabled && this._logData) {
       const startTime = Date.now();
       this._logData.startTime = new Date().toISOString();
@@ -180,8 +195,21 @@
     return originalXHRSend.apply(this, [body]);
   };
 
+  try {
+    XMLHttpRequest.prototype.open = xhrOpenInterceptor;
+    XMLHttpRequest.prototype.send = xhrSendInterceptor;
+    interception.xhr = true;
+  } catch (e) {
+    // XHR prototype not writable in this sandbox — skip XHR logging
+  }
+
   // Initialize console interception (always intercepts, but only logs when enabled)
-  interceptConsole();
+  try {
+    interceptConsole();
+    interception.console = true;
+  } catch (e) {
+    // console not writable in this sandbox — skip console logging
+  }
 
   // Logging control functions
   function startLogging(options = {}) {
@@ -233,7 +261,8 @@
       logs: logs,
       totalCount: consoleLogs.length,
       returnedCount: logs.length,
-      loggingEnabled: loggingEnabled
+      loggingEnabled: loggingEnabled,
+      interceptionAvailable: interception.console
     };
   }
 
@@ -272,7 +301,9 @@
       logs: logs,
       totalCount: networkLogs.length,
       returnedCount: logs.length,
-      loggingEnabled: loggingEnabled
+      loggingEnabled: loggingEnabled,
+      interceptionAvailable: interception.fetch || interception.xhr,
+      interception: { fetch: interception.fetch, xhr: interception.xhr }
     };
   }
 
@@ -343,6 +374,12 @@
         return selectOption(message);
       case "getComputedStyles":
         return getComputedStyles(message);
+      case "pressKey":
+        return pressKey(message);
+      case "getText":
+        return getText(message);
+      case "requestApproval":
+        return requestApproval(message);
       case "getBoundingRect":
         return getBoundingRect(message);
       // Console and network logging actions
@@ -359,6 +396,89 @@
       default:
         throw new Error(`Unknown action: ${message.action}`);
     }
+  }
+
+  // Credential guard: typing into password fields is refused unless the
+  // safety config explicitly allows it. Credentials belong in the browser's
+  // own password manager (autofill), so they never pass through the AI.
+  function assertNotPasswordField(element, options) {
+    const isPassword = element.tagName === 'INPUT' &&
+      (element.type === 'password' ||
+       element.getAttribute('autocomplete') === 'current-password' ||
+       element.getAttribute('autocomplete') === 'new-password');
+    if (isPassword && options.allowPassword !== true) {
+      throw new Error(
+        'Refused: target is a password field. Use the browser’s own ' +
+        'password manager (autofill) for credentials, or set ' +
+        '"allow_password_typing": true in ~/.claudecodebrowser/safety.json ' +
+        'if you really want automated password entry.'
+      );
+    }
+  }
+
+  // Human approval banner: Approve/Deny prompt rendered on the page,
+  // resolved by a real click from the person at the browser
+  function requestApproval(options) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('__ccb_approval_banner');
+      if (existing) existing.remove();
+
+      const banner = document.createElement('div');
+      banner.id = '__ccb_approval_banner';
+      banner.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+        'background:#1a1a2e', 'color:#fff', 'padding:14px 20px',
+        'font:14px/1.5 system-ui,sans-serif', 'display:flex',
+        'align-items:center', 'gap:16px', 'box-shadow:0 2px 12px rgba(0,0,0,.4)',
+        'border-bottom:3px solid #e94560'
+      ].join(';');
+
+      const textWrap = document.createElement('div');
+      textWrap.style.cssText = 'flex:1;min-width:0';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600';
+      title.textContent = '⚠️ Claude requests approval: ' + (options.message || 'Perform an action');
+      textWrap.appendChild(title);
+      if (options.detail) {
+        const detail = document.createElement('div');
+        detail.style.cssText = 'font-size:12px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        detail.textContent = options.detail;
+        textWrap.appendChild(detail);
+      }
+
+      function makeButton(label, bg) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'padding:8px 18px;border:none;border-radius:6px;cursor:pointer;' +
+          'font:600 13px system-ui,sans-serif;color:#fff;background:' + bg;
+        return b;
+      }
+      const approveBtn = makeButton('Approve', '#16a34a');
+      const denyBtn = makeButton('Deny', '#dc2626');
+
+      banner.appendChild(textWrap);
+      banner.appendChild(approveBtn);
+      banner.appendChild(denyBtn);
+      (document.body || document.documentElement).appendChild(banner);
+
+      const timeoutMs = options.timeout || 60000;
+      let settled = false;
+      function finish(approved, timedOut) {
+        if (settled) return;
+        settled = true;
+        banner.remove();
+        resolve({
+          success: true,
+          approved: approved,
+          timedOut: !!timedOut,
+          decidedAt: new Date().toISOString()
+        });
+      }
+
+      approveBtn.addEventListener('click', () => finish(true, false));
+      denyBtn.addEventListener('click', () => finish(false, false));
+      setTimeout(() => finish(false, true), timeoutMs);
+    });
   }
 
   // Find element by various selectors
@@ -488,6 +608,8 @@
     if (!element) {
       throw new Error(`Element not found with options: ${JSON.stringify(options)}`);
     }
+
+    assertNotPasswordField(element, options);
 
     // Focus the element
     element.focus();
@@ -1240,6 +1362,8 @@
     const element = findElement(options);
     if (!element) throw new Error('Element not found');
 
+    assertNotPasswordField(element, options);
+
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
       element.value = options.value;
     } else if (element.tagName === 'SELECT') {
@@ -1293,6 +1417,63 @@
     element.dispatchEvent(mouseOver);
 
     return { hovered: true, element: getElementInfo(element) };
+  }
+
+  // Press a keyboard key with optional modifiers
+  async function pressKey(options) {
+    let target = document.activeElement || document.body;
+    if (options.selector) {
+      const element = findElement(options);
+      if (!element) throw new Error('Element not found');
+      element.focus();
+      target = element;
+    }
+
+    const eventInit = {
+      key: options.key,
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: !!options.ctrl,
+      shiftKey: !!options.shift,
+      altKey: !!options.alt,
+      metaKey: !!options.meta
+    };
+
+    target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+
+    // Synthetic key events don't trigger default actions, so emulate the
+    // common one: Enter inside a form submits it
+    if (options.key === 'Enter' && !options.ctrl && !options.shift && target.form) {
+      if (target.form.requestSubmit) {
+        target.form.requestSubmit();
+      } else {
+        target.form.submit();
+      }
+    }
+
+    return { pressed: options.key, element: getElementInfo(target) };
+  }
+
+  // Extract visible text from the page or an element
+  function getText(options) {
+    let element = document.body;
+    if (options.selector) {
+      element = findElement(options);
+      if (!element) throw new Error('Element not found');
+    }
+
+    const maxLength = options.maxLength || 20000;
+    const text = element.innerText || element.textContent || '';
+
+    return {
+      text: text.slice(0, maxLength),
+      truncated: text.length > maxLength,
+      totalLength: text.length,
+      url: window.location.href,
+      title: document.title
+    };
   }
 
   // Select option

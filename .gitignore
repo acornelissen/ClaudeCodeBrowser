@@ -2,6 +2,9 @@
 *.xpi
 *.zip
 
+# Build output (e.g. scripts/build-chrome.sh)
+build/
+
 # Logs
 *.log
 logs/

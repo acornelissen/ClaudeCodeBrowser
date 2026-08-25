@@ -66,6 +66,18 @@ logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
 # Headless mode: CLAUDE_BROWSER_HEADLESS=1 or --headless flag
 HEADLESS_MODE = os.environ.get('CLAUDE_BROWSER_HEADLESS', '0') == '1' or '--headless' in sys.argv
 
+# The asyncio event loop owned by the main thread (started via asyncio.run in
+# main()). Published so ThreadingHTTPServer worker threads can dispatch onto it
+# with run_coroutine_threadsafe: asyncio.get_event_loop() raises in threads
+# without a loop on Python 3.12+ (see issue #9).
+MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+# How long a command waits for Playwright Firefox to finish booting before
+# giving up. Launching takes ~15s while the HTTP port binds immediately.
+HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
+
+from safety import get_safety_guard
+
 # API token for localhost HTTP authentication
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
@@ -97,6 +109,20 @@ WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 DEFAULT_SCREENSHOTS_DIR = Path('/tmp/claudecodebrowser/screenshots')
 SCREENSHOTS_DIR = Path(os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR', str(DEFAULT_SCREENSHOTS_DIR)))
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def camelize_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert snake_case MCP argument keys to the camelCase the extension reads.
+
+    The MCP tool schemas use snake_case (full_page, url_pattern, bypass_cache)
+    but background.js/content.js read camelCase (fullPage, urlPattern,
+    bypassCache). The headless Playwright backend keeps the original
+    snake_case arguments.
+    """
+    def camel(key: str) -> str:
+        head, *rest = key.split('_')
+        return head + ''.join(part.title() for part in rest)
+    return {camel(k): v for k, v in arguments.items()}
 
 
 @dataclass
@@ -628,6 +654,126 @@ MCP_TOOLS: List[MCPTool] = [
             }
         }
     ),
+    # Navigation history
+    MCPTool(
+        name="browser_go_back",
+        description="Navigate back in the tab's history (like the browser Back button).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_go_forward",
+        description="Navigate forward in the tab's history (like the browser Forward button).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_press_key",
+        description="Press a keyboard key (with optional modifiers) on the focused element or a specific element. Useful for Enter, Escape, Tab, arrow keys, and shortcuts.",
+        input_schema={
+            "type": "object",
+            "required": ["key"],
+            "properties": {
+                "key": {"type": "string", "description": "Key to press, e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown', 'a'."},
+                "selector": {"type": "string", "description": "Optional CSS selector of element to focus first."},
+                "ctrl": {"type": "boolean", "description": "Hold Ctrl.", "default": False},
+                "shift": {"type": "boolean", "description": "Hold Shift.", "default": False},
+                "alt": {"type": "boolean", "description": "Hold Alt.", "default": False},
+                "meta": {"type": "boolean", "description": "Hold Meta/Cmd.", "default": False},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_get_text",
+        description="Extract the visible text content of the page or a specific element. Lighter-weight than a screenshot for reading page content.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "Optional CSS selector; defaults to the whole page body."},
+                "max_length": {"type": "integer", "description": "Truncate the returned text to this many characters.", "default": 20000},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    # Human approval, workflows, and page auditing
+    MCPTool(
+        name="browser_request_approval",
+        description="Ask the human at the browser to approve or deny an action. Shows an Approve/Deny banner on the current page plus an OS notification, and waits for their decision. Use before doing anything the user might want to veto. Unavailable in headless mode (no human present).",
+        input_schema={
+            "type": "object",
+            "required": ["message"],
+            "properties": {
+                "message": {"type": "string", "description": "What you are asking permission to do, in plain language."},
+                "detail": {"type": "string", "description": "Optional extra context shown in smaller text."},
+                "timeout": {"type": "integer", "description": "How long to wait for a decision in ms.", "default": 60000},
+                "tab_id": {"type": "integer", "description": "Optional tab ID to show the banner in."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_run_workflow",
+        description="Run a declarative multi-step browser workflow with per-step assertions — an end-to-end test runner for web apps. Each step calls a browser tool; optional assertions check the page afterwards (url_contains, text_contains, selector_exists). Failing steps capture a screenshot. Returns pass/fail per step.",
+        input_schema={
+            "type": "object",
+            "required": ["steps"],
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered workflow steps.",
+                    "items": {
+                        "type": "object",
+                        "required": ["tool"],
+                        "properties": {
+                            "label": {"type": "string", "description": "Human-readable step name."},
+                            "tool": {"type": "string", "description": "Browser tool to call, e.g. browser_navigate, browser_click, browser_type."},
+                            "arguments": {"type": "object", "description": "Arguments for the tool."},
+                            "assert": {
+                                "type": "object",
+                                "description": "Checks to run after the step succeeds.",
+                                "properties": {
+                                    "url_contains": {"type": "string", "description": "Current URL must contain this substring."},
+                                    "text_contains": {"type": "string", "description": "Visible page text must contain this substring."},
+                                    "selector_exists": {"type": "string", "description": "This CSS selector must match at least one element."}
+                                }
+                            }
+                        }
+                    }
+                },
+                "stop_on_failure": {"type": "boolean", "description": "Stop at the first failing step.", "default": True},
+                "screenshot_on_failure": {"type": "boolean", "description": "Capture a screenshot when a step fails.", "default": True}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_audit_page",
+        description="Audit the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. One call gathers everything needed to critique a page's structure and accessibility basics.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "screenshot": {"type": "boolean", "description": "Also capture a screenshot.", "default": True},
+                "full_page": {"type": "boolean", "description": "Make the screenshot full-page.", "default": False},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    # Safety
+    MCPTool(
+        name="browser_safety_status",
+        description="Show the active safety guard policy: read-only mode, script toggle, protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
+        input_schema={
+            "type": "object",
+            "properties": {}
+        }
+    ),
     MCPTool(
         name="browser_inject_observer",
         description=(
@@ -674,7 +820,8 @@ class BrowserConnectionManager:
             return list(self.browser_connections.values())[0]
         return None
 
-    async def send_command(self, command: BrowserCommand) -> Dict[str, Any]:
+    async def send_command(self, command: BrowserCommand,
+                           timeout: float = 30.0) -> Dict[str, Any]:
         """Send a command to the browser and wait for response."""
         browser = self.get_active_browser()
         if not browser:
@@ -690,7 +837,7 @@ class BrowserConnectionManager:
 
         try:
             await browser.send(json.dumps(asdict(command)))
-            result = await asyncio.wait_for(future, timeout=30.0)
+            result = await asyncio.wait_for(future, timeout=timeout)
             return result
         except asyncio.TimeoutError:
             return {"success": False, "error": "Command timed out"}
@@ -748,7 +895,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.0.0',
+                'version': '1.3.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -845,6 +992,43 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         log_args = {k: ('***' if k in _SENSITIVE else v) for k, v in arguments.items()}
         logger.info(f"Executing tool: {tool_name} with args: {log_args}")
 
+        # Safety guard: scheme/blocklist checks, read-only mode, script toggle,
+        # protected-domain confirmation, rate limiting, audit logging.
+        guard = get_safety_guard()
+        denial = guard.check(tool_name, arguments)
+
+        # Duo-style human approval: when a protected action needs confirmation
+        # and a human is (potentially) at the browser, ask them directly with
+        # an in-page Approve/Deny banner instead of bouncing a token back
+        # through the agent. Headless mode has no human, so it keeps the
+        # token flow.
+        if (denial is not None and denial.get('confirmation_required')
+                and denial.get('approval_mode', 'auto') in ('auto', 'human')
+                and not HEADLESS_MODE):
+            approval = self._request_human_approval(tool_name, arguments, denial)
+            if approval.get('success') and approval.get('approved'):
+                denial = guard.check(tool_name, dict(arguments), human_approved=True)
+            elif approval.get('success') and approval.get('approved') is False:
+                return {'success': False,
+                        'safety_decision': 'human_denied',
+                        'error': f'The user denied {tool_name} via the in-browser '
+                                 f'approval prompt. Do not retry without asking them why.'}
+            # Approval prompt could not be delivered (no browser connected,
+            # timeout): fall through and return the token-based denial so the
+            # agent can still use the confirm_token flow.
+
+        if denial is not None:
+            logger.warning(f"Safety guard blocked {tool_name}: {denial.get('safety_decision')}")
+            return denial
+
+        # Handled entirely server-side, no browser round-trip needed.
+        if tool_name == 'browser_safety_status':
+            return guard.status()
+        if tool_name == 'browser_run_workflow':
+            return self._run_workflow(arguments)
+        if tool_name == 'browser_audit_page':
+            return self._audit_page(arguments)
+
         # Map tool names to actions
         tool_action_map = {
             'browser_screenshot': 'screenshot',
@@ -888,7 +1072,14 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             # Multi-turn / conditional execution
             'browser_eval_chain': 'evalChain',
             'browser_wait_and_act': 'waitAndAct',
-            'browser_inject_observer': 'injectObserver'
+            'browser_inject_observer': 'injectObserver',
+            # Navigation history and keyboard/text
+            'browser_go_back': 'goBack',
+            'browser_go_forward': 'goForward',
+            'browser_press_key': 'pressKey',
+            'browser_get_text': 'getText',
+            # Human approval
+            'browser_request_approval': 'requestApproval'
         }
 
         if tool_name not in tool_action_map:
@@ -896,6 +1087,26 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
         action = tool_action_map[tool_name]
         tab_id = arguments.pop('tab_id', None)
+
+        # Password guard: typing into <input type="password"> is refused by the
+        # browser side unless the safety config explicitly allows it. The flag
+        # travels with the command so the enforcement happens where the element
+        # type is visible.
+        if tool_name in ('browser_type', 'browser_set_value'):
+            arguments['allow_password'] = bool(
+                get_safety_guard().config.get('allow_password_typing', False))
+
+        return self._dispatch_action(action, tab_id, arguments)
+
+    def _dispatch_action(self, action: str, tab_id: Optional[int],
+                         arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Send a browser action over whichever transport is available
+        (WebSocket, headless Playwright, or native-host HTTP polling)."""
+        guard = get_safety_guard()
+
+        # Approval prompts wait on a human decision (60s by default), so give
+        # the transport more headroom than the usual command timeout.
+        wait_timeout = 90.0 if action == 'requestApproval' else 30.0
 
         # Check if we have a browser connection via WebSocket
         browser = connection_manager.get_active_browser()
@@ -905,50 +1116,69 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             command = BrowserCommand(
                 action=action,
                 tab_id=tab_id,
-                data=arguments
+                data=camelize_args(arguments)
             )
 
-            # Run async command in event loop
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're in a sync context, need to handle differently
+            # We run in a ThreadingHTTPServer worker thread, which owns no
+            # event loop (asyncio.get_event_loop() raises here on Python
+            # 3.12+), so hand the coroutine to the main thread's loop.
+            loop = MAIN_EVENT_LOOP
+            if loop is not None and loop.is_running():
+                try:
                     future = asyncio.run_coroutine_threadsafe(
-                        connection_manager.send_command(command),
+                        connection_manager.send_command(command, timeout=wait_timeout),
                         loop
                     )
-                    result = future.result(timeout=30)
-                else:
-                    result = loop.run_until_complete(connection_manager.send_command(command))
+                    result = future.result(timeout=wait_timeout + 5)
 
-                # Handle screenshot saving
-                if action == 'screenshot' and result.get('success') and result.get('data'):
-                    return self._save_screenshot(result, arguments)
+                    # Handle screenshot saving
+                    if action == 'screenshot' and result.get('success') and result.get('data'):
+                        return self._save_screenshot(result, arguments)
 
-                return result
-            except Exception as e:
-                logger.error(f"WebSocket command failed: {e}")
-                # Fall through to HTTP method
+                    guard.note_url(result)
+                    return result
+                except Exception as e:
+                    logger.error(f"WebSocket command failed: {e}")
+                    # Fall through to HTTP method
+            else:
+                logger.warning("WebSocket browser registered but no event loop running; "
+                               "falling back to HTTP polling")
 
         # Try headless Playwright backend if enabled and available
         if HEADLESS_MODE:
             from headless_backend import get_headless_browser
+            # Launching Playwright Firefox takes ~15s, but the HTTP server
+            # accepts requests as soon as the port binds. Rather than failing
+            # the first call of a session, wait for the browser to boot.
+            deadline = time.monotonic() + HEADLESS_STARTUP_TIMEOUT
             headless = get_headless_browser()
-            if headless:
-                loop = asyncio.get_event_loop()
-                try:
-                    if loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(
-                            headless.execute(action, tab_id, arguments), loop
-                        )
-                        return future.result(timeout=35)
-                    else:
-                        return loop.run_until_complete(headless.execute(action, tab_id, arguments))
-                except Exception as e:
-                    logger.error(f"Headless backend failed: {e}")
-                    return {'success': False, 'error': f'Headless execution failed: {e}'}
-            else:
-                return {'success': False, 'error': 'Headless mode enabled but browser not started yet. Wait a moment and retry.'}
+            while time.monotonic() < deadline:
+                if (MAIN_EVENT_LOOP is not None and MAIN_EVENT_LOOP.is_running()
+                        and headless is not None and headless.is_ready()):
+                    break
+                time.sleep(0.5)
+                headless = get_headless_browser()
+
+            if headless is None or not headless.is_ready():
+                return {'success': False,
+                        'error': f'Headless browser did not start within '
+                                 f'{HEADLESS_STARTUP_TIMEOUT:.0f}s. Check the server log.'}
+            # Worker threads own no event loop; dispatch onto the loop started
+            # by run_with_headless() in the main thread (issue #9).
+            loop = MAIN_EVENT_LOOP
+            if loop is None or not loop.is_running():
+                return {'success': False,
+                        'error': 'Headless event loop not running yet. Wait a moment and retry.'}
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    headless.execute(action, tab_id, arguments), loop
+                )
+                result = future.result(timeout=35)
+                guard.note_url(result)
+                return result
+            except Exception as e:
+                logger.error(f"Headless backend failed: {e}")
+                return {'success': False, 'error': f'Headless execution failed: {e}'}
 
         # No WebSocket connection — use HTTP polling with the native host.
         # ThreadingHTTPServer ensures /browser/poll and /browser/response are
@@ -957,7 +1187,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         command_data = {
             'action': action,
             'tabId': tab_id,
-            'data': arguments,
+            'data': camelize_args(arguments),
             'requestId': request_id
         }
 
@@ -971,20 +1201,196 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
         logger.info(f"Queued command {action} (requestId={request_id}), waiting for browser response...")
 
-        if event.wait(timeout=30.0):
+        if event.wait(timeout=wait_timeout):
             connection_manager.http_pending_requests.pop(request_id, None)
             response = result_holder.get('response', {})
             if action == 'screenshot' and response.get('success') and response.get('data'):
                 return self._save_screenshot(response, arguments)
+            guard.note_url(response)
             return response
         else:
             connection_manager.http_pending_requests.pop(request_id, None)
-            logger.warning(f"Command {action} timed out after 30s")
+            logger.warning(f"Command {action} timed out after {wait_timeout:.0f}s")
             return {
                 'success': False,
-                'error': f'Command {action} timed out waiting for browser response after 30s',
+                'error': f'Command {action} timed out waiting for browser response after {wait_timeout:.0f}s',
                 'action': action
             }
+
+    def _request_human_approval(self, tool_name: str, arguments: Dict[str, Any],
+                                denial: Dict[str, Any]) -> Dict[str, Any]:
+        """Show the in-browser Approve/Deny prompt for a protected action."""
+        _SENSITIVE = {'text', 'script', 'value', 'password'}
+        shown_args = {k: ('***' if k in _SENSITIVE else v) for k, v in arguments.items()
+                      if k != 'tab_id'}
+        try:
+            return self._dispatch_action('requestApproval', None, {
+                'message': f"Claude wants to run {tool_name} on a protected site "
+                           f"({denial.get('protected_url', 'unknown URL')}).",
+                'detail': json.dumps(shown_args)[:500],
+                'timeout': 60000
+            })
+        except Exception as e:
+            logger.warning(f"Human approval request failed: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _run_workflow(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a declarative list of tool steps with assertions."""
+        import re as _re
+        steps = arguments.get('steps') or []
+        stop_on_failure = arguments.get('stop_on_failure', True)
+        screenshot_on_failure = arguments.get('screenshot_on_failure', True)
+        known_tools = {t.name for t in MCP_TOOLS}
+
+        results = []
+        passed = 0
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                results.append({'label': f'step_{i+1}', 'success': False,
+                                'error': 'Step must be an object'})
+                break
+            label = step.get('label') or f'step_{i+1}'
+            tool = step.get('tool')
+            entry = {'label': label, 'tool': tool}
+
+            if tool not in known_tools or tool == 'browser_run_workflow':
+                entry['success'] = False
+                entry['error'] = f'Unknown or disallowed tool: {tool}'
+            else:
+                # Each step goes through execute_tool, so the safety guard
+                # applies per step exactly as it would for a direct call.
+                result = self.execute_tool(tool, dict(step.get('arguments') or {}))
+                entry['success'] = bool(result.get('success'))
+                entry['result'] = {k: v for k, v in result.items() if k != 'data'}
+
+                assertion = step.get('assert') or {}
+                if entry['success'] and assertion:
+                    failures = self._check_assertions(assertion)
+                    entry['assertions'] = {'passed': not failures, 'failures': failures}
+                    if failures:
+                        entry['success'] = False
+                        entry['error'] = 'Assertions failed: ' + '; '.join(failures)
+
+            if entry['success']:
+                passed += 1
+            elif screenshot_on_failure:
+                safe_label = _re.sub(r'[^A-Za-z0-9_-]', '_', label)[:40]
+                shot = self.execute_tool('browser_screenshot',
+                                         {'filename': f'workflow_fail_{safe_label}.png'})
+                if shot.get('filepath'):
+                    entry['failure_screenshot'] = shot['filepath']
+
+            results.append(entry)
+            if not entry['success'] and stop_on_failure:
+                break
+
+        return {
+            'success': passed == len(steps),
+            'passed': passed,
+            'failed': len(results) - passed,
+            'total_steps': len(steps),
+            'executed_steps': len(results),
+            'steps': results
+        }
+
+    def _check_assertions(self, assertion: Dict[str, Any]) -> List[str]:
+        """Evaluate a step's assertions against the live page; return failures."""
+        failures = []
+
+        url_contains = assertion.get('url_contains')
+        if url_contains:
+            info = self.execute_tool('browser_get_page_info', {})
+            url = info.get('url', '') if info.get('success') else ''
+            if url_contains not in url:
+                failures.append(f"url_contains {url_contains!r} (actual URL: {url!r})")
+
+        text_contains = assertion.get('text_contains')
+        if text_contains:
+            text_result = self.execute_tool('browser_get_text', {'max_length': 100000})
+            text = text_result.get('text', '') if text_result.get('success') else ''
+            if text_contains not in text:
+                failures.append(f"text_contains {text_contains!r} not found on page")
+
+        selector_exists = assertion.get('selector_exists')
+        if selector_exists:
+            el_result = self.execute_tool('browser_get_elements',
+                                          {'selector': selector_exists, 'limit': 1})
+            elements = el_result.get('elements') or []
+            if not (el_result.get('success') and len(elements) > 0):
+                failures.append(f"selector_exists {selector_exists!r} matched nothing")
+
+        return failures
+
+    # Structural/accessibility audit collected in one page pass. Kept to
+    # read-only DOM inspection — the audit tool is classified as observation.
+    _AUDIT_JS = r"""
+(function() {
+  const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+    .slice(0, 60).map(h => ({level: h.tagName, text: (h.innerText || '').trim().slice(0, 120)}));
+  const images = Array.from(document.querySelectorAll('img'));
+  const imagesMissingAlt = images.filter(i => !i.hasAttribute('alt'))
+    .slice(0, 30).map(i => (i.currentSrc || i.src || '').slice(0, 200));
+  const inputs = Array.from(document.querySelectorAll('input:not([type=hidden]),select,textarea'));
+  const unlabeled = inputs.filter(el => {
+    if (el.labels && el.labels.length) return false;
+    if (el.getAttribute('aria-label') || el.getAttribute('aria-labelledby')) return false;
+    if (el.getAttribute('placeholder')) return false;
+    return true;
+  }).slice(0, 30).map(el => (el.name || el.id || el.type || el.tagName).slice(0, 80));
+  const emptyLinks = Array.from(document.querySelectorAll('a')).filter(a =>
+    !(a.innerText || '').trim() && !a.getAttribute('aria-label') && !a.querySelector('img[alt]')
+  ).length;
+  const emptyButtons = Array.from(document.querySelectorAll('button')).filter(b =>
+    !(b.innerText || '').trim() && !b.getAttribute('aria-label')
+  ).length;
+  const meta = {};
+  const desc = document.querySelector('meta[name=description]');
+  if (desc) meta.description = (desc.content || '').slice(0, 300);
+  const viewportTag = document.querySelector('meta[name=viewport]');
+  meta.hasViewportTag = !!viewportTag;
+  return {
+    title: document.title,
+    url: location.href,
+    lang: document.documentElement.lang || null,
+    meta: meta,
+    headings: headings,
+    headingCounts: headings.reduce((acc, h) => { acc[h.level] = (acc[h.level] || 0) + 1; return acc; }, {}),
+    imageCount: images.length,
+    imagesMissingAlt: imagesMissingAlt,
+    formInputCount: inputs.length,
+    unlabeledInputs: unlabeled,
+    emptyLinks: emptyLinks,
+    emptyButtons: emptyButtons,
+    linkCount: document.querySelectorAll('a').length,
+    viewport: {width: window.innerWidth, height: window.innerHeight,
+               pageHeight: Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0)}
+  };
+})()
+"""
+
+    def _audit_page(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Collect page structure + optional screenshot for visual critique."""
+        tab_id = arguments.get('tab_id')
+        script_args = {'script': self._AUDIT_JS}
+        # Dispatch directly: the audit is read-only inspection, so it stays
+        # available even when browser_execute_script is policy-disabled.
+        audit = self._dispatch_action('executeScript', tab_id, script_args)
+        if not audit.get('success'):
+            return {'success': False,
+                    'error': f"Audit script failed: {audit.get('error', 'unknown')}"}
+
+        response = {'success': True, 'audit': audit.get('result')}
+
+        if arguments.get('screenshot', True):
+            from datetime import datetime as _dt
+            shot = self.execute_tool('browser_screenshot', {
+                'filename': f"audit_{_dt.now().strftime('%Y%m%d_%H%M%S')}.png",
+                'full_page': arguments.get('full_page', False),
+                **({'tab_id': tab_id} if tab_id is not None else {})
+            })
+            response['screenshot'] = shot.get('filepath') if shot.get('success') else None
+
+        return response
 
     def _save_screenshot(self, result: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Save screenshot data to file."""
@@ -1043,8 +1449,31 @@ def run_http_server():
     server.serve_forever()
 
 
-async def websocket_handler(websocket, path):
-    """Handle WebSocket connections from browser extensions."""
+async def websocket_handler(websocket, path=None):
+    """Handle WebSocket connections from browser extensions.
+
+    path is optional: websockets>=14 no longer passes it to handlers.
+
+    The first frame must be a JSON object carrying the API token; otherwise
+    any local process could register as the browser and receive automation
+    commands or forge responses.
+    """
+    try:
+        first_frame = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+        auth = json.loads(first_frame)
+        authorized = isinstance(auth, dict) and secrets.compare_digest(
+            str(auth.get('token', '')), API_TOKEN)
+    except Exception:
+        authorized = False
+
+    if not authorized:
+        logger.warning("WebSocket connection refused: missing or invalid token")
+        try:
+            await websocket.close(1008, 'auth required')
+        except Exception:
+            pass
+        return
+
     browser_id = f"browser_{id(websocket)}"
     connection_manager.register_browser(browser_id, websocket)
 
@@ -1072,6 +1501,9 @@ async def websocket_handler(websocket, path):
 
 async def run_websocket_server():
     """Run the WebSocket server."""
+    global MAIN_EVENT_LOOP
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
+
     if not HAS_WEBSOCKETS:
         logger.warning("websockets module not installed, WebSocket server disabled")
         return
@@ -1083,7 +1515,11 @@ async def run_websocket_server():
 
 async def run_with_headless():
     """Run WebSocket server alongside headless browser startup."""
+    global MAIN_EVENT_LOOP
     from headless_backend import init_headless_browser
+    # Publish this loop before awaiting anything slow, so HTTP worker threads
+    # can dispatch onto it as soon as the browser is up.
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
     headless = await init_headless_browser()
     logger.info("Headless browser ready")
 
@@ -1101,7 +1537,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|           ClaudeCodeBrowser MCP Server v1.0.0                |
+|           ClaudeCodeBrowser MCP Server v1.3.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |

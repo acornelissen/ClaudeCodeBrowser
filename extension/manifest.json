@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "ClaudeCodeBrowser",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Browser automation extension for Claude Code - enables screenshots, clicking, typing, and page interaction",
   "author": "Ligandal",
   "homepage_url": "https://ligandal.com",
@@ -10,6 +10,7 @@
     "activeTab",
     "tabs",
     "nativeMessaging",
+    "notifications",
     "storage",
     "<all_urls>",
     "webNavigation",

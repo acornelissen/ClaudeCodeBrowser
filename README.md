@@ -1,9 +1,13 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
+[![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
+[![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#installation)
 
-A Firefox browser automation system for Claude Code that enables AI-powered interaction with web pages. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers.
+A browser automation system for Claude Code that enables AI-powered interaction with web pages — with **built-in safety guards for humans**. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers. Drive your real Firefox through the extension, or run fully headless (Firefox, Chromium, or WebKit) via Playwright.
 
 **Author:** Andre Watson ([@nanogenomic](https://github.com/nanogenomic)) - dre@ligandal.com
 **Organization:** [Ligandal Inc.](https://ligandal.com)
@@ -19,7 +23,20 @@ A Firefox browser automation system for Claude Code that enables AI-powered inte
 - **Page Refresh** - Force refresh tabs after server restarts (bypass cache)
 - **Element Inspection** - Find elements, get page info, highlight elements
 - **JavaScript Execution** - Run arbitrary JS in browser context
+- **Console & Network Logging** - Capture console output and fetch/XHR traffic for debugging
+- **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, audit log ([details](#safety-guards))
+- **Headless Mode** - Unattended automation via Playwright: Firefox, Chromium, or WebKit
 - **MCP Integration** - Model Context Protocol server for Claude Code
+
+## Browser Support
+
+| Browser | Attended (extension) | Headless (Playwright) |
+|---------|---------------------|----------------------|
+| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSER_ENGINE=firefox` (default) |
+| Chromium / Chrome | 🧪 Experimental build via `scripts/build-chrome.sh` (MV3) | ✅ `CLAUDE_BROWSER_ENGINE=chromium` |
+| WebKit (Safari engine) | — | ✅ `CLAUDE_BROWSER_ENGINE=webkit` |
+
+Attended mode drives your real browser with your logged-in sessions. Headless mode launches a fresh, isolated browser — best for CI, servers, and unattended tasks. See [Headless Mode](#headless-mode).
 
 ## Overview
 
@@ -47,30 +64,17 @@ ClaudeCodeBrowser uses a **dual-server architecture** for maximum reliability an
 
 ### Communication Flow
 
-```
-┌─────────────────┐     ┌─────────────────────────────────┐
-│   Claude Code   │────▶│        MCP Server               │
-│   (MCP Client)  │     │  ┌─────────┐  ┌──────────────┐ │
-└─────────────────┘     │  │HTTP:8765│  │WebSocket:8766│ │
-                        │  └────┬────┘  └──────────────┘ │
-                        └───────┼────────────────────────┘
-                                │
-                                ▼
-                        ┌───────────────┐
-                        │ Command Queue │◀───────polling────┐
-                        │  (In-Memory)  │                   │
-                        └───────┬───────┘                   │
-                                │                           │
-                                ▼                           │
-                        ┌───────────────┐          ┌────────┴────────┐
-                        │ Native Host   │◀────────▶│Firefox Extension│
-                        │   (stdio)     │          │(Background + CS)│
-                        └───────────────┘          └────────┬────────┘
-                                                            │
-                                                            ▼
-                                                   ┌─────────────────┐
-                                                   │   Web Page      │
-                                                   └─────────────────┘
+```mermaid
+flowchart TB
+    CC["Claude Code<br/>(MCP client)"] -->|"stdio (MCP)"| SW["stdio_wrapper.py"]
+    SW -->|"HTTP + X-API-Key"| SRV["MCP Server<br/>HTTP :8765 / WebSocket :8766"]
+    SRV --> GUARD{{"Safety Guard<br/>URL rules · confirm tokens · rate limit · audit log"}}
+    GUARD -->|attended| QUEUE["Command queue<br/>(in-memory)"]
+    GUARD -->|"headless mode"| PW["Playwright<br/>Firefox / Chromium / WebKit"]
+    QUEUE <-->|"500ms polling"| NH["Native Host<br/>(stdio)"]
+    NH <--> EXT["Firefox Extension<br/>(background + content scripts)"]
+    EXT --> PAGE["Web Page"]
+    PW --> PAGE2["Web Page (headless)"]
 ```
 
 ### Request Flow (Step by Step)
@@ -160,6 +164,19 @@ The install script handles these automatically, but if you are installing manual
 
 ### Windows Installation
 
+**Quick install (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+This copies the components to `%USERPROFILE%\.claudecodebrowser`, generates the
+`.bat` native-host wrapper with your Python path baked in, writes the native
+messaging manifest, and registers it in the Windows registry. Then load the
+extension (step 1 below) and add the printed MCP config to Claude Code.
+
+**Manual steps:**
+
 1. **Install the Firefox extension:**
    - Open Firefox and go to `about:debugging`
    - Click "This Firefox"
@@ -208,6 +225,41 @@ python3 ~/.claudecodebrowser/mcp-server/stdio_wrapper.py
 The server runs on:
 - HTTP: http://127.0.0.1:8765
 - WebSocket: ws://127.0.0.1:8766
+
+### Headless Mode
+
+Run without any visible browser — ideal for CI, servers, and unattended tasks:
+
+```bash
+pip install playwright
+playwright install firefox        # or: chromium / webkit
+
+CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+Pick the engine with `CLAUDE_BROWSER_ENGINE`:
+
+```bash
+CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSER_ENGINE=webkit   CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+To use a browser you already have (a system install, or a Playwright build at
+a different revision) instead of running `playwright install`, point
+`CLAUDE_BROWSER_EXECUTABLE` at the binary:
+
+```bash
+CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_EXECUTABLE=/usr/bin/chromium \
+  CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+```
+
+Headless mode supports the core toolset (navigate, screenshot, click, type,
+scroll, element queries, script execution, eval chains, waiting, history,
+keyboard, text extraction) with real multi-tab management — `browser_create_tab`
+returns a `tabId` usable with `tab_id` on every other tool. The same safety
+guards apply. Startup takes ~15 seconds; the server holds the first command
+until the browser is ready (tunable via
+`CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT`, default 45s).
 
 ### Using the Browser Agent
 
@@ -263,6 +315,8 @@ agent.fill_form({
 |------|-------------|
 | `browser_screenshot` | Take a screenshot (visible area or full page) |
 | `browser_navigate` | Navigate to a URL, optionally in new tab |
+| `browser_go_back` | Navigate back in tab history |
+| `browser_go_forward` | Navigate forward in tab history |
 | `browser_refresh` | Refresh current page |
 | `browser_hard_refresh` | Force refresh bypassing cache (Ctrl+Shift+R) |
 | `browser_reload_all` | Reload all browser tabs |
@@ -278,11 +332,13 @@ agent.fill_form({
 | `browser_get_value` | Get the value of an input element |
 | `browser_set_value` | Set input value directly (no typing simulation) |
 | `browser_select_option` | Select an option in a dropdown |
+| `browser_press_key` | Press a keyboard key (Enter, Escape, arrows, shortcuts) |
 
 #### Page Inspection
 | Tool | Description |
 |------|-------------|
 | `browser_get_page_info` | Get URL, title, forms, headings, interactive elements |
+| `browser_get_text` | Extract visible text of the page or an element |
 | `browser_get_elements` | Find elements matching a CSS selector |
 | `browser_highlight` | Highlight an element for visual debugging |
 | `browser_execute_script` | Execute JavaScript in browser context |
@@ -318,6 +374,18 @@ agent.fill_form({
 | `browser_get_console_logs` | Retrieve captured console.log/error/warn/info/debug |
 | `browser_get_network_logs` | Retrieve captured fetch/XHR requests and responses |
 | `browser_clear_logs` | Clear all captured logs |
+
+#### Human Approval, Workflows & Auditing
+| Tool | Description |
+|------|-------------|
+| `browser_request_approval` | Ask the human at the browser to Approve/Deny an action (in-page banner + OS notification) |
+| `browser_run_workflow` | Run a declarative multi-step workflow with assertions — an end-to-end test runner for web apps |
+| `browser_audit_page` | One-call page audit: headings, missing alt text, unlabeled inputs, meta info + screenshot for visual critique |
+
+#### Safety
+| Tool | Description |
+|------|-------------|
+| `browser_safety_status` | Show active safety policy, rate-limit state, and audit log location |
 
 ### Console & Network Logging
 
@@ -549,10 +617,151 @@ curl -X POST http://localhost:8765/mcp/call \
 - Go to the Console tab
 - Filter by "ClaudeCodeBrowser"
 
+## Workflow Testing & Page Audits
+
+Two tools turn the browser into a lightweight QA rig for building websites:
+
+**`browser_run_workflow`** executes a declarative sequence of tool steps with
+assertions — click through a signup flow, submit a form, verify the result —
+and reports pass/fail per step with a screenshot captured at the point of
+failure:
+
+```json
+{
+  "steps": [
+    { "label": "open app", "tool": "browser_navigate",
+      "arguments": { "url": "http://localhost:3000" },
+      "assert": { "selector_exists": "#login-form" } },
+    { "label": "fill email", "tool": "browser_type",
+      "arguments": { "selector": "#email", "text": "test@example.com" } },
+    { "label": "submit", "tool": "browser_click",
+      "arguments": { "selector": "button[type=submit]" },
+      "assert": { "url_contains": "/dashboard", "text_contains": "Welcome" } }
+  ]
+}
+```
+
+Every step passes through the safety guard individually, and failing steps
+capture `workflow_fail_<label>.png` automatically.
+
+**`browser_audit_page`** gathers everything needed for a structural and visual
+critique in one call: heading hierarchy, images missing alt text, unlabeled
+form inputs, empty links/buttons, meta description and viewport info, page
+dimensions — plus a screenshot. Point Claude at a page and ask for a critique;
+this tool is the evidence-gathering step.
+
+## Safety Guards
+
+Every tool call passes through a safety guard before it reaches the browser.
+The guard is designed to keep an automated agent from doing things the human
+operating it would not expect, while staying out of the way for normal
+development workflows. Policy lives in `~/.claudecodebrowser/safety.json`
+(created with safe defaults on first run) and can be inspected at runtime with
+the `browser_safety_status` tool.
+
+### What the guard enforces
+
+| Guard | Behavior |
+|-------|----------|
+| **URL scheme guard** | Navigation is limited to `http://`, `https://`, and `about:blank`. `file:`, `javascript:`, `data:`, `chrome:`, `resource:`, and `moz-extension:` targets are always refused. |
+| **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
+| **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
+| **Password fields** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
+| **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus an Approve/Deny banner on the current page. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
+| **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
+| **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, and `browser_inject_observer` entirely. |
+| **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
+| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords) redacted. |
+
+### Example `safety.json`
+
+```json
+{
+  "enabled": true,
+  "read_only": false,
+  "allow_script_execution": true,
+  "confirm_protected_actions": true,
+  "max_actions_per_minute": 120,
+  "audit_log": true,
+  "blocked_url_patterns": ["internal-admin\\.mycompany\\.com"],
+  "allowed_url_patterns": [],
+  "protected_url_patterns": ["paypal\\.com", "chase\\.com", "\\.gov(/|$)"]
+}
+```
+
+The defaults include a starter set of protected patterns for common banking,
+payment, brokerage, government, and health domains — edit the file to match
+your own risk tolerance. Setting `"enabled": false` turns the guard off
+entirely (not recommended).
+
+### Credentials and 2FA: what this project deliberately does NOT do
+
+- **No password vault.** ClaudeCodeBrowser never stores credentials, and by
+  default refuses to type into password fields. Use the browser's own
+  password manager (Firefox autofill, Bitwarden, 1Password, ...): you click
+  the autofill yourself, and the secret never passes through the AI, its
+  arguments, or its logs.
+- **No 2FA auto-approval.** Automating Duo/TOTP/push approvals would defeat
+  the purpose of a second factor. When automation reaches a login or 2FA
+  wall, the right flow is: Claude pauses (use `browser_request_approval` to
+  ping you), you complete the login/2FA yourself in the same tab, then
+  automation continues in the authenticated session.
+
+The Duo-style pattern this project *does* implement is pointed the other way:
+**you are the second factor for Claude's actions.** Sensitive operations
+push a notification to you and wait for your explicit Approve click in the
+browser.
+
+## Pairs Well With
+
+ClaudeCodeBrowser is the *browser hands* of a Claude Code setup. For
+secretary-style workflows, combine it with purpose-built MCP connectors
+rather than screen-driving web apps: Gmail/Calendar MCP connectors handle
+email triage and scheduling far more reliably than clicking through webmail,
+while this project covers the parts that genuinely need a browser — visual
+review of what you're building, workflow testing, form filling, and anything
+without an API.
+
+## Uninstalling
+
+### Remove the Firefox add-on
+
+1. Open `about:addons` in Firefox (or menu → Add-ons and themes)
+2. Find **ClaudeCodeBrowser** under Extensions
+3. Click the `…` menu next to it and choose **Remove**
+
+If the extension was loaded temporarily via `about:debugging`, it disappears
+on its own the next time Firefox restarts — or click **Remove** on the
+`about:debugging#/runtime/this-firefox` page.
+
+### Remove the native host and server
+
+```bash
+./scripts/uninstall.sh
+```
+
+This removes the native messaging manifest, the `~/.claudecodebrowser`
+install directory, and any symlinks. If you registered the MCP server with
+Claude Code, also run:
+
+```bash
+claude mcp remove claudecodebrowser
+```
+
 ## Security Considerations
 
 - The server only binds to localhost (127.0.0.1) by default
+- All HTTP endpoints except `/health` require the `X-API-Key` token
+  (auto-generated at `~/.claudecodebrowser/api_token`, mode 0600)
+- The WebSocket control channel requires the same token as its first frame,
+  so no other local process can register as the browser or forge responses
+- No CORS headers are sent, so web pages cannot reach the API from the browser
+- The extension refuses `runtime.onMessageExternal` messages, so co-installed
+  extensions cannot issue automation commands through it
 - Native messaging is restricted to the specific extension ID
+- A configurable safety guard (see [Safety Guards](#safety-guards)) enforces
+  URL restrictions, protected-site confirmation, read-only mode, rate
+  limiting, and audit logging
 - Screenshots are stored locally in user's home directory
 - No data is sent to external servers
 

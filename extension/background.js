@@ -249,6 +249,35 @@ async function handleCommand(message) {
       case "reloadByUrl":
         result = await reloadTabsByUrl(data);
         break;
+      case "goBack":
+        result = await navigateHistory(tabId, "back");
+        break;
+      case "goForward":
+        result = await navigateHistory(tabId, "forward");
+        break;
+      case "requestApproval":
+        result = await requestApproval(tabId, data);
+        break;
+      // Element interaction and dynamic-content commands implemented by the
+      // content script — forwarded as-is
+      case "getValue":
+      case "setValue":
+      case "selectOption":
+      case "hover":
+      case "getAttribute":
+      case "focus":
+      case "getComputedStyles":
+      case "getBoundingRect":
+      case "waitForChange":
+      case "waitForNetworkIdle":
+      case "observeElement":
+      case "stopObserving":
+      case "scrollAndCapture":
+      case "clickAndWait":
+      case "pressKey":
+      case "getText":
+        result = await sendToContentScript(tabId, { action, ...data });
+        break;
       // Console and network logging commands
       case "startLogging":
         result = await sendToContentScript(tabId, { action: "startLogging", ...data });
@@ -393,6 +422,42 @@ async function screenshotAllTabs(options = {}) {
       count: results.filter(r => r.success).length,
       failed: results.filter(r => !r.success).length
     };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Human approval: OS notification to catch the user's attention, plus an
+// in-page Approve/Deny banner (content script) that carries the decision
+async function requestApproval(tabId, data = {}) {
+  try {
+    if (browser.notifications) {
+      await browser.notifications.create({
+        type: "basic",
+        title: "Claude requests approval",
+        message: (data.message || "Claude wants to perform an action").slice(0, 200),
+        iconUrl: browser.runtime.getURL("icons/icon-48.png")
+      });
+    }
+  } catch (e) {
+    // Notifications unavailable — the in-page banner still works
+  }
+  return sendToContentScript(tabId, { action: "requestApproval", ...data });
+}
+
+// History navigation (Back/Forward buttons)
+async function navigateHistory(tabId, direction) {
+  try {
+    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    if (direction === "back") {
+      await browser.tabs.goBack(tab.id);
+    } else {
+      await browser.tabs.goForward(tab.id);
+    }
+    // Give the navigation a moment to commit before reporting the new URL
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const updated = await browser.tabs.get(tab.id);
+    return { success: true, url: updated.url, title: updated.title };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -875,11 +940,15 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// Listen for external connections (from MCP server via HTTP)
+// Refuse external messages. Nothing legitimate uses this path — the MCP
+// server reaches the extension via native messaging and HTTP polling, never
+// runtime.sendMessage — and an open forward here would let any co-installed
+// extension run arbitrary commands (including executeScript on any tab),
+// bypassing the API token and the localhost boundary entirely.
 browser.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  handleCommand(message)
-    .then(sendResponse);
-  return true;
+  console.warn("[ClaudeCodeBrowser] Refused external message from", sender?.id);
+  sendResponse({ success: false, error: "External messages are not accepted" });
+  return false;
 });
 
 // Context menu for quick actions

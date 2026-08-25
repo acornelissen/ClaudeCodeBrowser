@@ -2,10 +2,11 @@
 """
 Headless browser backend for ClaudeCodeBrowser.
 
-Uses Playwright to drive Firefox (or Chromium) without a display.
+Uses Playwright to drive Firefox, Chromium, or WebKit without a display.
 Activated when CLAUDE_BROWSER_HEADLESS=1 or --headless is passed.
+Pick the engine with CLAUDE_BROWSER_ENGINE=firefox|chromium|webkit (default firefox).
 
-Install: pip install playwright && playwright install firefox
+Install: pip install playwright && playwright install firefox   (or chromium/webkit)
 """
 
 import asyncio
@@ -24,8 +25,13 @@ SCREENSHOTS_DIR = Path(os.environ.get(
 ))
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Firefox vs Chromium: default Firefox to match the visible-mode extension
+# Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
 BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
+
+# Optional path to a browser executable. Lets headless mode use a system
+# browser or a pre-installed Playwright build at a nonstandard revision,
+# instead of requiring "playwright install".
+EXECUTABLE_PATH = os.environ.get('CLAUDE_BROWSER_EXECUTABLE')
 
 
 class HeadlessBrowser:
@@ -37,6 +43,10 @@ class HeadlessBrowser:
         self._context = None
         self._page = None
         self._lock = asyncio.Lock()
+        # Real tab management: id -> Page, mirroring the extension's tab ids
+        self._tabs = {}
+        self._next_tab_id = 1
+        self._active_tab_id = None
 
     async def start(self):
         try:
@@ -48,11 +58,15 @@ class HeadlessBrowser:
 
         self._playwright = await async_playwright().start()
         launcher = getattr(self._playwright, BROWSER_TYPE)
-        self._browser = await launcher.launch(headless=True)
+        launch_kwargs = {'headless': True}
+        if EXECUTABLE_PATH:
+            launch_kwargs['executable_path'] = EXECUTABLE_PATH
+        self._browser = await launcher.launch(**launch_kwargs)
         self._context = await self._browser.new_context(
             viewport={'width': 1280, 'height': 800}
         )
         self._page = await self._context.new_page()
+        self._register_tab(self._page)
 
         # Wire up persistent console + network logging to stderr
         self._page.on('console', lambda m: logger.debug(f"[browser:console:{m.type}] {m.text}"))
@@ -69,11 +83,55 @@ class HeadlessBrowser:
             await self._playwright.stop()
         logger.info("Headless browser stopped")
 
+    def is_ready(self) -> bool:
+        """True once start() has finished and a page is available for commands."""
+        return self._page is not None
+
+    def _register_tab(self, page) -> int:
+        """Track a page under a stable tab id; untrack it when it closes."""
+        tab_id = self._next_tab_id
+        self._next_tab_id += 1
+        self._tabs[tab_id] = page
+        self._active_tab_id = tab_id
+        page.on('close', lambda: self._forget_tab(tab_id))
+        return tab_id
+
+    def _forget_tab(self, tab_id: int):
+        self._tabs.pop(tab_id, None)
+        if self._active_tab_id == tab_id:
+            self._active_tab_id = next(iter(self._tabs), None)
+            self._page = self._tabs.get(self._active_tab_id)
+
     async def _get_page(self, tab_id: Optional[int] = None):
-        """Return the active page (tab_id ignored for now; multi-tab support TODO)."""
+        """Return the page for tab_id, or the active page when not specified."""
+        if tab_id is not None:
+            page = self._tabs.get(tab_id)
+            if page is None:
+                raise RuntimeError(f"No headless tab with id {tab_id}")
+            return page
         if self._page is None:
             raise RuntimeError("Headless browser not started")
         return self._page
+
+    async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
+        """Refuse to fill password fields unless the safety config allows it."""
+        if args.get('allow_password') is True:
+            return
+        try:
+            is_password = await page.eval_on_selector(
+                selector,
+                "el => el.tagName === 'INPUT' && (el.type === 'password' || "
+                "['current-password','new-password'].includes(el.getAttribute('autocomplete')))"
+            )
+        except Exception:
+            return  # selector didn't resolve; the fill will report its own error
+        if is_password:
+            raise RuntimeError(
+                'Refused: target is a password field. Credentials belong in a '
+                'password manager, not automated typing. Set '
+                '"allow_password_typing": true in ~/.claudecodebrowser/safety.json '
+                'to override.'
+            )
 
     async def execute(self, action: str, tab_id: Optional[int], arguments: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
@@ -120,6 +178,7 @@ class HeadlessBrowser:
             selector = args.get('selector')
             text = args.get('text', '')
             if selector:
+                await self._assert_not_password(page, selector, args)
                 await page.fill(selector, text)
             else:
                 await page.keyboard.type(text)
@@ -171,9 +230,18 @@ class HeadlessBrowser:
             return {'success': True}
 
         elif action == 'getTabs':
-            pages = self._context.pages
-            tabs = [{'id': i, 'url': p.url, 'title': await p.title()} for i, p in enumerate(pages)]
-            return {'success': True, 'tabs': tabs}
+            tabs = []
+            for tid, p in list(self._tabs.items()):
+                try:
+                    tabs.append({
+                        'id': tid,
+                        'url': p.url,
+                        'title': await p.title(),
+                        'active': tid == self._active_tab_id
+                    })
+                except Exception:
+                    pass
+            return {'success': True, 'tabs': tabs, 'totalTabs': len(tabs)}
 
         elif action == 'createTab':
             url = args.get('url', 'about:blank')
@@ -181,7 +249,22 @@ class HeadlessBrowser:
             if url != 'about:blank':
                 await new_page.goto(url)
             self._page = new_page
-            return {'success': True, 'url': new_page.url}
+            new_id = self._register_tab(new_page)
+            return {'success': True, 'tabId': new_id, 'url': new_page.url}
+
+        elif action == 'closeTab':
+            if tab_id is None or tab_id not in self._tabs:
+                return {'success': False, 'error': f'No headless tab with id {tab_id}'}
+            await self._tabs[tab_id].close()
+            return {'success': True, 'closedTabId': tab_id}
+
+        elif action == 'focusTab':
+            if tab_id is None or tab_id not in self._tabs:
+                return {'success': False, 'error': f'No headless tab with id {tab_id}'}
+            self._active_tab_id = tab_id
+            self._page = self._tabs[tab_id]
+            await self._page.bring_to_front()
+            return {'success': True, 'tabId': tab_id, 'url': self._page.url}
 
         elif action == 'getValue':
             selector = args.get('selector', '')
@@ -191,13 +274,66 @@ class HeadlessBrowser:
         elif action == 'setValue':
             selector = args.get('selector', '')
             value = args.get('value', '')
+            await self._assert_not_password(page, selector, args)
             await page.fill(selector, value)
             return {'success': True}
+
+        elif action == 'requestApproval':
+            return {'success': False, 'approved': False,
+                    'error': 'No human is present in headless mode; use the '
+                             'confirm_token flow for protected actions instead.'}
 
         elif action == 'hover':
             selector = args.get('selector', '')
             await page.hover(selector)
             return {'success': True}
+
+        elif action == 'selectOption':
+            selector = args.get('selector', '')
+            if args.get('value') is not None:
+                await page.select_option(selector, value=args['value'])
+            elif args.get('text') is not None:
+                await page.select_option(selector, label=args['text'])
+            elif args.get('index') is not None:
+                await page.select_option(selector, index=int(args['index']))
+            else:
+                return {'success': False, 'error': 'selectOption requires value, text, or index'}
+            return {'success': True}
+
+        elif action == 'goBack':
+            await page.go_back(wait_until='domcontentloaded', timeout=15000)
+            return {'success': True, 'url': page.url, 'title': await page.title()}
+
+        elif action == 'goForward':
+            await page.go_forward(wait_until='domcontentloaded', timeout=15000)
+            return {'success': True, 'url': page.url, 'title': await page.title()}
+
+        elif action == 'pressKey':
+            key = args.get('key', '')
+            if not key:
+                return {'success': False, 'error': 'pressKey requires key'}
+            modifiers = [name for flag, name in
+                         [('ctrl', 'Control'), ('shift', 'Shift'), ('alt', 'Alt'), ('meta', 'Meta')]
+                         if args.get(flag)]
+            combo = '+'.join(modifiers + [key])
+            selector = args.get('selector')
+            if selector:
+                await page.focus(selector)
+            await page.keyboard.press(combo)
+            return {'success': True, 'key': combo}
+
+        elif action == 'getText':
+            selector = args.get('selector') or 'body'
+            max_length = int(args.get('max_length', 20000))
+            text = await page.inner_text(selector, timeout=10000)
+            truncated = len(text) > max_length
+            return {
+                'success': True,
+                'text': text[:max_length],
+                'truncated': truncated,
+                'total_length': len(text),
+                'url': page.url
+            }
 
         elif action == 'refresh':
             await page.reload()
