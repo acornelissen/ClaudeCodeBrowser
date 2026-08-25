@@ -66,6 +66,18 @@ logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
 # Headless mode: CLAUDE_BROWSER_HEADLESS=1 or --headless flag
 HEADLESS_MODE = os.environ.get('CLAUDE_BROWSER_HEADLESS', '0') == '1' or '--headless' in sys.argv
 
+# The asyncio event loop owned by the main thread (started via asyncio.run in
+# main()). Published so ThreadingHTTPServer worker threads can dispatch onto it
+# with run_coroutine_threadsafe: asyncio.get_event_loop() raises in threads
+# without a loop on Python 3.12+ (see issue #9).
+MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+# How long a command waits for Playwright Firefox to finish booting before
+# giving up. Launching takes ~15s while the HTTP port binds immediately.
+HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
+
+from safety import get_safety_guard
+
 # API token for localhost HTTP authentication
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
@@ -97,6 +109,20 @@ WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 DEFAULT_SCREENSHOTS_DIR = Path('/tmp/claudecodebrowser/screenshots')
 SCREENSHOTS_DIR = Path(os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR', str(DEFAULT_SCREENSHOTS_DIR)))
 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def camelize_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert snake_case MCP argument keys to the camelCase the extension reads.
+
+    The MCP tool schemas use snake_case (full_page, url_pattern, bypass_cache)
+    but background.js/content.js read camelCase (fullPage, urlPattern,
+    bypassCache). The headless Playwright backend keeps the original
+    snake_case arguments.
+    """
+    def camel(key: str) -> str:
+        head, *rest = key.split('_')
+        return head + ''.join(part.title() for part in rest)
+    return {camel(k): v for k, v in arguments.items()}
 
 
 @dataclass
@@ -623,6 +649,65 @@ MCP_TOOLS: List[MCPTool] = [
             }
         }
     ),
+    # Navigation history
+    MCPTool(
+        name="browser_go_back",
+        description="Navigate back in the tab's history (like the browser Back button).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_go_forward",
+        description="Navigate forward in the tab's history (like the browser Forward button).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_press_key",
+        description="Press a keyboard key (with optional modifiers) on the focused element or a specific element. Useful for Enter, Escape, Tab, arrow keys, and shortcuts.",
+        input_schema={
+            "type": "object",
+            "required": ["key"],
+            "properties": {
+                "key": {"type": "string", "description": "Key to press, e.g. 'Enter', 'Escape', 'Tab', 'ArrowDown', 'a'."},
+                "selector": {"type": "string", "description": "Optional CSS selector of element to focus first."},
+                "ctrl": {"type": "boolean", "description": "Hold Ctrl.", "default": False},
+                "shift": {"type": "boolean", "description": "Hold Shift.", "default": False},
+                "alt": {"type": "boolean", "description": "Hold Alt.", "default": False},
+                "meta": {"type": "boolean", "description": "Hold Meta/Cmd.", "default": False},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    MCPTool(
+        name="browser_get_text",
+        description="Extract the visible text content of the page or a specific element. Lighter-weight than a screenshot for reading page content.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string", "description": "Optional CSS selector; defaults to the whole page body."},
+                "max_length": {"type": "integer", "description": "Truncate the returned text to this many characters.", "default": 20000},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    # Safety
+    MCPTool(
+        name="browser_safety_status",
+        description="Show the active safety guard policy: read-only mode, script toggle, protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
+        input_schema={
+            "type": "object",
+            "properties": {}
+        }
+    ),
     MCPTool(
         name="browser_inject_observer",
         description=(
@@ -743,7 +828,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.0.0',
+                'version': '1.1.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -840,6 +925,18 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         log_args = {k: ('***' if k in _SENSITIVE else v) for k, v in arguments.items()}
         logger.info(f"Executing tool: {tool_name} with args: {log_args}")
 
+        # Safety guard: scheme/blocklist checks, read-only mode, script toggle,
+        # protected-domain confirmation, rate limiting, audit logging.
+        guard = get_safety_guard()
+        denial = guard.check(tool_name, arguments)
+        if denial is not None:
+            logger.warning(f"Safety guard blocked {tool_name}: {denial.get('safety_decision')}")
+            return denial
+
+        # Handled entirely server-side, no browser round-trip needed.
+        if tool_name == 'browser_safety_status':
+            return guard.status()
+
         # Map tool names to actions
         tool_action_map = {
             'browser_screenshot': 'screenshot',
@@ -883,7 +980,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             # Multi-turn / conditional execution
             'browser_eval_chain': 'evalChain',
             'browser_wait_and_act': 'waitAndAct',
-            'browser_inject_observer': 'injectObserver'
+            'browser_inject_observer': 'injectObserver',
+            # Navigation history and keyboard/text
+            'browser_go_back': 'goBack',
+            'browser_go_forward': 'goForward',
+            'browser_press_key': 'pressKey',
+            'browser_get_text': 'getText'
         }
 
         if tool_name not in tool_action_map:
@@ -900,50 +1002,69 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             command = BrowserCommand(
                 action=action,
                 tab_id=tab_id,
-                data=arguments
+                data=camelize_args(arguments)
             )
 
-            # Run async command in event loop
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're in a sync context, need to handle differently
+            # We run in a ThreadingHTTPServer worker thread, which owns no
+            # event loop (asyncio.get_event_loop() raises here on Python
+            # 3.12+), so hand the coroutine to the main thread's loop.
+            loop = MAIN_EVENT_LOOP
+            if loop is not None and loop.is_running():
+                try:
                     future = asyncio.run_coroutine_threadsafe(
                         connection_manager.send_command(command),
                         loop
                     )
                     result = future.result(timeout=30)
-                else:
-                    result = loop.run_until_complete(connection_manager.send_command(command))
 
-                # Handle screenshot saving
-                if action == 'screenshot' and result.get('success') and result.get('data'):
-                    return self._save_screenshot(result, arguments)
+                    # Handle screenshot saving
+                    if action == 'screenshot' and result.get('success') and result.get('data'):
+                        return self._save_screenshot(result, arguments)
 
-                return result
-            except Exception as e:
-                logger.error(f"WebSocket command failed: {e}")
-                # Fall through to HTTP method
+                    guard.note_url(result)
+                    return result
+                except Exception as e:
+                    logger.error(f"WebSocket command failed: {e}")
+                    # Fall through to HTTP method
+            else:
+                logger.warning("WebSocket browser registered but no event loop running; "
+                               "falling back to HTTP polling")
 
         # Try headless Playwright backend if enabled and available
         if HEADLESS_MODE:
             from headless_backend import get_headless_browser
+            # Launching Playwright Firefox takes ~15s, but the HTTP server
+            # accepts requests as soon as the port binds. Rather than failing
+            # the first call of a session, wait for the browser to boot.
+            deadline = time.monotonic() + HEADLESS_STARTUP_TIMEOUT
             headless = get_headless_browser()
-            if headless:
-                loop = asyncio.get_event_loop()
-                try:
-                    if loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(
-                            headless.execute(action, tab_id, arguments), loop
-                        )
-                        return future.result(timeout=35)
-                    else:
-                        return loop.run_until_complete(headless.execute(action, tab_id, arguments))
-                except Exception as e:
-                    logger.error(f"Headless backend failed: {e}")
-                    return {'success': False, 'error': f'Headless execution failed: {e}'}
-            else:
-                return {'success': False, 'error': 'Headless mode enabled but browser not started yet. Wait a moment and retry.'}
+            while time.monotonic() < deadline:
+                if (MAIN_EVENT_LOOP is not None and MAIN_EVENT_LOOP.is_running()
+                        and headless is not None and headless.is_ready()):
+                    break
+                time.sleep(0.5)
+                headless = get_headless_browser()
+
+            if headless is None or not headless.is_ready():
+                return {'success': False,
+                        'error': f'Headless browser did not start within '
+                                 f'{HEADLESS_STARTUP_TIMEOUT:.0f}s. Check the server log.'}
+            # Worker threads own no event loop; dispatch onto the loop started
+            # by run_with_headless() in the main thread (issue #9).
+            loop = MAIN_EVENT_LOOP
+            if loop is None or not loop.is_running():
+                return {'success': False,
+                        'error': 'Headless event loop not running yet. Wait a moment and retry.'}
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    headless.execute(action, tab_id, arguments), loop
+                )
+                result = future.result(timeout=35)
+                guard.note_url(result)
+                return result
+            except Exception as e:
+                logger.error(f"Headless backend failed: {e}")
+                return {'success': False, 'error': f'Headless execution failed: {e}'}
 
         # No WebSocket connection — use HTTP polling with the native host.
         # ThreadingHTTPServer ensures /browser/poll and /browser/response are
@@ -952,7 +1073,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         command_data = {
             'action': action,
             'tabId': tab_id,
-            'data': arguments,
+            'data': camelize_args(arguments),
             'requestId': request_id
         }
 
@@ -971,6 +1092,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             response = result_holder.get('response', {})
             if action == 'screenshot' and response.get('success') and response.get('data'):
                 return self._save_screenshot(response, arguments)
+            guard.note_url(response)
             return response
         else:
             connection_manager.http_pending_requests.pop(request_id, None)
@@ -1067,6 +1189,9 @@ async def websocket_handler(websocket, path):
 
 async def run_websocket_server():
     """Run the WebSocket server."""
+    global MAIN_EVENT_LOOP
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
+
     if not HAS_WEBSOCKETS:
         logger.warning("websockets module not installed, WebSocket server disabled")
         return
@@ -1078,7 +1203,11 @@ async def run_websocket_server():
 
 async def run_with_headless():
     """Run WebSocket server alongside headless browser startup."""
+    global MAIN_EVENT_LOOP
     from headless_backend import init_headless_browser
+    # Publish this loop before awaiting anything slow, so HTTP worker threads
+    # can dispatch onto it as soon as the browser is up.
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
     headless = await init_headless_browser()
     logger.info("Headless browser ready")
 
@@ -1096,7 +1225,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|           ClaudeCodeBrowser MCP Server v1.0.0                |
+|           ClaudeCodeBrowser MCP Server v1.1.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |

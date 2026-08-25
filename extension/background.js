@@ -249,6 +249,32 @@ async function handleCommand(message) {
       case "reloadByUrl":
         result = await reloadTabsByUrl(data);
         break;
+      case "goBack":
+        result = await navigateHistory(tabId, "back");
+        break;
+      case "goForward":
+        result = await navigateHistory(tabId, "forward");
+        break;
+      // Element interaction and dynamic-content commands implemented by the
+      // content script — forwarded as-is
+      case "getValue":
+      case "setValue":
+      case "selectOption":
+      case "hover":
+      case "getAttribute":
+      case "focus":
+      case "getComputedStyles":
+      case "getBoundingRect":
+      case "waitForChange":
+      case "waitForNetworkIdle":
+      case "observeElement":
+      case "stopObserving":
+      case "scrollAndCapture":
+      case "clickAndWait":
+      case "pressKey":
+      case "getText":
+        result = await sendToContentScript(tabId, { action, ...data });
+        break;
       // Console and network logging commands
       case "startLogging":
         result = await sendToContentScript(tabId, { action: "startLogging", ...data });
@@ -393,6 +419,24 @@ async function screenshotAllTabs(options = {}) {
       count: results.filter(r => r.success).length,
       failed: results.filter(r => !r.success).length
     };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// History navigation (Back/Forward buttons)
+async function navigateHistory(tabId, direction) {
+  try {
+    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    if (direction === "back") {
+      await browser.tabs.goBack(tab.id);
+    } else {
+      await browser.tabs.goForward(tab.id);
+    }
+    // Give the navigation a moment to commit before reporting the new URL
+    await new Promise(resolve => setTimeout(resolve, 300));
+    const updated = await browser.tabs.get(tab.id);
+    return { success: true, url: updated.url, title: updated.title };
   } catch (error) {
     return { success: false, error: error.message };
   }

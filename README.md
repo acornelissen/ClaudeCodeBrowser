@@ -250,6 +250,8 @@ agent.fill_form({
 |------|-------------|
 | `browser_screenshot` | Take a screenshot (visible area or full page) |
 | `browser_navigate` | Navigate to a URL, optionally in new tab |
+| `browser_go_back` | Navigate back in tab history |
+| `browser_go_forward` | Navigate forward in tab history |
 | `browser_refresh` | Refresh current page |
 | `browser_hard_refresh` | Force refresh bypassing cache (Ctrl+Shift+R) |
 | `browser_reload_all` | Reload all browser tabs |
@@ -265,11 +267,13 @@ agent.fill_form({
 | `browser_get_value` | Get the value of an input element |
 | `browser_set_value` | Set input value directly (no typing simulation) |
 | `browser_select_option` | Select an option in a dropdown |
+| `browser_press_key` | Press a keyboard key (Enter, Escape, arrows, shortcuts) |
 
 #### Page Inspection
 | Tool | Description |
 |------|-------------|
 | `browser_get_page_info` | Get URL, title, forms, headings, interactive elements |
+| `browser_get_text` | Extract visible text of the page or an element |
 | `browser_get_elements` | Find elements matching a CSS selector |
 | `browser_highlight` | Highlight an element for visual debugging |
 | `browser_execute_script` | Execute JavaScript in browser context |
@@ -305,6 +309,11 @@ agent.fill_form({
 | `browser_get_console_logs` | Retrieve captured console.log/error/warn/info/debug |
 | `browser_get_network_logs` | Retrieve captured fetch/XHR requests and responses |
 | `browser_clear_logs` | Clear all captured logs |
+
+#### Safety
+| Tool | Description |
+|------|-------------|
+| `browser_safety_status` | Show active safety policy, rate-limit state, and audit log location |
 
 ### Console & Network Logging
 
@@ -536,10 +545,84 @@ curl -X POST http://localhost:8765/mcp/call \
 - Go to the Console tab
 - Filter by "ClaudeCodeBrowser"
 
+## Safety Guards
+
+Every tool call passes through a safety guard before it reaches the browser.
+The guard is designed to keep an automated agent from doing things the human
+operating it would not expect, while staying out of the way for normal
+development workflows. Policy lives in `~/.claudecodebrowser/safety.json`
+(created with safe defaults on first run) and can be inspected at runtime with
+the `browser_safety_status` tool.
+
+### What the guard enforces
+
+| Guard | Behavior |
+|-------|----------|
+| **URL scheme guard** | Navigation is limited to `http://`, `https://`, and `about:blank`. `file:`, `javascript:`, `data:`, `chrome:`, `resource:`, and `moz-extension:` targets are always refused. |
+| **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
+| **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit two-step confirmation. The first call is refused with a single-use `confirm_token`; repeating the identical call with that token proceeds. Read-only actions (screenshots, inspection) are unaffected. |
+| **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
+| **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, and `browser_inject_observer` entirely. |
+| **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
+| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords) redacted. |
+
+### Example `safety.json`
+
+```json
+{
+  "enabled": true,
+  "read_only": false,
+  "allow_script_execution": true,
+  "confirm_protected_actions": true,
+  "max_actions_per_minute": 120,
+  "audit_log": true,
+  "blocked_url_patterns": ["internal-admin\\.mycompany\\.com"],
+  "allowed_url_patterns": [],
+  "protected_url_patterns": ["paypal\\.com", "chase\\.com", "\\.gov(/|$)"]
+}
+```
+
+The defaults include a starter set of protected patterns for common banking,
+payment, brokerage, government, and health domains — edit the file to match
+your own risk tolerance. Setting `"enabled": false` turns the guard off
+entirely (not recommended).
+
+## Uninstalling
+
+### Remove the Firefox add-on
+
+1. Open `about:addons` in Firefox (or menu → Add-ons and themes)
+2. Find **ClaudeCodeBrowser** under Extensions
+3. Click the `…` menu next to it and choose **Remove**
+
+If the extension was loaded temporarily via `about:debugging`, it disappears
+on its own the next time Firefox restarts — or click **Remove** on the
+`about:debugging#/runtime/this-firefox` page.
+
+### Remove the native host and server
+
+```bash
+./scripts/uninstall.sh
+```
+
+This removes the native messaging manifest, the `~/.claudecodebrowser`
+install directory, and any symlinks. If you registered the MCP server with
+Claude Code, also run:
+
+```bash
+claude mcp remove claudecodebrowser
+```
+
 ## Security Considerations
 
 - The server only binds to localhost (127.0.0.1) by default
+- All HTTP endpoints except `/health` require the `X-API-Key` token
+  (auto-generated at `~/.claudecodebrowser/api_token`, mode 0600)
+- No CORS headers are sent, so web pages cannot reach the API from the browser
 - Native messaging is restricted to the specific extension ID
+- A configurable safety guard (see [Safety Guards](#safety-guards)) enforces
+  URL restrictions, protected-site confirmation, read-only mode, rate
+  limiting, and audit logging
 - Screenshots are stored locally in user's home directory
 - No data is sent to external servers
 

@@ -343,6 +343,10 @@
         return selectOption(message);
       case "getComputedStyles":
         return getComputedStyles(message);
+      case "pressKey":
+        return pressKey(message);
+      case "getText":
+        return getText(message);
       case "getBoundingRect":
         return getBoundingRect(message);
       // Console and network logging actions
@@ -1293,6 +1297,63 @@
     element.dispatchEvent(mouseOver);
 
     return { hovered: true, element: getElementInfo(element) };
+  }
+
+  // Press a keyboard key with optional modifiers
+  async function pressKey(options) {
+    let target = document.activeElement || document.body;
+    if (options.selector) {
+      const element = findElement(options);
+      if (!element) throw new Error('Element not found');
+      element.focus();
+      target = element;
+    }
+
+    const eventInit = {
+      key: options.key,
+      bubbles: true,
+      cancelable: true,
+      ctrlKey: !!options.ctrl,
+      shiftKey: !!options.shift,
+      altKey: !!options.alt,
+      metaKey: !!options.meta
+    };
+
+    target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+
+    // Synthetic key events don't trigger default actions, so emulate the
+    // common one: Enter inside a form submits it
+    if (options.key === 'Enter' && !options.ctrl && !options.shift && target.form) {
+      if (target.form.requestSubmit) {
+        target.form.requestSubmit();
+      } else {
+        target.form.submit();
+      }
+    }
+
+    return { pressed: options.key, element: getElementInfo(target) };
+  }
+
+  // Extract visible text from the page or an element
+  function getText(options) {
+    let element = document.body;
+    if (options.selector) {
+      element = findElement(options);
+      if (!element) throw new Error('Element not found');
+    }
+
+    const maxLength = options.maxLength || 20000;
+    const text = element.innerText || element.textContent || '';
+
+    return {
+      text: text.slice(0, maxLength),
+      truncated: text.length > maxLength,
+      totalLength: text.length,
+      url: window.location.href,
+      title: document.title
+    };
   }
 
   // Select option

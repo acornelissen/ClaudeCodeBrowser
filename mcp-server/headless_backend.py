@@ -69,6 +69,10 @@ class HeadlessBrowser:
             await self._playwright.stop()
         logger.info("Headless browser stopped")
 
+    def is_ready(self) -> bool:
+        """True once start() has finished and a page is available for commands."""
+        return self._page is not None
+
     async def _get_page(self, tab_id: Optional[int] = None):
         """Return the active page (tab_id ignored for now; multi-tab support TODO)."""
         if self._page is None:
@@ -198,6 +202,53 @@ class HeadlessBrowser:
             selector = args.get('selector', '')
             await page.hover(selector)
             return {'success': True}
+
+        elif action == 'selectOption':
+            selector = args.get('selector', '')
+            if args.get('value') is not None:
+                await page.select_option(selector, value=args['value'])
+            elif args.get('text') is not None:
+                await page.select_option(selector, label=args['text'])
+            elif args.get('index') is not None:
+                await page.select_option(selector, index=int(args['index']))
+            else:
+                return {'success': False, 'error': 'selectOption requires value, text, or index'}
+            return {'success': True}
+
+        elif action == 'goBack':
+            await page.go_back(wait_until='domcontentloaded', timeout=15000)
+            return {'success': True, 'url': page.url, 'title': await page.title()}
+
+        elif action == 'goForward':
+            await page.go_forward(wait_until='domcontentloaded', timeout=15000)
+            return {'success': True, 'url': page.url, 'title': await page.title()}
+
+        elif action == 'pressKey':
+            key = args.get('key', '')
+            if not key:
+                return {'success': False, 'error': 'pressKey requires key'}
+            modifiers = [name for flag, name in
+                         [('ctrl', 'Control'), ('shift', 'Shift'), ('alt', 'Alt'), ('meta', 'Meta')]
+                         if args.get(flag)]
+            combo = '+'.join(modifiers + [key])
+            selector = args.get('selector')
+            if selector:
+                await page.focus(selector)
+            await page.keyboard.press(combo)
+            return {'success': True, 'key': combo}
+
+        elif action == 'getText':
+            selector = args.get('selector') or 'body'
+            max_length = int(args.get('max_length', 20000))
+            text = await page.inner_text(selector, timeout=10000)
+            truncated = len(text) > max_length
+            return {
+                'success': True,
+                'text': text[:max_length],
+                'truncated': truncated,
+                'total_length': len(text),
+                'url': page.url
+            }
 
         elif action == 'refresh':
             await page.reload()
