@@ -113,6 +113,26 @@ class HeadlessBrowser:
             raise RuntimeError("Headless browser not started")
         return self._page
 
+    async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
+        """Refuse to fill password fields unless the safety config allows it."""
+        if args.get('allow_password') is True:
+            return
+        try:
+            is_password = await page.eval_on_selector(
+                selector,
+                "el => el.tagName === 'INPUT' && (el.type === 'password' || "
+                "['current-password','new-password'].includes(el.getAttribute('autocomplete')))"
+            )
+        except Exception:
+            return  # selector didn't resolve; the fill will report its own error
+        if is_password:
+            raise RuntimeError(
+                'Refused: target is a password field. Credentials belong in a '
+                'password manager, not automated typing. Set '
+                '"allow_password_typing": true in ~/.claudecodebrowser/safety.json '
+                'to override.'
+            )
+
     async def execute(self, action: str, tab_id: Optional[int], arguments: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
             try:
@@ -158,6 +178,7 @@ class HeadlessBrowser:
             selector = args.get('selector')
             text = args.get('text', '')
             if selector:
+                await self._assert_not_password(page, selector, args)
                 await page.fill(selector, text)
             else:
                 await page.keyboard.type(text)
@@ -253,8 +274,14 @@ class HeadlessBrowser:
         elif action == 'setValue':
             selector = args.get('selector', '')
             value = args.get('value', '')
+            await self._assert_not_password(page, selector, args)
             await page.fill(selector, value)
             return {'success': True}
+
+        elif action == 'requestApproval':
+            return {'success': False, 'approved': False,
+                    'error': 'No human is present in headless mode; use the '
+                             'confirm_token flow for protected actions instead.'}
 
         elif action == 'hover':
             selector = args.get('selector', '')

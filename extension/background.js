@@ -255,6 +255,9 @@ async function handleCommand(message) {
       case "goForward":
         result = await navigateHistory(tabId, "forward");
         break;
+      case "requestApproval":
+        result = await requestApproval(tabId, data);
+        break;
       // Element interaction and dynamic-content commands implemented by the
       // content script — forwarded as-is
       case "getValue":
@@ -422,6 +425,24 @@ async function screenshotAllTabs(options = {}) {
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+// Human approval: OS notification to catch the user's attention, plus an
+// in-page Approve/Deny banner (content script) that carries the decision
+async function requestApproval(tabId, data = {}) {
+  try {
+    if (browser.notifications) {
+      await browser.notifications.create({
+        type: "basic",
+        title: "Claude requests approval",
+        message: (data.message || "Claude wants to perform an action").slice(0, 200),
+        iconUrl: browser.runtime.getURL("icons/icon-48.png")
+      });
+    }
+  } catch (e) {
+    // Notifications unavailable — the in-page banner still works
+  }
+  return sendToContentScript(tabId, { action: "requestApproval", ...data });
 }
 
 // History navigation (Back/Forward buttons)

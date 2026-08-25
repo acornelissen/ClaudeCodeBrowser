@@ -66,6 +66,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "read_only": False,
     "allow_script_execution": True,
     "confirm_protected_actions": True,
+    # How protected actions get approved:
+    #   "auto"  - ask the human in their browser (overlay + OS notification)
+    #             when an attended browser is connected, else confirm_token
+    #   "human" - always require in-browser human approval
+    #   "token" - always use the agent-side confirm_token round trip
+    "protected_approval": "auto",
+    # Typing into <input type="password"> fields is refused by default.
+    # Credentials belong in the browser's own password manager (autofill),
+    # so they never pass through the AI or its logs. Set true to override.
+    "allow_password_typing": False,
     "max_actions_per_minute": 120,
     "audit_log": True,
     # Regexes matched against target URLs. Empty allowlist = allow everything
@@ -107,6 +117,7 @@ OBSERVE_TOOLS = {
     'browser_get_console_logs', 'browser_get_network_logs',
     'browser_clear_logs', 'browser_highlight', 'browser_scroll',
     'browser_hover', 'browser_focus_tab', 'browser_safety_status',
+    'browser_request_approval', 'browser_audit_page',
 }
 
 # Tools that run arbitrary JavaScript in the page. Subject to the
@@ -183,17 +194,25 @@ class SafetyGuard:
     # ------------------------------------------------------------------ #
     # Public API
 
-    def check(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Return None if the call may proceed, or an error dict to send back."""
+    def check(self, tool_name: str, arguments: Dict[str, Any],
+              human_approved: bool = False) -> Optional[Dict[str, Any]]:
+        """Return None if the call may proceed, or an error dict to send back.
+
+        human_approved=True means the person at the browser explicitly
+        approved this exact call (via the in-page Approve/Deny overlay), which
+        satisfies the protected-domain confirmation requirement.
+        """
         if not self.config.get('enabled', True):
             return None
 
         target_url = self._target_url(arguments)
         confirm_token = arguments.pop('confirm_token', None)
 
-        denial = self._check_inner(tool_name, target_url, confirm_token)
+        denial = self._check_inner(tool_name, target_url, confirm_token, human_approved)
         self._audit(tool_name, arguments, target_url,
-                    'allowed' if denial is None else denial.get('safety_decision', 'denied'))
+                    ('allowed_by_human' if human_approved and denial is None else
+                     'allowed' if denial is None else
+                     denial.get('safety_decision', 'denied')))
         return denial
 
     def note_url(self, result: Dict[str, Any]):
@@ -215,6 +234,8 @@ class SafetyGuard:
             'read_only': self.config.get('read_only', False),
             'allow_script_execution': self.config.get('allow_script_execution', True),
             'confirm_protected_actions': self.config.get('confirm_protected_actions', True),
+            'protected_approval': self.config.get('protected_approval', 'auto'),
+            'allow_password_typing': self.config.get('allow_password_typing', False),
             'max_actions_per_minute': self.config.get('max_actions_per_minute', 120),
             'actions_in_last_minute': recent,
             'pending_confirmations': pending,
@@ -230,7 +251,8 @@ class SafetyGuard:
     # Policy internals
 
     def _check_inner(self, tool_name: str, target_url: Optional[str],
-                     confirm_token: Optional[str]) -> Optional[Dict[str, Any]]:
+                     confirm_token: Optional[str],
+                     human_approved: bool = False) -> Optional[Dict[str, Any]]:
         is_observe = tool_name in OBSERVE_TOOLS
         is_script = tool_name in SCRIPT_TOOLS
 
@@ -277,6 +299,8 @@ class SafetyGuard:
             check_url = target_url if target_url is not None else self._current_url
             matched = self._matched_protected(check_url)
             if matched:
+                if human_approved:
+                    return None
                 if confirm_token and self._consume_token(confirm_token, tool_name):
                     return None
                 token = self._issue_token(tool_name)
@@ -285,6 +309,8 @@ class SafetyGuard:
                     'safety_decision': 'confirmation_required',
                     'confirmation_required': True,
                     'confirm_token': token,
+                    'approval_mode': self.config.get('protected_approval', 'auto'),
+                    'protected_url': check_url,
                     'error': (
                         f"{tool_name} targets a protected site ({check_url!r} matches "
                         f"pattern {matched!r} in safety.json). This is a guard against "

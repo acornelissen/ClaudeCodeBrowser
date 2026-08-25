@@ -1,7 +1,7 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -375,6 +375,13 @@ agent.fill_form({
 | `browser_get_network_logs` | Retrieve captured fetch/XHR requests and responses |
 | `browser_clear_logs` | Clear all captured logs |
 
+#### Human Approval, Workflows & Auditing
+| Tool | Description |
+|------|-------------|
+| `browser_request_approval` | Ask the human at the browser to Approve/Deny an action (in-page banner + OS notification) |
+| `browser_run_workflow` | Run a declarative multi-step workflow with assertions — an end-to-end test runner for web apps |
+| `browser_audit_page` | One-call page audit: headings, missing alt text, unlabeled inputs, meta info + screenshot for visual critique |
+
 #### Safety
 | Tool | Description |
 |------|-------------|
@@ -610,6 +617,39 @@ curl -X POST http://localhost:8765/mcp/call \
 - Go to the Console tab
 - Filter by "ClaudeCodeBrowser"
 
+## Workflow Testing & Page Audits
+
+Two tools turn the browser into a lightweight QA rig for building websites:
+
+**`browser_run_workflow`** executes a declarative sequence of tool steps with
+assertions — click through a signup flow, submit a form, verify the result —
+and reports pass/fail per step with a screenshot captured at the point of
+failure:
+
+```json
+{
+  "steps": [
+    { "label": "open app", "tool": "browser_navigate",
+      "arguments": { "url": "http://localhost:3000" },
+      "assert": { "selector_exists": "#login-form" } },
+    { "label": "fill email", "tool": "browser_type",
+      "arguments": { "selector": "#email", "text": "test@example.com" } },
+    { "label": "submit", "tool": "browser_click",
+      "arguments": { "selector": "button[type=submit]" },
+      "assert": { "url_contains": "/dashboard", "text_contains": "Welcome" } }
+  ]
+}
+```
+
+Every step passes through the safety guard individually, and failing steps
+capture `workflow_fail_<label>.png` automatically.
+
+**`browser_audit_page`** gathers everything needed for a structural and visual
+critique in one call: heading hierarchy, images missing alt text, unlabeled
+form inputs, empty links/buttons, meta description and viewport info, page
+dimensions — plus a screenshot. Point Claude at a page and ask for a critique;
+this tool is the evidence-gathering step.
+
 ## Safety Guards
 
 Every tool call passes through a safety guard before it reaches the browser.
@@ -625,7 +665,9 @@ the `browser_safety_status` tool.
 |-------|----------|
 | **URL scheme guard** | Navigation is limited to `http://`, `https://`, and `about:blank`. `file:`, `javascript:`, `data:`, `chrome:`, `resource:`, and `moz-extension:` targets are always refused. |
 | **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
-| **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit two-step confirmation. The first call is refused with a single-use `confirm_token`; repeating the identical call with that token proceeds. Read-only actions (screenshots, inspection) are unaffected. |
+| **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
+| **Password fields** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
+| **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus an Approve/Deny banner on the current page. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
 | **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
 | **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, and `browser_inject_observer` entirely. |
 | **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
@@ -651,6 +693,34 @@ The defaults include a starter set of protected patterns for common banking,
 payment, brokerage, government, and health domains — edit the file to match
 your own risk tolerance. Setting `"enabled": false` turns the guard off
 entirely (not recommended).
+
+### Credentials and 2FA: what this project deliberately does NOT do
+
+- **No password vault.** ClaudeCodeBrowser never stores credentials, and by
+  default refuses to type into password fields. Use the browser's own
+  password manager (Firefox autofill, Bitwarden, 1Password, ...): you click
+  the autofill yourself, and the secret never passes through the AI, its
+  arguments, or its logs.
+- **No 2FA auto-approval.** Automating Duo/TOTP/push approvals would defeat
+  the purpose of a second factor. When automation reaches a login or 2FA
+  wall, the right flow is: Claude pauses (use `browser_request_approval` to
+  ping you), you complete the login/2FA yourself in the same tab, then
+  automation continues in the authenticated session.
+
+The Duo-style pattern this project *does* implement is pointed the other way:
+**you are the second factor for Claude's actions.** Sensitive operations
+push a notification to you and wait for your explicit Approve click in the
+browser.
+
+## Pairs Well With
+
+ClaudeCodeBrowser is the *browser hands* of a Claude Code setup. For
+secretary-style workflows, combine it with purpose-built MCP connectors
+rather than screen-driving web apps: Gmail/Calendar MCP connectors handle
+email triage and scheduling far more reliably than clicking through webmail,
+while this project covers the parts that genuinely need a browser — visual
+review of what you're building, workflow testing, form filling, and anything
+without an API.
 
 ## Uninstalling
 

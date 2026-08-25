@@ -378,6 +378,8 @@
         return pressKey(message);
       case "getText":
         return getText(message);
+      case "requestApproval":
+        return requestApproval(message);
       case "getBoundingRect":
         return getBoundingRect(message);
       // Console and network logging actions
@@ -394,6 +396,89 @@
       default:
         throw new Error(`Unknown action: ${message.action}`);
     }
+  }
+
+  // Credential guard: typing into password fields is refused unless the
+  // safety config explicitly allows it. Credentials belong in the browser's
+  // own password manager (autofill), so they never pass through the AI.
+  function assertNotPasswordField(element, options) {
+    const isPassword = element.tagName === 'INPUT' &&
+      (element.type === 'password' ||
+       element.getAttribute('autocomplete') === 'current-password' ||
+       element.getAttribute('autocomplete') === 'new-password');
+    if (isPassword && options.allowPassword !== true) {
+      throw new Error(
+        'Refused: target is a password field. Use the browser’s own ' +
+        'password manager (autofill) for credentials, or set ' +
+        '"allow_password_typing": true in ~/.claudecodebrowser/safety.json ' +
+        'if you really want automated password entry.'
+      );
+    }
+  }
+
+  // Human approval banner: Approve/Deny prompt rendered on the page,
+  // resolved by a real click from the person at the browser
+  function requestApproval(options) {
+    return new Promise((resolve) => {
+      const existing = document.getElementById('__ccb_approval_banner');
+      if (existing) existing.remove();
+
+      const banner = document.createElement('div');
+      banner.id = '__ccb_approval_banner';
+      banner.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+        'background:#1a1a2e', 'color:#fff', 'padding:14px 20px',
+        'font:14px/1.5 system-ui,sans-serif', 'display:flex',
+        'align-items:center', 'gap:16px', 'box-shadow:0 2px 12px rgba(0,0,0,.4)',
+        'border-bottom:3px solid #e94560'
+      ].join(';');
+
+      const textWrap = document.createElement('div');
+      textWrap.style.cssText = 'flex:1;min-width:0';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600';
+      title.textContent = '⚠️ Claude requests approval: ' + (options.message || 'Perform an action');
+      textWrap.appendChild(title);
+      if (options.detail) {
+        const detail = document.createElement('div');
+        detail.style.cssText = 'font-size:12px;opacity:.75;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        detail.textContent = options.detail;
+        textWrap.appendChild(detail);
+      }
+
+      function makeButton(label, bg) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'padding:8px 18px;border:none;border-radius:6px;cursor:pointer;' +
+          'font:600 13px system-ui,sans-serif;color:#fff;background:' + bg;
+        return b;
+      }
+      const approveBtn = makeButton('Approve', '#16a34a');
+      const denyBtn = makeButton('Deny', '#dc2626');
+
+      banner.appendChild(textWrap);
+      banner.appendChild(approveBtn);
+      banner.appendChild(denyBtn);
+      (document.body || document.documentElement).appendChild(banner);
+
+      const timeoutMs = options.timeout || 60000;
+      let settled = false;
+      function finish(approved, timedOut) {
+        if (settled) return;
+        settled = true;
+        banner.remove();
+        resolve({
+          success: true,
+          approved: approved,
+          timedOut: !!timedOut,
+          decidedAt: new Date().toISOString()
+        });
+      }
+
+      approveBtn.addEventListener('click', () => finish(true, false));
+      denyBtn.addEventListener('click', () => finish(false, false));
+      setTimeout(() => finish(false, true), timeoutMs);
+    });
   }
 
   // Find element by various selectors
@@ -523,6 +608,8 @@
     if (!element) {
       throw new Error(`Element not found with options: ${JSON.stringify(options)}`);
     }
+
+    assertNotPasswordField(element, options);
 
     // Focus the element
     element.focus();
@@ -1274,6 +1361,8 @@
   function setValue(options) {
     const element = findElement(options);
     if (!element) throw new Error('Element not found');
+
+    assertNotPasswordField(element, options);
 
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
       element.value = options.value;
