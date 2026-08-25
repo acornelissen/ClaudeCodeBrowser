@@ -21,7 +21,12 @@ NC='\033[0m' # No Color
 # Configuration
 INSTALL_DIR="$HOME/.claudecodebrowser"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FIREFOX_NATIVE_MANIFESTS_DIR="$HOME/.mozilla/native-messaging-hosts"
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+    FIREFOX_NATIVE_MANIFESTS_DIR="$HOME/Library/Application Support/Mozilla/NativeMessagingHosts"
+else
+    FIREFOX_NATIVE_MANIFESTS_DIR="$HOME/.mozilla/native-messaging-hosts"
+fi
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════════╗"
@@ -44,8 +49,10 @@ echo -e "${GREEN}✓ Python $PYTHON_VERSION found${NC}"
 if command -v firefox &> /dev/null; then
     FIREFOX_VERSION=$(firefox --version 2>/dev/null | head -n1)
     echo -e "${GREEN}✓ $FIREFOX_VERSION found${NC}"
+elif [ -d "/Applications/Firefox.app" ] || [ -d "$HOME/Applications/Firefox.app" ]; then
+    echo -e "${GREEN}✓ Firefox.app found${NC}"
 else
-    echo -e "${YELLOW}⚠ Firefox not found in PATH${NC}"
+    echo -e "${YELLOW}⚠ Firefox not found${NC}"
 fi
 
 # Create installation directory
@@ -63,6 +70,7 @@ echo -e "${GREEN}✓ Native messaging host installed${NC}"
 
 # Copy MCP server
 cp "$SCRIPT_DIR/mcp-server/server.py" "$INSTALL_DIR/mcp-server/"
+cp "$SCRIPT_DIR/mcp-server/stdio_wrapper.py" "$INSTALL_DIR/mcp-server/"
 cp "$SCRIPT_DIR/mcp-server/mcp_config.json" "$INSTALL_DIR/mcp-server/"
 chmod +x "$INSTALL_DIR/mcp-server/server.py"
 echo -e "${GREEN}✓ MCP server installed${NC}"
@@ -76,11 +84,25 @@ echo -e "${GREEN}✓ Browser agent installed${NC}"
 echo -e "\n${YELLOW}Installing Firefox native messaging manifest...${NC}"
 mkdir -p "$FIREFOX_NATIVE_MANIFESTS_DIR"
 
+NATIVE_HOST_PATH="$INSTALL_DIR/native-host/claudecodebrowser_host.py"
+if [ "$OS" = "Darwin" ]; then
+    # Firefox on macOS launches native hosts with a minimal PATH (launchd's),
+    # so "#!/usr/bin/env python3" may not resolve (e.g. Homebrew installs).
+    # Use a launcher with the absolute python3 path resolved at install time.
+    PYTHON_BIN="$(command -v python3)"
+    cat > "$INSTALL_DIR/native-host/run_host.sh" << WRAPEOF
+#!/bin/bash
+exec "$PYTHON_BIN" "$INSTALL_DIR/native-host/claudecodebrowser_host.py"
+WRAPEOF
+    chmod +x "$INSTALL_DIR/native-host/run_host.sh"
+    NATIVE_HOST_PATH="$INSTALL_DIR/native-host/run_host.sh"
+fi
+
 cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" << EOF
 {
   "name": "claudecodebrowser",
   "description": "ClaudeCodeBrowser Native Messaging Host",
-  "path": "$INSTALL_DIR/native-host/claudecodebrowser_host.py",
+  "path": "$NATIVE_HOST_PATH",
   "type": "stdio",
   "allowed_extensions": [
     "claudecodebrowser@ligandal.com"
