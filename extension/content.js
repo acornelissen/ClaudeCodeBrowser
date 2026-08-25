@@ -380,6 +380,8 @@
         return getText(message);
       case "requestApproval":
         return requestApproval(message);
+      case "solveCaptcha":
+        return solveCaptcha(message);
       case "getBoundingRect":
         return getBoundingRect(message);
       // Console and network logging actions
@@ -478,6 +480,127 @@
       approveBtn.addEventListener('click', () => finish(true, false));
       denyBtn.addEventListener('click', () => finish(false, false));
       setTimeout(() => finish(false, true), timeoutMs);
+    });
+  }
+
+  // Captcha detection. Returns the widgets found and, where the challenge
+  // exposes a response token, whether it has already been solved.
+  function detectCaptcha() {
+    const widgets = [];
+
+    function hasResponseToken(name) {
+      const el = document.querySelector(`textarea[name="${name}"], input[name="${name}"]`);
+      return !!(el && el.value && el.value.length > 0);
+    }
+
+    // Google reCAPTCHA (v2 checkbox / invisible / v3)
+    if (document.querySelector('.g-recaptcha, iframe[src*="recaptcha"], #g-recaptcha-response')) {
+      widgets.push({
+        type: 'recaptcha',
+        solved: hasResponseToken('g-recaptcha-response') ||
+                !!document.querySelector('.recaptcha-checkbox-checked')
+      });
+    }
+    // hCaptcha
+    if (document.querySelector('.h-captcha, iframe[src*="hcaptcha"], textarea[name="h-captcha-response"]')) {
+      widgets.push({ type: 'hcaptcha', solved: hasResponseToken('h-captcha-response') });
+    }
+    // Cloudflare Turnstile
+    if (document.querySelector('.cf-turnstile, iframe[src*="challenges.cloudflare.com"], input[name="cf-turnstile-response"]')) {
+      widgets.push({ type: 'turnstile', solved: hasResponseToken('cf-turnstile-response') });
+    }
+    // Generic image/text captcha (no reliable machine-readable completion)
+    if (widgets.length === 0 &&
+        document.querySelector('img[src*="captcha" i], input[name*="captcha" i], [id*="captcha" i], [class*="captcha" i]')) {
+      widgets.push({ type: 'generic', solved: null });
+    }
+
+    return { present: widgets.length > 0, widgets };
+  }
+
+  // Detect a captcha and hand it to the human to solve, then continue.
+  // NOTE: this does not auto-solve or use any solver service — the person at
+  // the browser completes the challenge; we detect completion or a Done click.
+  function solveCaptcha(options = {}) {
+    const detection = detectCaptcha();
+    if (options.detectOnly) {
+      return { success: true, ...detection };
+    }
+    if (!detection.present) {
+      return { success: true, present: false, message: 'No captcha detected on the page.' };
+    }
+    if (detection.widgets.every(w => w.solved === true)) {
+      return { success: true, present: true, solved: true,
+               message: 'Captcha already solved.', widgets: detection.widgets };
+    }
+
+    return new Promise((resolve) => {
+      const existing = document.getElementById('__ccb_captcha_banner');
+      if (existing) existing.remove();
+
+      const types = detection.widgets.map(w => w.type).join(', ');
+      const banner = document.createElement('div');
+      banner.id = '__ccb_captcha_banner';
+      banner.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+        'background:#0f3460', 'color:#fff', 'padding:14px 20px',
+        'font:14px/1.5 system-ui,sans-serif', 'display:flex',
+        'align-items:center', 'gap:16px', 'box-shadow:0 2px 12px rgba(0,0,0,.4)',
+        'border-bottom:3px solid #ffd166'
+      ].join(';');
+
+      const textWrap = document.createElement('div');
+      textWrap.style.cssText = 'flex:1;min-width:0';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-weight:600';
+      title.textContent = '🧩 Please solve the captcha (' + types + '), then it continues automatically.';
+      const detail = document.createElement('div');
+      detail.style.cssText = 'font-size:12px;opacity:.8';
+      detail.textContent = 'Claude paused and is waiting for you. Click Done if it does not continue on its own.';
+      textWrap.appendChild(title);
+      textWrap.appendChild(detail);
+
+      const doneBtn = document.createElement('button');
+      doneBtn.textContent = 'Done';
+      doneBtn.style.cssText = 'padding:8px 18px;border:none;border-radius:6px;cursor:pointer;' +
+        'font:600 13px system-ui,sans-serif;color:#0f3460;background:#ffd166';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'padding:8px 14px;border:1px solid #ffffff55;border-radius:6px;' +
+        'cursor:pointer;font:600 13px system-ui,sans-serif;color:#fff;background:transparent';
+
+      banner.appendChild(textWrap);
+      banner.appendChild(doneBtn);
+      banner.appendChild(cancelBtn);
+      (document.body || document.documentElement).appendChild(banner);
+
+      const timeoutMs = options.timeout || 180000;
+      const start = Date.now();
+      let settled = false;
+
+      function finish(payload) {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        banner.remove();
+        resolve({ success: true, present: true, elapsedMs: Date.now() - start, ...payload });
+      }
+
+      // Auto-detect completion for token-based widgets
+      const poll = setInterval(() => {
+        const now = detectCaptcha();
+        const tokened = now.widgets.filter(w => w.solved !== null);
+        if (tokened.length && tokened.every(w => w.solved === true)) {
+          finish({ solved: true, resolvedBy: 'token', widgets: now.widgets });
+        } else if (Date.now() - start > timeoutMs) {
+          finish({ solved: false, timedOut: true, widgets: now.widgets });
+        }
+      }, 1000);
+
+      doneBtn.addEventListener('click', () =>
+        finish({ solved: true, resolvedBy: 'human', widgets: detectCaptcha().widgets }));
+      cancelBtn.addEventListener('click', () =>
+        finish({ solved: false, cancelled: true }));
     });
   }
 

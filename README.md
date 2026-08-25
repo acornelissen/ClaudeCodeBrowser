@@ -1,7 +1,7 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser/releases)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -379,6 +379,7 @@ agent.fill_form({
 | Tool | Description |
 |------|-------------|
 | `browser_request_approval` | Ask the human at the browser to Approve/Deny an action (in-page banner + OS notification) |
+| `browser_solve_captcha` | Detect a captcha and hand it to the human to solve, then continue (never auto-solves) |
 | `browser_run_workflow` | Run a declarative multi-step workflow with assertions — an end-to-end test runner for web apps |
 | `browser_audit_page` | One-call page audit: headings, missing alt text, unlabeled inputs, meta info + screenshot for visual critique |
 
@@ -711,6 +712,25 @@ The Duo-style pattern this project *does* implement is pointed the other way:
 **you are the second factor for Claude's actions.** Sensitive operations
 push a notification to you and wait for your explicit Approve click in the
 browser.
+
+### Captchas: detect and hand off, never auto-solve
+
+`browser_solve_captcha` follows the same human-in-the-loop principle.
+Captchas exist to tell humans from bots, so auto-solving them (via OCR or
+third-party solver farms) is explicitly **not** something this project does.
+Instead:
+
+- It **detects** reCAPTCHA, hCaptcha, Cloudflare Turnstile, and generic
+  image/text captchas on the page.
+- It **notifies you** (OS notification + an in-page banner) and **pauses**.
+- **You solve it** in the same tab. For token-based widgets (reCAPTCHA,
+  hCaptcha, Turnstile) it auto-detects completion and continues; otherwise
+  click **Done**. `detect_only: true` just reports what's present without
+  waiting.
+
+In headless mode there is no human, so it reports what it detected and that a
+human is required — re-run that step in attended mode (the Firefox extension)
+so you can complete the challenge.
 
 ## Pairs Well With
 

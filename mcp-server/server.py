@@ -754,6 +754,26 @@ MCP_TOOLS: List[MCPTool] = [
         }
     ),
     MCPTool(
+        name="browser_solve_captcha",
+        description=(
+            "Detect a captcha on the page and hand it to the human to solve, then continue. "
+            "Detects reCAPTCHA, hCaptcha, Cloudflare Turnstile, and generic image captchas, "
+            "shows a solve banner plus an OS notification, and waits until the challenge is "
+            "completed (its response token appears) or the human clicks Done. This project "
+            "does NOT auto-solve captchas or use solver services — a human completes the "
+            "challenge. In headless mode there is no human, so it reports what it detected "
+            "and that a human is required."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "timeout": {"type": "integer", "description": "How long to wait for the human to solve it, in ms.", "default": 180000},
+                "detect_only": {"type": "boolean", "description": "Only report whether a captcha is present, without waiting.", "default": False},
+                "tab_id": {"type": "integer", "description": "Optional tab ID."}
+            }
+        }
+    ),
+    MCPTool(
         name="browser_audit_page",
         description="Audit the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. One call gathers everything needed to critique a page's structure and accessibility basics.",
         input_schema={
@@ -895,7 +915,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.3.0',
+                'version': '1.4.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -1079,7 +1099,9 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             'browser_press_key': 'pressKey',
             'browser_get_text': 'getText',
             # Human approval
-            'browser_request_approval': 'requestApproval'
+            'browser_request_approval': 'requestApproval',
+            # Captcha detection + human handoff
+            'browser_solve_captcha': 'solveCaptcha'
         }
 
         if tool_name not in tool_action_map:
@@ -1104,9 +1126,14 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         (WebSocket, headless Playwright, or native-host HTTP polling)."""
         guard = get_safety_guard()
 
-        # Approval prompts wait on a human decision (60s by default), so give
-        # the transport more headroom than the usual command timeout.
-        wait_timeout = 90.0 if action == 'requestApproval' else 30.0
+        # Prompts that wait on a human (approval, captcha solving) can take far
+        # longer than a normal command, so give the transport matching headroom.
+        if action == 'requestApproval':
+            wait_timeout = 90.0
+        elif action == 'solveCaptcha':
+            wait_timeout = 200.0
+        else:
+            wait_timeout = 30.0
 
         # Check if we have a browser connection via WebSocket
         browser = connection_manager.get_active_browser()
@@ -1537,7 +1564,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|           ClaudeCodeBrowser MCP Server v1.3.0                |
+|           ClaudeCodeBrowser MCP Server v1.4.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |
