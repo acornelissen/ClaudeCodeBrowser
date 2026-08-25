@@ -96,17 +96,26 @@ The native messaging host (`claudecodebrowser_host.py`) provides an alternative 
 
 **System Python websockets** (required for WebSocket server on port 8766):
 ```bash
-sudo apt install python3-websockets
+sudo apt install python3-websockets   # Linux
+pip3 install websockets              # macOS
 ```
 
-Without this, the server runs in HTTP-only mode and `browsers_connected` will always show 0.
+Without this, the server runs in HTTP-only mode and `browsers_connected` will always show 0. Everything else still works over HTTP.
 
-### Quick Install
+### Quick Install (Linux and macOS)
 
 ```bash
-cd /mnt/backup/ClaudeCodeBrowser
+cd ClaudeCodeBrowser
 ./scripts/install.sh
 ```
+
+### macOS notes
+
+The install script handles these automatically, but if you are installing manually:
+
+- The native messaging manifest goes in `~/Library/Application Support/Mozilla/NativeMessagingHosts/` (not `~/.mozilla/`).
+- The native host must live outside TCC-protected folders (`~/Documents`, `~/Desktop`, `~/Downloads`). Firefox is not allowed to execute anything there and fails with `Operation not permitted`. The default install location `~/.claudecodebrowser` is fine.
+- The manifest should point to a wrapper script with an absolute `python3` path. Firefox launches native hosts with a minimal PATH, so `#!/usr/bin/env python3` may not resolve (e.g. Homebrew installs).
 
 ### Manual Installation
 
@@ -121,8 +130,12 @@ cd /mnt/backup/ClaudeCodeBrowser
 
 2. **Install native messaging manifest for Firefox:**
    ```bash
+   # Linux
    mkdir -p ~/.mozilla/native-messaging-hosts
    cp native-host/claudecodebrowser.json ~/.mozilla/native-messaging-hosts/
+   # macOS
+   mkdir -p ~/Library/Application\ Support/Mozilla/NativeMessagingHosts
+   cp native-host/claudecodebrowser.json ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/
    # Update the path in the JSON file to point to your installation
    ```
 

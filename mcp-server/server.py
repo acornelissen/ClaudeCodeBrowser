@@ -285,10 +285,15 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_tabs",
-        description="Get list of all open browser tabs with detailed state info including URL, title, active status, loading state, window info, and whether playing audio.",
+        description="Get list of open browser tabs (URL, title, active status, loading state, whether playing audio). Defaults to the current window and a max of 50 tabs to keep results small when many tabs are open — pass current_window_only=false to see every window, or url_pattern to filter.",
         input_schema={
             "type": "object",
-            "properties": {}
+            "properties": {
+                "current_window_only": {"type": "boolean", "default": True, "description": "Only list tabs in the current window. Set false to include every open Firefox window."},
+                "limit": {"type": "integer", "default": 50, "description": "Max tabs to return."},
+                "url_pattern": {"type": "string", "description": "Regex to filter tabs by URL before applying limit."},
+                "include_favicon": {"type": "boolean", "default": False, "description": "Include favIconUrl (often a large base64 data URI) per tab."}
+            }
         }
     ),
     MCPTool(
