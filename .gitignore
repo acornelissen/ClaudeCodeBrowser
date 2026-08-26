@@ -2,8 +2,9 @@
 *.xpi
 *.zip
 
-# Build output (e.g. scripts/build-chrome.sh)
+# Build output (scripts/build-chrome.sh, scripts/package-extension.sh)
 build/
+dist/
 
 # Logs
 *.log
