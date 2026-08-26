@@ -27,9 +27,29 @@ VERSION=$(python3 -c "import json; print(json.load(open('$SRC/manifest.json'))['
 EXT_ID=$(python3 -c "import json; print(json.load(open('$SRC/manifest.json'))['browser_specific_settings']['gecko']['id'])")
 XPI="$DIST/claudecodebrowser-${VERSION}.xpi"
 
+# Where release assets live. The manifest's update_url points at
+# releases/latest/download/updates.json (a stable URL), and each release's
+# .xpi is downloaded from its versioned tag.
+REPO_SLUG="${CCB_REPO_SLUG:-nanogenomic/ClaudeCodeBrowser}"
+XPI_URL="https://github.com/${REPO_SLUG}/releases/download/v${VERSION}/claudecodebrowser-${VERSION}.xpi"
+
 mkdir -p "$DIST"
 
 echo "Packaging ClaudeCodeBrowser extension v${VERSION} (${EXT_ID})"
+
+# Emit the Firefox update manifest so installed copies can auto-update.
+cat > "$DIST/updates.json" << EOF
+{
+  "addons": {
+    "${EXT_ID}": {
+      "updates": [
+        { "version": "${VERSION}", "update_link": "${XPI_URL}" }
+      ]
+    }
+  }
+}
+EOF
+echo "Wrote update manifest: $DIST/updates.json"
 
 if [ "$SIGN" = "1" ]; then
     if ! command -v web-ext &> /dev/null; then
@@ -49,7 +69,18 @@ if [ "$SIGN" = "1" ]; then
         --channel=unlisted \
         --api-key "$AMO_JWT_ISSUER" \
         --api-secret "$AMO_JWT_SECRET"
-    echo "Signed .xpi written to $DIST (auto-named by web-ext)."
+    # web-ext names the signed file with underscores; normalize to the name
+    # the update manifest expects so update_link resolves.
+    SIGNED=$(ls -t "$DIST"/*.xpi 2>/dev/null | head -n1)
+    if [ -n "$SIGNED" ] && [ "$SIGNED" != "$XPI" ]; then
+        cp "$SIGNED" "$XPI"
+    fi
+    echo "Signed .xpi ready: $XPI"
+    echo ""
+    echo "To publish this as an auto-updating release:"
+    echo "  1. Create GitHub release tag v${VERSION}"
+    echo "  2. Upload BOTH assets: $XPI  and  $DIST/updates.json"
+    echo "  Installed copies then update within ~24h (or via about:addons > Check for Updates)."
 else
     # Plain zip -> .xpi. The archive root must be the manifest, not a folder.
     ( cd "$SRC" && zip -r -FS "$XPI" . -x '*.DS_Store' > /dev/null )
