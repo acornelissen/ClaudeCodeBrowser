@@ -275,8 +275,40 @@ pointing at the matching versioned `.xpi`. So each new plugin version is just:
 2. `./scripts/package-extension.sh --sign` (or the `.ps1` on Windows) — writes
    the signed `claudecodebrowser-<version>.xpi` **and** `updates.json` into
    `dist/`.
-3. Create a GitHub release tagged `v<version>` and upload **both** files as
-   release assets.
+3. Publish the release with both assets — one command:
+   ```bash
+   ./scripts/publish-release.sh            # or --draft to review before publishing
+   ```
+   It reads the version from the manifest, creates the `v<version>` release,
+   and uploads the `.xpi` + `updates.json`. It uses the `gh` CLI if present
+   (`gh auth login`), otherwise falls back to the GitHub API with
+   `GITHUB_TOKEN` (needs `repo` scope).
+
+   <details><summary>Prefer to run it by hand?</summary>
+
+   With the `gh` CLI:
+   ```bash
+   VER=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
+   gh release create "v$VER" \
+     "dist/claudecodebrowser-$VER.xpi" "dist/updates.json" \
+     --title "v$VER" --notes "ClaudeCodeBrowser v$VER"
+   ```
+
+   With `curl` (set `GITHUB_TOKEN`):
+   ```bash
+   VER=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
+   REPO=nanogenomic/ClaudeCodeBrowser
+   ID=$(curl -sS -X POST "https://api.github.com/repos/$REPO/releases" \
+     -H "Authorization: Bearer $GITHUB_TOKEN" \
+     -d "{\"tag_name\":\"v$VER\",\"name\":\"v$VER\"}" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
+   curl -sS -X POST "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=claudecodebrowser-$VER.xpi" \
+     -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/octet-stream" \
+     --data-binary @"dist/claudecodebrowser-$VER.xpi"
+   curl -sS -X POST "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=updates.json" \
+     -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" \
+     --data-binary @"dist/updates.json"
+   ```
+   </details>
 
 Installed copies check `releases/latest/download/updates.json`, see the higher
 version, and update themselves within ~24h — or immediately via *Check for
