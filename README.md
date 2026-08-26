@@ -216,11 +216,19 @@ them and you're current. **The browser extension is separate**: it runs
 inside Firefox and does not update from a `git pull`. How you update it
 depends on how it was installed.
 
-Build a versioned package with:
+Build a versioned package (both scripts also emit `dist/updates.json` for
+auto-update — see below):
 
 ```bash
+# Linux / macOS
 ./scripts/package-extension.sh          # dist/claudecodebrowser-<version>.xpi
 ./scripts/package-extension.sh --sign   # signed via AMO (see below)
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File scripts\package-extension.ps1
+powershell -ExecutionPolicy Bypass -File scripts\package-extension.ps1 -Sign
 ```
 
 **1. Temporary add-on (development).** If you loaded it through
@@ -253,25 +261,31 @@ Mozilla without a public listing:
 3. Install the signed `.xpi` by opening it in Firefox (drag it onto the
    window, or `about:addons` → gear → *Install Add-on From File*).
 
-To make it **auto-update**, host the signed `.xpi` and an update manifest
-somewhere (e.g. GitHub Releases), and add an `update_url` to the extension's
-`browser_specific_settings.gecko` before signing:
+**Auto-update is already wired** to GitHub Releases. The manifest carries:
 
 ```json
-"browser_specific_settings": {
-  "gecko": {
-    "id": "claudecodebrowser@ligandal.com",
-    "strict_min_version": "78.0",
-    "update_url": "https://your-host/updates.json"
-  }
-}
+"update_url": "https://github.com/nanogenomic/ClaudeCodeBrowser/releases/latest/download/updates.json"
 ```
 
-`updates.json` maps the extension ID to each version's `.xpi` URL (Mozilla's
-[updateURL manifest format](https://extensionworkshop.com/documentation/manage/updating-your-extension/)).
-Bump `version` in `manifest.json`, re-sign, upload the new `.xpi`, and point
-`updates.json` at it — installed copies update themselves within a day (or on
-"Check for Updates" in `about:addons`).
+That's a stable URL — it always resolves to the newest release's
+`updates.json` — and the packaging scripts generate that `updates.json`
+pointing at the matching versioned `.xpi`. So each new plugin version is just:
+
+1. Bump `version` in `extension/manifest.json`.
+2. `./scripts/package-extension.sh --sign` (or the `.ps1` on Windows) — writes
+   the signed `claudecodebrowser-<version>.xpi` **and** `updates.json` into
+   `dist/`.
+3. Create a GitHub release tagged `v<version>` and upload **both** files as
+   release assets.
+
+Installed copies check `releases/latest/download/updates.json`, see the higher
+version, and update themselves within ~24h — or immediately via *Check for
+Updates* in `about:addons`. (Format reference: Mozilla's
+[updateURL manifest](https://extensionworkshop.com/documentation/manage/updating-your-extension/).)
+
+> Forking? Set `CCB_REPO_SLUG=youruser/yourrepo` when packaging so the
+> generated `update_link` points at your releases, and change the `update_url`
+> in the manifest to match.
 
 **3. Public AMO listing.** To distribute on
 [addons.mozilla.org](https://addons.mozilla.org), run
