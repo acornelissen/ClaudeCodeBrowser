@@ -209,6 +209,81 @@ extension (step 1 below) and add the printed MCP config to Claude Code.
    }
    ```
 
+## Updating the Firefox Extension
+
+The MCP server and native host are plain Python — pull the repo and restart
+them and you're current. **The browser extension is separate**: it runs
+inside Firefox and does not update from a `git pull`. How you update it
+depends on how it was installed.
+
+Build a versioned package with:
+
+```bash
+./scripts/package-extension.sh          # dist/claudecodebrowser-<version>.xpi
+./scripts/package-extension.sh --sign   # signed via AMO (see below)
+```
+
+**1. Temporary add-on (development).** If you loaded it through
+`about:debugging` → *Load Temporary Add-on*, it is not persistent and does
+not auto-update:
+
+- Open `about:debugging#/runtime/this-firefox`
+- Find ClaudeCodeBrowser and click **Reload**, or remove it and load the new
+  `manifest.json`/`.xpi` again
+- It is removed on Firefox restart, so you reload it each session
+
+This is the quickest loop while developing, and it's where you are if you've
+been "reloading the plugin" after each change. When the manifest gains a new
+permission (v1.3.0 added `notifications`), a reload picks it up.
+
+**2. Signed, self-distributed `.xpi` (recommended for real use).** A signed
+extension installs permanently and can **auto-update**. Sign it through
+Mozilla without a public listing:
+
+1. Create an AMO API key at
+   <https://addons.mozilla.org/developers/addon/api/key/> and export it:
+   ```bash
+   export AMO_JWT_ISSUER=user:xxxx
+   export AMO_JWT_SECRET=yyyy
+   npm install -g web-ext        # one-time
+   ```
+2. Sign: `./scripts/package-extension.sh --sign`
+   (this uploads to AMO's signer with `--channel=unlisted` and writes a
+   signed `.xpi` to `dist/`).
+3. Install the signed `.xpi` by opening it in Firefox (drag it onto the
+   window, or `about:addons` → gear → *Install Add-on From File*).
+
+To make it **auto-update**, host the signed `.xpi` and an update manifest
+somewhere (e.g. GitHub Releases), and add an `update_url` to the extension's
+`browser_specific_settings.gecko` before signing:
+
+```json
+"browser_specific_settings": {
+  "gecko": {
+    "id": "claudecodebrowser@ligandal.com",
+    "strict_min_version": "78.0",
+    "update_url": "https://your-host/updates.json"
+  }
+}
+```
+
+`updates.json` maps the extension ID to each version's `.xpi` URL (Mozilla's
+[updateURL manifest format](https://extensionworkshop.com/documentation/manage/updating-your-extension/)).
+Bump `version` in `manifest.json`, re-sign, upload the new `.xpi`, and point
+`updates.json` at it — installed copies update themselves within a day (or on
+"Check for Updates" in `about:addons`).
+
+**3. Public AMO listing.** To distribute on
+[addons.mozilla.org](https://addons.mozilla.org), run
+`web-ext sign --channel=listed` (or submit the `.xpi` in the Developer Hub)
+and go through Mozilla's review. Users then install and update like any store
+add-on. Best when you want the extension discoverable; heavier because each
+version is reviewed.
+
+> Whichever route: bump `version` in `extension/manifest.json` first (it must
+> increase for Firefox to treat a build as an update), keep it in step with
+> the server version, then repackage.
+
 ## Usage
 
 ### Starting the MCP Server
@@ -582,6 +657,8 @@ curl -X POST http://localhost:8765/mcp/call \
 - Ensure manifest.json is valid JSON
 - Check Firefox console for errors
 - Verify the extension ID matches in native messaging manifest
+- After pulling a new version, remember the extension must be repackaged and
+  reloaded — see [Updating the Firefox Extension](#updating-the-firefox-extension)
 
 ### Native messaging not working
 - Check that the path in `claudecodebrowser.json` is correct
