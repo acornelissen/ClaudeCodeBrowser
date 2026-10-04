@@ -1655,6 +1655,20 @@
       };
     }
 
+    // A checkbox or radio keeps its state in `checked`; `.value` is only the
+    // string it would submit, and that string is the same ticked or not
+    // (it defaults to "on"). Returning it told an agent reading a consent
+    // box or a radio group nothing at all, so report the state as the value
+    // and keep the submit string beside it.
+    if (isCheckableInput(element)) {
+      return {
+        value: !!element.checked,
+        checked: !!element.checked,
+        submitValue: element.value ?? null,
+        element: getElementInfo(element)
+      };
+    }
+
     let value;
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
       value = element.value;
@@ -1667,6 +1681,14 @@
     return { value, element: getElementInfo(element) };
   }
 
+  // <input type="checkbox"> and <input type="radio"> are the two inputs whose
+  // state lives in `checked` rather than `value`.
+  function isCheckableInput(element) {
+    if (!element || element.tagName !== 'INPUT') return false;
+    const type = String(element.type || '').toLowerCase();
+    return type === 'checkbox' || type === 'radio';
+  }
+
   // Set value
   function setValue(options) {
     const element = findElement(options);
@@ -1674,9 +1696,37 @@
 
     assertNotPasswordField(element, options);
 
+    // Assigning to `.value` on a checkbox or radio changes the string it
+    // submits and leaves the tick alone, so the old code reported
+    // {set: true} after changing nothing the caller cared about. Take the
+    // value as the state to put the box in, and refuse anything that is not
+    // clearly on or off rather than guessing.
+    if (isCheckableInput(element)) {
+      const wanted = parseFlag(options.value, null);
+      if (wanted === null) {
+        throw new Error(
+          `Cannot set a ${element.type} from ${JSON.stringify(options.value)}: ` +
+          'its state is checked/unchecked, not text. Pass true or false ' +
+          '(or "on"/"off"), or use browser_click to toggle it.'
+        );
+      }
+      element.checked = wanted;
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      return { set: true, checked: wanted, element: getElementInfo(element) };
+    }
+
+    if (element.tagName === 'SELECT') {
+      // A real <select> silently resets to '' when the assigned value matches
+      // no option, so {set: true} was a lie for any value the dropdown does
+      // not offer. Go through the same resolver browser_select_option uses.
+      const chosen = chooseSelectOption(element, { value: options.value });
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+      return { set: true, ...chosen, element: getElementInfo(element) };
+    }
+
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
-      element.value = options.value;
-    } else if (element.tagName === 'SELECT') {
       element.value = options.value;
     } else if (element.isContentEditable) {
       element.textContent = options.value;
@@ -1806,12 +1856,21 @@
     }
 
     const maxLength = options.maxLength || 20000;
-    const text = element.innerText || element.textContent || '';
+    // innerText is the visible text this tool promises: it leaves out
+    // display:none subtrees, textContent does not. `innerText || textContent`
+    // fell through whenever the visible text was empty - a hidden template,
+    // a collapsed menu - and handed back the hidden markup as "visible text".
+    // The fallback is still needed where innerText does not exist (an SVG
+    // element, a detached node), so keep it and say which one was read.
+    const visible = typeof element.innerText === 'string';
+    const text = visible ? element.innerText : (element.textContent || '');
+    const source = visible ? 'innerText' : 'textContent';
 
     return {
       text: text.slice(0, maxLength),
       truncated: text.length > maxLength,
       totalLength: text.length,
+      source,
       url: window.location.href,
       title: document.title
     };
@@ -1824,21 +1883,49 @@
       throw new Error('Select element not found');
     }
 
-    if (options.value !== undefined) {
-      element.value = options.value;
-    } else if (options.index !== undefined) {
-      element.selectedIndex = options.index;
-    } else if (options.text) {
-      const option = Array.from(element.options).find(o => o.text === options.text);
-      if (option) element.value = option.value;
-    }
+    const chosen = chooseSelectOption(element, options);
 
     element.dispatchEvent(new Event('change', { bubbles: true }));
 
+    return { selected: true, ...chosen };
+  }
+
+  // Pick the option the caller asked for and report what the <select> is
+  // actually on afterwards. The old code assigned element.value and trusted
+  // it: a value no option carries resets a real <select> to '', and a `text`
+  // that matched nothing was ignored without a word, so the caller was told
+  // {selected: true} about a dropdown it had not moved. Selecting by index
+  // is the one authoritative assignment - it updates .value for us, and it
+  // still works when two options share a value.
+  function chooseSelectOption(element, request) {
+    const list = Array.from(element.options || []);
+    let index = -1;
+
+    if (request.value !== undefined) {
+      index = list.findIndex(o => o.value === String(request.value));
+    } else if (request.index !== undefined) {
+      index = Number(request.index);
+      if (!Number.isInteger(index) || index < 0 || index >= list.length) index = -1;
+    } else if (request.text !== undefined) {
+      index = list.findIndex(o => o.text === request.text);
+    } else {
+      throw new Error('Nothing to select: pass value, text or index.');
+    }
+
+    if (index < 0) {
+      const offered = list.map(o => o.value).join(', ') || '(none)';
+      throw new Error(
+        `No option matching ${JSON.stringify(request.value ?? request.text ?? request.index)}. ` +
+        `Available values: ${offered}`
+      );
+    }
+
+    element.selectedIndex = index;
+
     return {
-      selected: true,
       value: element.value,
-      text: element.options[element.selectedIndex]?.text
+      text: list[element.selectedIndex]?.text ?? null,
+      index: element.selectedIndex
     };
   }
 
@@ -1848,18 +1935,32 @@
     if (!element) throw new Error('Element not found');
 
     const styles = window.getComputedStyle(element);
+    // getPropertyValue takes a CSS property name, not the camelCase alias:
+    // 'backgroundColor', 'fontSize' and 'fontFamily' used to come back ''
+    // on every real page, so three of these twelve defaults never reported
+    // anything.
     const properties = options.properties || [
       'display', 'visibility', 'opacity', 'position',
-      'width', 'height', 'color', 'backgroundColor',
-      'fontSize', 'fontFamily', 'margin', 'padding'
+      'width', 'height', 'color', 'background-color',
+      'font-size', 'font-family', 'margin', 'padding'
     ];
 
     const result = {};
     properties.forEach(prop => {
-      result[prop] = styles.getPropertyValue(prop);
+      // Callers (and older workflows) still pass camelCase, so translate
+      // before asking, and key the answer by whatever name they used.
+      result[prop] = styles.getPropertyValue(cssPropertyName(prop));
     });
 
     return { styles: result, element: getElementInfo(element) };
+  }
+
+  // backgroundColor -> background-color. A name that is already hyphenated
+  // or is a --custom-property passes through untouched.
+  function cssPropertyName(prop) {
+    const name = String(prop);
+    if (name.startsWith('--')) return name;
+    return name.replace(/[A-Z]/g, (ch) => `-${ch.toLowerCase()}`);
   }
 
   // Get bounding rect

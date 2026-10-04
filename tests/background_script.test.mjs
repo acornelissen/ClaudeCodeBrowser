@@ -96,7 +96,26 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
       getURL: (p) => `moz-extension://stub/${p}`
     },
     tabs: {
-      query: async () => [{ id: 7, windowId: 1, url: 'http://stub.test/', title: 'stub' }],
+      // Honours currentWindow, and the tabs carry the fields Firefox sets.
+      // The stub used to discard the query object and return one bare tab, so
+      // getAllTabs' privacy default - the current window, not the user's
+      // whole browsing surface - was only ever asserted through the `scope`
+      // string it reports. Swapping {currentWindow: true} for {} kept the
+      // suite green.
+      query: async (q = {}) => {
+        const all = [
+          { id: 7, windowId: 1, url: 'http://stub.test/', title: 'stub',
+            active: true, pinned: false, status: 'complete', audible: false,
+            discarded: false, index: 0, favIconUrl: 'http://stub.test/f.ico' },
+          { id: 9, windowId: 2, url: 'http://other-window.test/',
+            title: 'other', active: true, pinned: false, status: 'complete',
+            audible: false, discarded: false, index: 0 }
+        ];
+        let out = all;
+        if (q.currentWindow) out = out.filter(t => t.windowId === 1);
+        if (q.active !== undefined) out = out.filter(t => t.active === q.active);
+        return out;
+      },
       get: async (id) => {
         if (tabGetRejects) throw new Error('No tab with id ' + id);
         return { id, windowId: 1, url: tabUrl, title: 'stub',
@@ -372,7 +391,30 @@ test('the response body filter passes every chunk through and closes', async () 
   assert.equal(result.logs[0].responseBody, '{"items":[1,2,3]}');
 });
 
-test('a chunk that cannot be decoded is still passed through', async () => {
+test('invalid utf-8 bytes are passed through and not logged as text', async () => {
+  // The old fixture was `{ byteLength: 4 }` - not a buffer, so decode() threw
+  // and the test exercised a catch that real input never reaches:
+  // TextDecoder is non-fatal by default and yields U+FFFD rather than
+  // throwing. These are bytes Firefox really can deliver.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  fireRequest(webRequest, { complete: false });
+  const filter = filters[0];
+  const invalid = new Uint8Array([0x7b, 0xff, 0xfe, 0x80, 0x81, 0x82, 0x7d]);
+
+  filter.ondata({ data: invalid });
+  assert.deepEqual(Array.from(filter.written[0]), Array.from(invalid),
+    'the page must receive the chunk even when logging cannot read it');
+
+  filter.onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(entry.responseBody, /not captured/,
+    'replacement characters are binary noise, not the page content');
+});
+
+test('a chunk that genuinely throws on decode is still passed through', async () => {
   const { command, webRequest, filters } = loadBackground();
   await command('startLogging', {}, 7);
 
@@ -382,7 +424,7 @@ test('a chunk that cannot be decoded is still passed through', async () => {
 
   filter.ondata({ data: bad });
   assert.deepEqual(filter.written, [bad],
-    'the page must receive the chunk even when logging cannot read it');
+    'logging must never be able to stop the page receiving its data');
 });
 
 test('non-textual responses are not filtered at all', async () => {
@@ -1528,6 +1570,53 @@ test('get_network_logs finds a status given as a string', async () => {
 
   assert.equal(result.logs.length, 1,
     'a strict comparison against the numeric status returned nothing');
+});
+
+test('get_tabs defaults to the current window, by which tabs come back', async () => {
+  // This privacy default was only ever asserted through the `scope` string
+  // the result reports, so swapping {currentWindow: true} for {} kept the
+  // suite green while handing over every window.
+  const ctx = loadBackground();
+
+  const scoped = await ctx.command('getTabs', {}, undefined);
+  assert.deepEqual(scoped.tabs.map(t => t.id), [7],
+    'the default must not reach into another window');
+
+  const wide = await ctx.command('getTabs', { currentWindowOnly: false },
+                                 undefined);
+  assert.deepEqual(wide.tabs.map(t => t.id).sort(), [7, 9],
+    'opting in explicitly must widen the view');
+});
+
+test('a log entry hands the caller only the fields it should', async () => {
+  // Every other assertion here is a scalar, because deepEqual cannot compare
+  // an object built inside the vm realm. Re-homing it through JSON makes a
+  // whole-shape assertion possible, so the next internal field added does not
+  // reach the agent unnoticed - filterAttached already did once.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestHeaders: [{ name: 'Authorization', value: 'Bearer x' }]
+  });
+
+  const entry = JSON.parse(JSON.stringify(
+    (await command('getNetworkLogs', {}, 7)).logs[0]));
+
+  const allowed = new Set([
+    'id', 'requestId', 'tabId', 'url', 'method', 'type', 'timestamp',
+    'status', 'statusLine', 'statusCode', 'statusText', 'startTime',
+    'fromCache', 'requestHeaders',
+    'responseHeaders', 'requestBody', 'responseBody', 'responseBodyTruncated',
+    'responseBodyBytes', 'responseCharset', 'responseEncoding', 'charsetNote',
+    'responseType', 'contentType', 'error', 'duration', 'completedAt',
+    'startedAt', 'redirectedTo', 'redirectedFrom', 'ip', 'size'
+  ]);
+  const unexpected = Object.keys(entry).filter(k => !allowed.has(k));
+  assert.deepEqual(unexpected, [],
+    `internal bookkeeping reached the caller: ${unexpected.join(', ')}`);
+  assert.equal(entry.requestHeaders.Authorization, '***',
+    'the credential header must be redacted');
 });
 
 test('find_tabs requires a filter rather than dumping every tab', async () => {

@@ -25,14 +25,23 @@ function makeElement(tag, props = {}) {
     className: props.className || '',
     classList: props.className ? props.className.split(/\s+/) : [],
     textContent: props.textContent || '',
+    /** innerText is the visible text; textContent includes display:none
+     *  subtrees. They are the same on an element with nothing hidden in it,
+     *  so that is the default, and a fixture with hidden content sets
+     *  innerText itself (often to '') to make the difference show. */
+    innerText: props.innerText !== undefined
+      ? props.innerText
+      : (props.textContent || ''),
     style: { cssText: '' },
     isContentEditable: false,
     disabled: false,
-    checked: false,
+    checked: props.checked === true,
     parentElement: null,
     children: [],
     options: [],
     selectedIndex: -1,
+    /** Computed CSS, keyed by real CSS property name ('background-color'). */
+    _styles: props.styles || {},
     _attributes: props.attributes || {},
     getAttribute(name) {
       return Object.prototype.hasOwnProperty.call(this._attributes, name)
@@ -72,6 +81,34 @@ function makeElement(tag, props = {}) {
     dispatchEvent() { return true; },
     closest() { return null; }
   };
+
+  if (el.tagName === 'SELECT') {
+    el.options = (props.options || []).map(o => (
+      typeof o === 'string' ? { value: o, text: o }
+                            : { value: o.value, text: o.text ?? o.value }
+    ));
+    // A real <select> keeps no value of its own: .value is the selected
+    // option's value, assigning a value no option carries deselects
+    // everything and .value reads back as ''. Code that assigns and then
+    // reports .value is only testable against that behaviour.
+    let selectedIndex = props.selectedIndex !== undefined
+      ? props.selectedIndex
+      : (el.options.length ? 0 : -1);
+    Object.defineProperty(el, 'selectedIndex', {
+      get: () => selectedIndex,
+      set: (i) => {
+        const n = Number(i);
+        selectedIndex = (Number.isInteger(n) && n >= 0 && n < el.options.length) ? n : -1;
+      }
+    });
+    Object.defineProperty(el, 'value', {
+      get: () => (el.options[selectedIndex] ? el.options[selectedIndex].value : ''),
+      set: (v) => {
+        selectedIndex = el.options.findIndex(o => o.value === String(v));
+      }
+    });
+  }
+
   return el;
 }
 
@@ -146,12 +183,24 @@ function loadContentScript(registry) {
     innerHeight: 800,
     scrollX: 0,
     scrollY: 0,
-    getComputedStyle: () => ({
-      display: 'block',
-      visibility: 'visible',
-      opacity: '1',
-      getPropertyValue: () => ''
-    }),
+    /** getPropertyValue answers for CSS property names ('background-color')
+     *  and returns '' for any name it does not know. A stub that returned ''
+     *  for everything could not show that content.js was asking for the
+     *  camelCase alias, so this one only answers for names it was given. */
+    getComputedStyle: (el) => {
+      const computed = {
+        display: 'block',
+        visibility: 'visible',
+        opacity: '1',
+        ...((el && el._styles) || {})
+      };
+      return {
+        ...computed,
+        getPropertyValue: (name) => (
+          Object.prototype.hasOwnProperty.call(computed, name) ? computed[name] : ''
+        )
+      };
+    },
     scrollTo() {}, scrollBy() {},
     _listeners: {},
     addEventListener(type, fn) {
@@ -1155,6 +1204,218 @@ test('typing into a contenteditable element still works', async () => {
 
   assert.equal(result.typed, true);
   assert.equal(editor.textContent, 'hello');
+});
+
+// --------------------------------------------------------------------------
+// Checkboxes, radios and <select>: reading state, not the submit string.
+
+test('browser_get_value reports a checkbox state, not its submit string', async () => {
+  // The default value attribute of a checkbox is "on" whether it is ticked
+  // or not, so returning it told the caller nothing about the consent box.
+  const off = makeElement('input', { id: 'tos', type: 'checkbox', value: 'on' });
+  const on = makeElement('input', { id: 'ads', type: 'checkbox', value: 'on', checked: true });
+  const { send } = loadContentScript({ '#tos': off, '#ads': on });
+
+  const unchecked = await send({ action: 'getValue', selector: '#tos' });
+  const checked = await send({ action: 'getValue', selector: '#ads' });
+
+  assert.equal(unchecked.value, false);
+  assert.equal(unchecked.checked, false);
+  assert.equal(unchecked.submitValue, 'on');
+  assert.equal(checked.value, true);
+  assert.equal(checked.checked, true);
+  assert.notEqual(unchecked.value, checked.value,
+    'a ticked and an unticked box must not read back the same');
+});
+
+test('browser_get_value tells the selected radio from the unselected one', async () => {
+  const yes = makeElement('input', { id: 'yes', type: 'radio', name: 'ship', value: 'yes' });
+  const no = makeElement('input', {
+    id: 'no', type: 'radio', name: 'ship', value: 'no', checked: true
+  });
+  const { send } = loadContentScript({ '#yes': yes, '#no': no });
+
+  assert.equal((await send({ action: 'getValue', selector: '#yes' })).checked, false);
+  assert.equal((await send({ action: 'getValue', selector: '#no' })).checked, true);
+});
+
+test('browser_set_value ticks a checkbox instead of rewriting its value', async () => {
+  const box = makeElement('input', { id: 'tos', type: 'checkbox', value: 'on' });
+  const { send } = loadContentScript({ '#tos': box });
+
+  const result = await send({ action: 'setValue', selector: '#tos', value: true });
+
+  assert.equal(result.set, true);
+  assert.equal(result.checked, true);
+  assert.equal(box.checked, true);
+  assert.equal(box.value, 'on', 'the submit string must be left alone');
+
+  const cleared = await send({ action: 'setValue', selector: '#tos', value: 'off' });
+  assert.equal(cleared.checked, false);
+  assert.equal(box.checked, false);
+});
+
+test('browser_set_value refuses a checkbox value that is not on or off', async () => {
+  const box = makeElement('input', { id: 'tos', type: 'checkbox', value: 'on' });
+  const { send } = loadContentScript({ '#tos': box });
+
+  const result = await send({ action: 'setValue', selector: '#tos', value: 'hello' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /checked/i);
+  assert.equal(box.checked, false, 'a refused set must not change the box');
+});
+
+test('browser_set_value on a <select> reports the option it landed on', async () => {
+  const picker = makeElement('select', {
+    id: 'country',
+    options: [{ value: 'nl', text: 'Netherlands' }, { value: 'be', text: 'Belgium' }]
+  });
+  const { send } = loadContentScript({ '#country': picker });
+
+  const result = await send({ action: 'setValue', selector: '#country', value: 'be' });
+
+  assert.equal(result.set, true);
+  assert.equal(result.value, 'be');
+  assert.equal(result.text, 'Belgium');
+  assert.equal(picker.selectedIndex, 1);
+});
+
+test('browser_set_value on a <select> refuses a value no option carries', async () => {
+  // A real <select> resets to '' here, so {set: true} was a lie.
+  const picker = makeElement('select', {
+    id: 'country',
+    options: [{ value: 'nl', text: 'Netherlands' }, { value: 'be', text: 'Belgium' }]
+  });
+  const { send } = loadContentScript({ '#country': picker });
+
+  const result = await send({ action: 'setValue', selector: '#country', value: 'fr' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /no option matching/i);
+  assert.match(result.error, /nl, be/);
+  assert.equal(picker.value, 'nl', 'the dropdown must stay where it was');
+});
+
+test('browser_select_option refuses text that matches no option', async () => {
+  const picker = makeElement('select', {
+    id: 'country',
+    options: [{ value: 'nl', text: 'Netherlands' }, { value: 'be', text: 'Belgium' }]
+  });
+  const { send } = loadContentScript({ '#country': picker });
+
+  const result = await send({ action: 'selectOption', selector: '#country', text: 'France' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /no option matching/i);
+  assert.equal(picker.selectedIndex, 0, 'the dropdown must stay where it was');
+});
+
+test('browser_select_option by text and by index report where they landed', async () => {
+  const picker = makeElement('select', {
+    id: 'country',
+    options: [{ value: 'nl', text: 'Netherlands' },
+              { value: 'be', text: 'Belgium' },
+              { value: 'de', text: 'Germany' }]
+  });
+  const { send } = loadContentScript({ '#country': picker });
+
+  const byText = await send({ action: 'selectOption', selector: '#country', text: 'Germany' });
+  assert.equal(byText.selected, true);
+  assert.equal(byText.value, 'de');
+  assert.equal(byText.index, 2);
+
+  const byIndex = await send({ action: 'selectOption', selector: '#country', index: 1 });
+  assert.equal(byIndex.value, 'be');
+  assert.equal(byIndex.text, 'Belgium');
+
+  const outOfRange = await send({ action: 'selectOption', selector: '#country', index: 9 });
+  assert.equal(outOfRange.success, false);
+  assert.equal(picker.value, 'be', 'the dropdown must stay where it was');
+});
+
+// --------------------------------------------------------------------------
+// browser_get_computed_styles asks the stylesheet, so it must use CSS
+// property names.
+
+test('browser_get_computed_styles returns the hyphenated CSS properties', async () => {
+  const box = makeElement('div', {
+    id: 'box',
+    styles: {
+      'background-color': 'rgb(255, 0, 0)',
+      'font-size': '14px',
+      'font-family': 'Inter'
+    }
+  });
+  const { send } = loadContentScript({ '#box': box });
+
+  const result = await send({ action: 'getComputedStyles', selector: '#box' });
+
+  assert.equal(result.styles['background-color'], 'rgb(255, 0, 0)');
+  assert.equal(result.styles['font-size'], '14px');
+  assert.equal(result.styles['font-family'], 'Inter');
+});
+
+test('browser_get_computed_styles still answers a camelCase request', async () => {
+  const box = makeElement('div', {
+    id: 'box', styles: { 'background-color': 'rgb(0, 128, 0)' }
+  });
+  const { send } = loadContentScript({ '#box': box });
+
+  const result = await send({
+    action: 'getComputedStyles', selector: '#box', properties: ['backgroundColor']
+  });
+
+  assert.equal(result.styles.backgroundColor, 'rgb(0, 128, 0)',
+    'the answer is keyed by the name the caller asked for');
+});
+
+// --------------------------------------------------------------------------
+// browser_get_text promises visible text.
+
+test('browser_get_text returns the visible text, not the hidden markup', async () => {
+  // A collapsed admin template: innerText skips a display:none subtree,
+  // textContent does not, and `innerText || textContent` fell through to
+  // textContent whenever the visible text was empty.
+  const panel = makeElement('div', {
+    id: 'panel',
+    innerText: 'Welcome back',
+    textContent: 'Welcome back ADMIN PANEL token=abc123'
+  });
+  const { send } = loadContentScript({ '#panel': panel });
+
+  const result = await send({ action: 'getText', selector: '#panel' });
+
+  assert.equal(result.text, 'Welcome back');
+  assert.equal(result.source, 'innerText');
+  assert.ok(!result.text.includes('token=abc123'),
+    'hidden text must not be returned as visible text');
+});
+
+test('browser_get_text reports empty visible text as empty', async () => {
+  const hidden = makeElement('div', {
+    id: 'tpl', innerText: '', textContent: 'ADMIN PANEL token=abc123'
+  });
+  const { send } = loadContentScript({ '#tpl': hidden });
+
+  const result = await send({ action: 'getText', selector: '#tpl' });
+
+  assert.equal(result.text, '');
+  assert.equal(result.totalLength, 0);
+  assert.equal(result.source, 'innerText');
+});
+
+test('browser_get_text falls back to textContent and says so', async () => {
+  // Nodes without an innerText (SVG elements, detached nodes) still need
+  // reading, so the fallback stays - it is just labelled now.
+  const svg = makeElement('g', { id: 'label', textContent: 'Revenue' });
+  delete svg.innerText;
+  const { send } = loadContentScript({ '#label': svg });
+
+  const result = await send({ action: 'getText', selector: '#label' });
+
+  assert.equal(result.text, 'Revenue');
+  assert.equal(result.source, 'textContent');
 });
 
 // --------------------------------------------------------------------------
