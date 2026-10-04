@@ -146,6 +146,68 @@ class AttributionTests(unittest.TestCase):
                               f'{path} does not state its license')
 
 
+class PackagingGuardTests(unittest.TestCase):
+    """The release path can break auto-update for every installed copy
+    silently, so its guards are worth pinning."""
+
+    def test_both_packagers_refuse_to_clobber_a_signed_build(self):
+        for script in ('scripts/package-extension.sh', 'scripts/package-extension.ps1'):
+            with self.subTest(script=script):
+                body = (ROOT / script).read_text()
+                self.assertIn('META-INF/mozilla.rsa', body,
+                              f'{script} must detect a signed archive before '
+                              'overwriting it; publish-release.sh uploads that path')
+
+    def test_publish_verifies_the_signature_and_the_version(self):
+        body = (ROOT / 'scripts' / 'publish-release.sh').read_text()
+        self.assertIn('META-INF/mozilla.rsa', body,
+                      'publishing an unsigned xpi breaks every install')
+        self.assertIn('--fail-with-body', body,
+                      'curl exits 0 on HTTP 422, so a failed upload looked like success')
+
+    def test_the_unsigned_zip_excludes_top_level_dotfiles(self):
+        body = (ROOT / 'scripts' / 'package-extension.sh').read_text()
+        self.assertIn("-x '.*'", body,
+                      "-x '*/.*' only covers nested dotfiles, so a stray "
+                      "extension/.env shipped")
+
+    def test_upstream_id_is_never_offered_our_build(self):
+        """Listing upstream's id in updates.json would offer this fork's
+        build to their users, which is a hijack rather than a rescue. Checked
+        against the configured value, not the file, so the comment explaining
+        the exclusion does not trip it."""
+        mise = (ROOT / 'mise.toml').read_text()
+        configured = ''
+        for line in mise.splitlines():
+            if line.strip().startswith('CCB_LEGACY_EXT_IDS'):
+                configured = line.split('=', 1)[1].strip().strip('"')
+        ids = [i.strip() for i in configured.split(',') if i.strip()]
+        self.assertNotIn('claudecodebrowser@ligandal.com', ids)
+        for ext_id in ids:
+            self.assertNotIn('ligandal', ext_id.lower())
+        self.assertNotIn(extension_id(), ids,
+                         'the current id is added separately; listing it twice '
+                         'would emit a duplicate key')
+
+    def test_signing_credentials_are_not_passed_in_argv(self):
+        for script in ('scripts/package-extension.sh', 'scripts/package-extension.ps1'):
+            with self.subTest(script=script):
+                body = (ROOT / script).read_text()
+                self.assertNotIn('--api-secret', body,
+                                 'argv is readable from any process listing')
+
+
+class AttributionIdentityTests(unittest.TestCase):
+
+    def test_the_manifest_credits_upstream_where_users_see_it(self):
+        """author/homepage_url name the fork, because this build is signed by
+        and supported from the fork - but about:addons should still say where
+        the work came from."""
+        manifest = json.loads((ROOT / 'extension' / 'manifest.json').read_text())
+        self.assertIn('Andre Watson', manifest['description'])
+        self.assertIn('acornelissen', manifest['homepage_url'])
+
+
 class PermissionTests(unittest.TestCase):
 
     def test_webrequest_permissions_are_declared(self):

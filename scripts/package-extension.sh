@@ -23,8 +23,10 @@ DIST="$SCRIPT_DIR/dist"
 SIGN=0
 [ "$1" = "--sign" ] && SIGN=1
 
-VERSION=$(python3 -c "import json; print(json.load(open('$SRC/manifest.json'))['version'])")
-EXT_ID=$(python3 -c "import json; print(json.load(open('$SRC/manifest.json'))['browser_specific_settings']['gecko']['id'])")
+# Paths go through the environment rather than being interpolated into Python
+# source: a checkout path containing a quote would otherwise break or inject.
+VERSION=$(CCB_SRC="$SRC" python3 -c "import json,os; print(json.load(open(os.environ['CCB_SRC']+'/manifest.json'))['version'])")
+EXT_ID=$(CCB_SRC="$SRC" python3 -c "import json,os; print(json.load(open(os.environ['CCB_SRC']+'/manifest.json'))['browser_specific_settings']['gecko']['id'])")
 XPI="$DIST/claudecodebrowser-${VERSION}.xpi"
 
 # Where release assets live. The manifest's update_url points at
@@ -37,19 +39,28 @@ mkdir -p "$DIST"
 
 echo "Packaging ClaudeCodeBrowser extension v${VERSION} (${EXT_ID})"
 
-# Emit the Firefox update manifest so installed copies can auto-update.
-cat > "$DIST/updates.json" << EOF
-{
-  "addons": {
-    "${EXT_ID}": {
-      "updates": [
-        { "version": "${VERSION}", "update_link": "${XPI_URL}" }
-      ]
-    }
-  }
-}
-EOF
+
+# Emit the Firefox update manifest. Called only after the artifact exists and
+# has been validated: written up front, an aborted run left updates.json
+# advertising a version with no matching .xpi.
+write_update_manifest() {
+# Firefox looks up only its own id in this map, so every id that has ever
+    # shipped needs an entry or those installs are stranded with no error. Extra
+    # ids come from CCB_LEGACY_EXT_IDS (comma-separated).
+CCB_LEGACY_EXT_IDS="${CCB_LEGACY_EXT_IDS:-}" \
+CCB_EXT_ID="$EXT_ID" CCB_VERSION="$VERSION" CCB_XPI_URL="$XPI_URL" \
+python3 > "$DIST/updates.json" <<'PYEOF'
+import json, os
+
+update = [{"version": os.environ["CCB_VERSION"],
+           "update_link": os.environ["CCB_XPI_URL"]}]
+ids = [os.environ["CCB_EXT_ID"]]
+ids += [i.strip() for i in os.environ.get("CCB_LEGACY_EXT_IDS", "").split(",")
+        if i.strip()]
+print(json.dumps({"addons": {i: {"updates": update} for i in ids}}, indent=2))
+PYEOF
 echo "Wrote update manifest: $DIST/updates.json"
+}
 
 if [ "$SIGN" = "1" ]; then
     if ! command -v web-ext &> /dev/null; then
@@ -63,19 +74,47 @@ if [ "$SIGN" = "1" ]; then
     echo "Signing via AMO (channel: unlisted, self-distribution)..."
     # --channel=unlisted signs without a public AMO listing, for self-hosting.
     # Use --channel=listed to submit to the public AMO catalog instead.
+    # Credentials go through the environment, not argv: anything in argv is
+    # readable from `ps` by any process on the machine for the duration, and
+    # this credential is what stands between release-write access and signed
+    # code running with <all_urls> and nativeMessaging.
+    WEB_EXT_API_KEY="$AMO_JWT_ISSUER" \
+    WEB_EXT_API_SECRET="$AMO_JWT_SECRET" \
     web-ext sign \
         --source-dir "$SRC" \
         --artifacts-dir "$DIST" \
-        --channel=unlisted \
-        --api-key "$AMO_JWT_ISSUER" \
-        --api-secret "$AMO_JWT_SECRET"
+        --channel=unlisted
     # web-ext names the signed file with underscores; normalize to the name
     # the update manifest expects so update_link resolves.
-    SIGNED=$(ls -t "$DIST"/*.xpi 2>/dev/null | head -n1)
-    if [ -n "$SIGNED" ] && [ "$SIGNED" != "$XPI" ]; then
+    # Match this version's artifact rather than the newest file in dist/:
+    # if web-ext exits 0 without producing one, picking by mtime copied the
+    # PREVIOUS version's signed .xpi onto this version's filename, and the
+    # release then advertised a version the archive does not contain.
+    SIGNED=""
+    for candidate in "$DIST"/*-"${VERSION}".xpi; do
+        [ -f "$candidate" ] || continue
+        [ "$candidate" = "$XPI" ] && continue
+        SIGNED="$candidate"
+    done
+    if [ -n "$SIGNED" ]; then
         cp "$SIGNED" "$XPI"
     fi
-    echo "Signed .xpi ready: $XPI"
+    if [ ! -f "$XPI" ]; then
+        echo "Error: no signed .xpi for version ${VERSION} was produced." >&2
+        exit 1
+    fi
+    if ! unzip -l "$XPI" 2>/dev/null | grep -q 'META-INF/mozilla.rsa'; then
+        echo "Error: $XPI carries no Mozilla signature." >&2
+        exit 1
+    fi
+    PACKAGED_VERSION=$(unzip -p "$XPI" manifest.json | CCB_KEY=version python3 -c \
+        "import json,os,sys; print(json.load(sys.stdin)[os.environ['CCB_KEY']])")
+    if [ "$PACKAGED_VERSION" != "$VERSION" ]; then
+        echo "Error: $XPI contains version $PACKAGED_VERSION, expected $VERSION." >&2
+        exit 1
+    fi
+    write_update_manifest
+    echo "Signed .xpi ready: $XPI (verified signed, version $PACKAGED_VERSION)"
     echo ""
     echo "To publish this as an auto-updating release:"
     echo "  1. Create GitHub release tag v${VERSION}"
@@ -96,8 +135,11 @@ else
     # Plain zip -> .xpi. The archive root must be the manifest, not a folder.
     # Exclude build state and editor droppings; web-ext already skips dotfiles
     # when signing, so the two paths produce the same archive contents.
+    # '.*' catches top-level dotfiles, '*/.*' catches nested ones. With only
+    # the latter, a stray extension/.env shipped.
     ( cd "$SRC" && zip -r -FS "$XPI" . \
-        -x '*.DS_Store' -x '.amo-upload-uuid' -x '*/.*' > /dev/null )
+        -x '*.DS_Store' -x '.*' -x '*/.*' > /dev/null )
+    write_update_manifest
     echo "Unsigned package: $XPI"
     echo ""
     echo "To load it: Firefox -> about:debugging -> This Firefox ->"

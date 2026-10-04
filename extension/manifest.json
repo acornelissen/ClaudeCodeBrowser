@@ -2,9 +2,9 @@
   "manifest_version": 2,
   "name": "ClaudeCodeBrowserX",
   "version": "1.5.1",
-  "description": "Browser automation extension for Claude Code - enables screenshots, clicking, typing, and page interaction",
-  "author": "Ligandal",
-  "homepage_url": "https://ligandal.com",
+  "description": "Browser automation for Claude Code: screenshots, clicking, typing and page interaction. A fork of ClaudeCodeBrowser, originally created by Andre Watson (Ligandal Inc.).",
+  "author": "Albert Cornelissen",
+  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowser",
 
   "permissions": [
     "activeTab",

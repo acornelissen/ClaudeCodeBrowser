@@ -51,9 +51,9 @@ cat > "$OUT/manifest.json" << EOF
   "manifest_version": 3,
   "name": "ClaudeCodeBrowserX (Experimental Chrome Build)",
   "version": "$VERSION",
-  "description": "Browser automation extension for Claude Code - EXPERIMENTAL Chrome build; Firefox is the primary target",
-  "author": "Ligandal",
-  "homepage_url": "https://ligandal.com",
+  "description": "Browser automation for Claude Code - EXPERIMENTAL Chrome build; Firefox is the primary target. A fork of ClaudeCodeBrowser, originally created by Andre Watson (Ligandal Inc.).",
+  "author": "Albert Cornelissen",
+  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowser",
 
   "permissions": [
     "activeTab",

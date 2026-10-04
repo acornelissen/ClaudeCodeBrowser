@@ -1,8 +1,11 @@
 [tools]
 python = "3.12"
 node = "22"
-# Mozilla's extension packaging/signing tool, used by scripts/package-extension.sh --sign
-"npm:web-ext" = "latest"
+# Mozilla's extension packaging/signing tool, used by scripts/package-extension.sh --sign.
+# Pinned: this tool runs with the AMO signing credentials and read access to
+# extension/, and "latest" re-resolved its whole transitive npm tree on every
+# mise install with no integrity pinning.
+"npm:web-ext" = "10.7.0"
 
 [tasks.test]
 description = "Run the Python and extension test suites"
@@ -26,6 +29,14 @@ run = [
 [tasks.package]
 description = "Build an unsigned .xpi into dist/ (temporary-load only)"
 run = "./scripts/package-extension.sh"
+
+[env]
+# Extension ids this fork has shipped and retired. Firefox looks up only its
+# own id in updates.json, so without these, installs of an older build poll
+# forever and are never offered an update. Upstream's
+# claudecodebrowser@ligandal.com is deliberately NOT listed: offering our
+# build to their users would be a hijack, not a rescue.
+CCB_LEGACY_EXT_IDS = "{31c66d81-5dcd-4210-97ab-098400466392}"
 
 [tasks.sign]
 description = "Build and AMO-sign an .xpi into dist/ (needs AMO_JWT_* in mise.local.toml)"

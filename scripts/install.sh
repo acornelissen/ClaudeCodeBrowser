@@ -91,7 +91,14 @@ if [ "$OS" = "Darwin" ]; then
     # Firefox on macOS launches native hosts with a minimal PATH (launchd's),
     # so "#!/usr/bin/env python3" may not resolve (e.g. Homebrew installs).
     # Use a launcher with the absolute python3 path resolved at install time.
+    # Prefer a stable launcher over a version-pinned install path: with mise
+    # active, command -v python3 resolves to .../installs/python/3.12/bin, which
+    # disappears when that version is pruned and the bridge then dies with no
+    # error the user can see.
     PYTHON_BIN="$(command -v python3)"
+    if [ -x "$HOME/.local/share/mise/shims/python3" ]; then
+        PYTHON_BIN="$HOME/.local/share/mise/shims/python3"
+    fi
     cat > "$INSTALL_DIR/native-host/run_host.sh" << WRAPEOF
 #!/bin/bash
 exec "$PYTHON_BIN" "$INSTALL_DIR/native-host/claudecodebrowser_host.py"
@@ -103,7 +110,7 @@ fi
 # Read the extension ID from the manifest rather than repeating it here.
 # Firefox only talks to the native host if this list matches the ID exactly,
 # and a copy that drifts out of sync breaks the bridge silently.
-EXT_ID=$(python3 -c "import json; print(json.load(open('$SCRIPT_DIR/extension/manifest.json'))['browser_specific_settings']['gecko']['id'])")
+EXT_ID=$(CCB_DIR="$SCRIPT_DIR" python3 -c "import json,os; print(json.load(open(os.environ['CCB_DIR']+'/extension/manifest.json'))['browser_specific_settings']['gecko']['id'])")
 if [ -z "$EXT_ID" ]; then
     echo -e "${RED}Error: could not read the extension ID from extension/manifest.json${NC}"
     exit 1
@@ -142,8 +149,18 @@ chmod +x "$INSTALL_DIR/browser-agent"
 
 # Create symlinks in ~/bin if it exists
 if [ -d "$HOME/bin" ]; then
-    ln -sf "$INSTALL_DIR/start-server.sh" "$HOME/bin/claudecodebrowser-server"
-    ln -sf "$INSTALL_DIR/browser-agent" "$HOME/bin/browser-agent"
+    # browser-agent is a generic name and ln -sf replaces a regular file, so
+    # this used to destroy a user's own script with no warning (and uninstall
+    # only reverses it when it is still our symlink).
+    for link in claudecodebrowser-server browser-agent; do
+        target="$INSTALL_DIR/browser-agent"
+        [ "$link" = "claudecodebrowser-server" ] && target="$INSTALL_DIR/start-server.sh"
+        if [ -e "$HOME/bin/$link" ] && [ ! -L "$HOME/bin/$link" ]; then
+            echo -e "${YELLOW}⚠ ~/bin/$link exists and is not a symlink; leaving it alone${NC}"
+            continue
+        fi
+        ln -sf "$target" "$HOME/bin/$link"
+    done
     echo -e "${GREEN}✓ Created symlinks in ~/bin${NC}"
 fi
 
@@ -157,7 +174,14 @@ if python3 -c "import websockets" 2>/dev/null; then
     echo -e "${GREEN}✓ websockets module found${NC}"
 else
     echo -e "${YELLOW}Installing websockets module...${NC}"
-    pip3 install --user websockets || echo -e "${YELLOW}⚠ Could not install websockets (WebSocket support will be disabled)${NC}"
+    # python3 -m pip, not pip3: the capability check above uses python3, and on
+    # a mixed mise/Homebrew machine pip3 can belong to a different interpreter,
+    # so the install "succeeded" into a Python the server never uses.
+    if python3 -m pip install --user websockets; then
+        echo -e "${GREEN}✓ websockets installed${NC}"
+    else
+        echo -e "${YELLOW}⚠ Could not install websockets (WebSocket support will be disabled)${NC}"
+    fi
 fi
 
 # Print Firefox extension installation instructions
