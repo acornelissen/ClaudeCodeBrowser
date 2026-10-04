@@ -69,7 +69,7 @@ def _redact(arguments: dict) -> dict:
             for k, v in (arguments or {}).items()}
 
 
-def _api_headers(url: str = MCP_SERVER_URL) -> dict:
+def _api_headers(url: Optional[str] = None) -> dict:
     """Headers for a request, including the API token for a local server only.
 
     The token is full control of the user's browser. MCP_SERVER_URL comes from
@@ -78,6 +78,12 @@ def _api_headers(url: str = MCP_SERVER_URL) -> dict:
     cleartext to that host on the first call. Set
     CLAUDE_BROWSER_ALLOW_REMOTE=1 to override deliberately.
     """
+    # Read MCP_SERVER_URL at call time, not as a default argument: bound at
+    # definition time it froze the value the module was imported with, so a
+    # later change to the server URL was judged against the old one and the
+    # token went to the new host anyway.
+    if url is None:
+        url = MCP_SERVER_URL
     headers = {'Content-Type': 'application/json'}
     if not _is_loopback(url) and os.environ.get('CLAUDE_BROWSER_ALLOW_REMOTE') != '1':
         return headers
@@ -135,24 +141,61 @@ class BrowserAutomationAgent:
     def _make_request(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Make an HTTP request to the MCP server."""
         url = f"{MCP_SERVER_URL}{endpoint}"
+        # The URL this request actually goes to decides whether the token
+        # travels with it.
+        headers = _api_headers(url)
 
         try:
             if data:
                 req = urllib.request.Request(
                     url,
                     data=json.dumps(data).encode('utf-8'),
-                    headers=_api_headers()
+                    headers=headers
                 )
             else:
-                req = urllib.request.Request(url, headers=_api_headers())
+                req = urllib.request.Request(url, headers=headers)
 
             with urllib.request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode('utf-8'))
+                body = response.read().decode('utf-8', errors='replace')
+            try:
+                return json.loads(body)
+            except ValueError:
+                # A proxy or captive portal answering 200 with HTML gave the
+                # caller "Expecting value: line 1 column 1 (char 0)", which
+                # says nothing about where the problem is.
+                return {
+                    'success': False,
+                    'transport_error': 'invalid_response',
+                    'error': 'The server did not return JSON. The URL may not '
+                             f'be the MCP server: {body[:200]!r}'
+                }
 
+        # HTTPError is a subclass of URLError, so this has to come first.
+        # Without it, a rejected token read as "Connection failed: HTTP Error
+        # 403: Forbidden" - so the user restarted a server that was never
+        # down - and the server's own {"error": "Unauthorized"} body was
+        # discarded.
+        except urllib.error.HTTPError as e:
+            detail = ''
+            try:
+                detail = e.read().decode('utf-8', errors='replace')[:200]
+            except Exception:
+                pass
+            return {
+                'success': False,
+                'transport_error': 'auth' if e.code in (401, 403) else 'http',
+                'status': e.code,
+                'error': f'The MCP server returned HTTP {e.code} '
+                         f'{e.reason}.{" " + detail if detail else ""}'
+            }
         except urllib.error.URLError as e:
-            return {'success': False, 'error': f'Connection failed: {str(e)}'}
+            return {'success': False, 'transport_error': 'connection',
+                    'error': f'Connection failed: {str(e)}'}
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            # transport_error, so a caller can tell "the request did not get
+            # through, retry it" from "the tool ran and said no". Both used to
+            # arrive as {'success': False, 'error': ...} and nothing else.
+            return {'success': False, 'transport_error': 'request', 'error': str(e)}
 
     def call_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
         """Call an MCP tool."""
@@ -357,7 +400,14 @@ class BrowserAutomationAgent:
 
     def reload_localhost(self, port: Optional[int] = None) -> Dict[str, Any]:
         """Reload all localhost tabs. Optionally filter by port number."""
-        if port:
+        # `if port:` made port=0 mean "every localhost tab", which is the
+        # opposite of naming one port, and --reload-localhost 0 reaches here.
+        # 0 is not a port a server listens on, so refuse it rather than
+        # quietly widening the request.
+        if port is not None:
+            if not 1 <= int(port) <= 65535:
+                return {'success': False,
+                        'error': f'{port} is not a usable port number (1-65535).'}
             return self.reload_by_url(url=f'http://localhost:{port}')
         return self.reload_by_url(url_pattern=r'https?://localhost')
 
@@ -366,6 +416,40 @@ class BrowserAutomationAgent:
         return self.reload_by_url(url_pattern=r'https?://(localhost|127\.0\.0\.1|.*\.local|.*\.dev)')
 
     # Workflow helpers
+
+    @staticmethod
+    def _refusal(result: Dict[str, Any]) -> Optional[str]:
+        """The reason the call was refused, if it was refused.
+
+        A refusal is not a wrong locator and not an empty page, so no caller
+        should retry it or report it as an absence. Two sources: the safety
+        guard names its decision, and the extension's own credential guard
+        answers with a plain "Refused: ..." message and no decision field.
+        """
+        if not isinstance(result, dict):
+            return None
+        decision = result.get('safety_decision')
+        if decision:
+            return decision
+        error = result.get('error')
+        if isinstance(error, str) and error.startswith('Refused:'):
+            return 'browser_refused'
+        return None
+
+    @staticmethod
+    def _looks_like_a_wrong_locator(result: Dict[str, Any]) -> bool:
+        """True only when the failure was "nothing matched that locator".
+
+        fill_form retries with a different locator, and the retry is only
+        right for this one case. It used to retry on ANY failure, so a
+        password-field refusal posted the secret to the server a second time -
+        and the extension's refusal carries no safety_decision, so testing
+        for one was not enough on its own.
+        """
+        if not isinstance(result, dict):
+            return False
+        error = result.get('error')
+        return isinstance(error, str) and 'not found' in error.lower()
 
     def fill_form(self, fields: Dict[str, str], submit: bool = False, submit_selector: Optional[str] = None) -> List[Dict[str, Any]]:
         """
@@ -385,9 +469,14 @@ class BrowserAutomationAgent:
             elif '=' in field:
                 result = self.type_text(value, selector=f'[{field}]', clear=True)
             else:
-                # Try by name, then by placeholder
+                # Try by name, then by placeholder. The retry exists for a
+                # wrong locator, so it must not run after a refusal: a
+                # password-field refusal posted the secret to the server a
+                # second time, and confirmation_required means stop and ask
+                # the human rather than work around it with another locator.
                 result = self.type_text(value, name=field, clear=True)
-                if not result.get('success'):
+                if (not result.get('success')
+                        and self._looks_like_a_wrong_locator(result)):
                     result = self.type_text(value, placeholder=field, clear=True)
 
             results.append(result)
@@ -396,18 +485,32 @@ class BrowserAutomationAgent:
             if submit_selector:
                 results.append(self.click(selector=submit_selector))
             else:
-                # Try common submit selectors
-                for selector in ['button[type="submit"]', 'input[type="submit"]', 'button:contains("Submit")', '.submit-btn']:
-                    result = self.click(selector=selector)
-                    if result.get('success'):
-                        results.append(result)
+                # Try common submit selectors. Every failure used to append
+                # nothing, so a form that was never submitted returned a
+                # results list that read as a clean fill - the caller could
+                # not tell. Report the last attempt, and stop early on a
+                # refusal rather than trying the next selector.
+                attempted = None
+                for selector in ['button[type="submit"]', 'input[type="submit"]',
+                                 'button:contains("Submit")', '.submit-btn']:
+                    attempted = self.click(selector=selector)
+                    if attempted.get('success') or self._refusal(attempted):
                         break
+                results.append(attempted if attempted is not None else {
+                    'success': False,
+                    'error': 'No submit button was tried.'
+                })
 
         return results
 
     def search(self, query: str, search_selector: str = 'input[type="search"], input[name="q"], #search') -> Dict[str, Any]:
         """Perform a search on the current page."""
-        self.type_text(query, selector=search_selector, clear=True)
+        # The result of typing the query used to be discarded and only the
+        # Enter keypress reported, so a refused query plus a successful Enter
+        # read as a successful search of nothing.
+        typed = self.type_text(query, selector=search_selector, clear=True)
+        if not typed.get('success'):
+            return typed
         return self.type_text('', selector=search_selector, press_enter=True)
 
     def login(self, username: str, password: str,
@@ -472,7 +575,7 @@ class BrowserAutomationAgent:
         # A safety denial is not "no matching text". Returning None for both
         # let an agent report that content was absent when the guard refused
         # to look at it.
-        decision = result.get('safety_decision')
+        decision = self._refusal(result)
         if decision:
             raise BrowserAgentDenied(
                 f"extract_text refused by the safety guard ({decision}): "
@@ -490,6 +593,13 @@ class BrowserAutomationAgent:
         """)
         if result.get('success') and result.get('result'):
             return result['result']
+        # [] for a refusal told the caller the page had no links, when the
+        # guard had refused to look. Same rule as extract_text.
+        decision = self._refusal(result)
+        if decision:
+            raise BrowserAgentDenied(
+                f"extract_links refused by the safety guard ({decision}): "
+                f"{result.get('error', 'no reason given')}")
         return []
 
 
@@ -636,8 +746,25 @@ Available commands:
 
         except KeyboardInterrupt:
             print("\nInterrupted. Type 'exit' to quit.")
+        except EOFError:
+            # A piped or closed stdin raises EOFError from input(). The bare
+            # `except Exception` below caught it, printed "Error: " and asked
+            # for input again, so the process spun on a dead stdin instead of
+            # exiting.
+            print("\nEnd of input. Goodbye!")
+            break
         except Exception as e:
             print(f"Error: {e}")
+
+
+# The commands --command may reach. Anything not named here is not a command,
+# however callable it happens to be.
+COMMAND_METHODS = frozenset({
+    'navigate', 'screenshot', 'click', 'type_text', 'get_text', 'get_page_info',
+    'scroll', 'wait_for_element', 'extract_text', 'extract_links',
+    'execute_script', 'refresh', 'hard_refresh', 'reload_all',
+    'reload_localhost', 'reload_dev_servers', 'search', 'check_server',
+})
 
 
 def main():
@@ -712,12 +839,24 @@ def main():
         cmd = parts[0]
         cmd_args = parts[1] if len(parts) > 1 else ''
 
-        method = getattr(agent, cmd, None)
-        if method and callable(method):
-            result = method(cmd_args) if cmd_args else method()
-            print(json.dumps(result, indent=2))
-        else:
+        # An allowlist, not getattr on whatever arrives. getattr dispatched to
+        # any attribute: '--command __init__' re-ran the constructor and wiped
+        # the action history, printing "null" as though nothing had gone
+        # wrong, and '--command log oops' reached an internal helper.
+        if cmd not in COMMAND_METHODS:
             print(f"Unknown command: {cmd}")
+            print(f"Try one of: {', '.join(sorted(COMMAND_METHODS))}")
+        else:
+            method = getattr(agent, cmd)
+            try:
+                result = method(cmd_args) if cmd_args else method()
+            except TypeError as e:
+                # login(username, password) called one argument short used to
+                # escape main() as a traceback.
+                print(f"Unknown command: {cmd} does not take those arguments "
+                      f"({e}).")
+            else:
+                print(json.dumps(result, indent=2))
 
     elif args.interactive:
         if not agent.check_server():

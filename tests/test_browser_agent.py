@@ -349,9 +349,7 @@ class ApiTokenTests(AgentTestCase):
             self.only_request().header('X-API-Key'),
             'an empty token file must not be sent as an empty credential')
 
-    # DEFECT D6: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D6.
     def test_the_token_is_not_sent_to_a_non_loopback_server(self):
         """CLAUDE_BROWSER_URL chooses the server. The token is a local secret
         for a loopback service, so it must not be attached to a request that
@@ -472,9 +470,7 @@ class CredentialHandlingTests(AgentTestCase):
             'outcome, and it reports success although the credential never '
             'reached the field: %r' % (results,))
 
-    # DEFECT D4: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D4.
     def test_fill_form_does_not_resend_a_credential_after_a_refusal(self):
         """fill_form's retry exists for a wrong locator. A password-field
         refusal is not a wrong locator, so the retry simply posts the secret
@@ -566,9 +562,7 @@ class ErrorReportingTests(AgentTestCase):
         self.assertEqual(result,
                          {'success': False, 'error': 'Element not found'})
 
-    # DEFECT D12: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D12.
     def test_a_403_is_reported_as_an_authentication_failure(self):
         """HTTPError subclasses URLError, so a rejected token comes back as
         "Connection failed: HTTP Error 403: Forbidden". The user restarts a
@@ -582,18 +576,14 @@ class ErrorReportingTests(AgentTestCase):
             'a server that answered and rejected the token is not a '
             'connection failure: %r' % result['error'])
 
-    # DEFECT D12: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D12.
     def test_an_http_500_is_not_reported_as_a_connection_failure(self):
         result = self._navigate(http_error(500, 'Internal Server Error'))
         self.assertFalse(result.get('success'))
         self.assertIn('500', result['error'])
         self.assertNotIn('Connection failed', result['error'])
 
-    # DEFECT D12: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D12.
     def test_a_non_json_body_is_reported_as_an_invalid_response(self):
         """A proxy or captive portal answering 200 with HTML yields
         "Expecting value: line 1 column 1 (char 0)", which tells the user
@@ -612,9 +602,7 @@ class ErrorReportingTests(AgentTestCase):
         result = self._navigate(TimeoutError('timed out'))
         self.assertFalse(result.get('success'))
 
-    # DEFECT D12: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D12.
     def test_a_transport_failure_is_distinguishable_from_a_tool_failure(self):
         """The decision a caller must make differs completely: retry the
         request, or stop and tell the user the element is not there. Both
@@ -677,9 +665,7 @@ class SafetyDecisionTests(AgentTestCase):
             'extract_text() returned None for a read_only denial, which is '
             'exactly what it returns for a page with no matching text')
 
-    # DEFECT D8: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D8.
     def test_extract_links_distinguishes_a_denial_from_a_page_with_no_links(self):
         self.serve_json({'success': False,
                          'safety_decision': 'blocked_url',
@@ -693,9 +679,7 @@ class SafetyDecisionTests(AgentTestCase):
             'extract_links() returned [] for a blocked_url denial, which a '
             'caller reads as "this page has no links"')
 
-    # DEFECT D9: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D9.
     def test_fill_form_does_not_retry_a_safety_denial(self):
         """The retry is for a wrong locator. confirmation_required means stop
         and ask the human; retrying with a different locator spends the rate
@@ -707,9 +691,7 @@ class SafetyDecisionTests(AgentTestCase):
             len(self.requests), 1,
             'fill_form retried an action the safety guard refused')
 
-    # DEFECT D10: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D10.
     def test_fill_form_reports_a_submit_that_never_happened(self):
         """With no submit_selector, fill_form tries four selectors and appends
         nothing when they all fail. The caller gets a results list that looks
@@ -724,9 +706,7 @@ class SafetyDecisionTests(AgentTestCase):
             'is invisible to the caller' % len(results))
         self.assertFalse(results[-1].get('success'))
 
-    # DEFECT D11: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D11.
     def test_search_reports_a_denial_of_the_query_typing(self):
         """search() discards the result of typing the query and returns the
         result of pressing Enter. A denied query plus a successful Enter reads
@@ -802,16 +782,24 @@ class RequestShapeTests(AgentTestCase):
         args = self.only_request().arguments
         self.assertEqual((args.get('x'), args.get('y')), (0, 0))
 
-    # DEFECT D16: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D16.
     def test_reload_localhost_honours_port_zero_or_rejects_it(self):
-        """reload_localhost(port=0) tests the port with 'if port:', so 0
-        silently becomes "reload every localhost tab" instead of the one port
-        asked for. --reload-localhost 0 reaches this."""
+        """reload_localhost(port=0) tested the port with 'if port:', so 0
+        silently became "reload every localhost tab" instead of the one port
+        asked for. --reload-localhost 0 reaches this.
+
+        Either answer is acceptable, as the name says, so long as 0 does not
+        widen the request. It refuses: 0 is not a port anything listens on,
+        and saying so beats reloading nothing or everything."""
         self.serve_ok()
         agent = browser_agent.BrowserAutomationAgent()
-        agent.reload_localhost(port=0)
+        result = agent.reload_localhost(port=0)
+
+        if not self.requests:
+            self.assertFalse(result.get('success'),
+                             'refusing port 0 must say it refused')
+            self.assertIn('port', result['error'].lower())
+            return
         args = self.only_request().arguments
         self.assertNotIn(
             'url_pattern', args,
@@ -863,9 +851,7 @@ class CliTests(AgentTestCase):
         self.assertIn('[BrowserAgent]', out)
         self.assertIn('browser_navigate', out)
 
-    # DEFECT D13: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D13.
     def test_command_dispatch_rejects_a_dunder_attribute(self):
         """--command does getattr(agent, name) on whatever it is handed and
         calls it. '__init__' re-runs the constructor and wipes the action
@@ -878,16 +864,12 @@ class CliTests(AgentTestCase):
             'it; only the documented commands should be reachable')
         self.assertEqual(self.requests, [])
 
-    # DEFECT D13: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D13.
     def test_command_dispatch_rejects_an_internal_method(self):
         _, out = self.run_main('--command', 'log oops')
         self.assertIn('Unknown command', out)
 
-    # DEFECT D13: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D13.
     def test_command_with_the_wrong_number_of_arguments_fails_cleanly(self):
         """'--command login alice' calls login(username, password) one
         argument short, and the TypeError escapes main() as a traceback."""
@@ -938,9 +920,7 @@ class InteractiveModeTests(AgentTestCase):
         self.assertIn('Interrupted', out)
         self.assertIn('Goodbye', out)
 
-    # DEFECT D15: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
-    @unittest.expectedFailure
+    # Regression test for defect D15.
     def test_the_loop_exits_when_stdin_reaches_end_of_file(self):
         """A piped or closed stdin raises EOFError from input(). The loop's
         bare 'except Exception' catches it, prints "Error: " and immediately
