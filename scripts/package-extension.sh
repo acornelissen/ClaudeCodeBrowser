@@ -30,7 +30,7 @@ XPI="$DIST/claudecodebrowser-${VERSION}.xpi"
 # Where release assets live. The manifest's update_url points at
 # releases/latest/download/updates.json (a stable URL), and each release's
 # .xpi is downloaded from its versioned tag.
-REPO_SLUG="${CCB_REPO_SLUG:-nanogenomic/ClaudeCodeBrowser}"
+REPO_SLUG="${CCB_REPO_SLUG:-acornelissen/ClaudeCodeBrowser}"
 XPI_URL="https://github.com/${REPO_SLUG}/releases/download/v${VERSION}/claudecodebrowser-${VERSION}.xpi"
 
 mkdir -p "$DIST"

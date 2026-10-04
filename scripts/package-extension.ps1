@@ -22,7 +22,7 @@ $Version = $manifest.version
 $ExtId = $manifest.browser_specific_settings.gecko.id
 $Xpi = Join-Path $Dist "claudecodebrowser-$Version.xpi"
 
-$RepoSlug = if ($env:CCB_REPO_SLUG) { $env:CCB_REPO_SLUG } else { "nanogenomic/ClaudeCodeBrowser" }
+$RepoSlug = if ($env:CCB_REPO_SLUG) { $env:CCB_REPO_SLUG } else { "acornelissen/ClaudeCodeBrowser" }
 $XpiUrl = "https://github.com/$RepoSlug/releases/download/v$Version/claudecodebrowser-$Version.xpi"
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null

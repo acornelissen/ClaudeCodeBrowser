@@ -1,7 +1,7 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/nanogenomic/ClaudeCodeBrowser/releases)
+[![Version](https://img.shields.io/badge/version-1.4.0-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -264,7 +264,7 @@ Mozilla without a public listing:
 **Auto-update is already wired** to GitHub Releases. The manifest carries:
 
 ```json
-"update_url": "https://github.com/nanogenomic/ClaudeCodeBrowser/releases/latest/download/updates.json"
+"update_url": "https://github.com/acornelissen/ClaudeCodeBrowser/releases/latest/download/updates.json"
 ```
 
 That's a stable URL — it always resolves to the newest release's
@@ -297,7 +297,7 @@ pointing at the matching versioned `.xpi`. So each new plugin version is just:
    With `curl` (set `GITHUB_TOKEN`):
    ```bash
    VER=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
-   REPO=nanogenomic/ClaudeCodeBrowser
+   REPO=acornelissen/ClaudeCodeBrowser
    ID=$(curl -sS -X POST "https://api.github.com/repos/$REPO/releases" \
      -H "Authorization: Bearer $GITHUB_TOKEN" \
      -d "{\"tag_name\":\"v$VER\",\"name\":\"v$VER\"}" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
