@@ -1286,7 +1286,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         # still report whether a field is filled.
         if tool_name in ('browser_type', 'browser_set_value',
                          'browser_get_value', 'browser_get_elements',
-                         'browser_get_page_info'):
+                         'browser_get_page_info', 'browser_press_key'):
             arguments['allow_password'] = bool(
                 get_safety_guard().config.get('allow_password_typing', False))
 

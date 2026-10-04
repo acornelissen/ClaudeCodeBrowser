@@ -36,6 +36,21 @@ BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
 EXECUTABLE_PATH = os.environ.get('CLAUDE_BROWSER_EXECUTABLE')
 
 
+class CredentialProbeFailed(RuntimeError):
+    """The credential check could not be evaluated.
+
+    Treated as a refusal rather than a pass: a guard that cannot tell must not
+    let the call through. The message says so, because this surfaces to the
+    agent as the reason its call did not happen.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(
+            'Refused: could not determine whether the target is a credential '
+            f'field ({detail}). Refusing rather than risk handling a '
+            'credential.')
+
+
 class HeadlessBrowser:
     """Playwright-backed headless browser. One persistent context per server lifetime."""
 
@@ -115,38 +130,79 @@ class HeadlessBrowser:
             raise RuntimeError("Headless browser not started")
         return self._page
 
-    # Mirrors isPasswordField in extension/content.js: autocomplete is a
-    # case-insensitive token list, and one-time codes and card fields are
-    # credentials too even though they are not type=password.
-    _IS_PASSWORD_JS = (
-        "el => el.tagName === 'INPUT' && (el.type === 'password' || "
-        "el.type === 'hidden' || "
-        "(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/)"
-        ".some(t => ['current-password','new-password','one-time-code',"
-        "'cc-number','cc-csc','cc-exp'].includes(t)))"
+    # ONE definition, mirroring CREDENTIAL_AUTOCOMPLETE_TOKENS in
+    # extension/content.js. There were previously three divergent copies in
+    # this file - the selector guard, the focused-element guard and the read
+    # mask - with different token lists, so whether a field counted as a
+    # credential depended on which code path reached it: cc-exp-month and
+    # cc-exp-year were missing everywhere, and cc-exp was missing from the
+    # focused path, meaning `type` with a selector refused a card-expiry field
+    # while `type` with no selector typed into the same focused field.
+    # tests/test_headless_backend.py asserts this list matches the extension's.
+    CREDENTIAL_AUTOCOMPLETE_TOKENS = (
+        'current-password', 'new-password', 'one-time-code',
+        'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year',
     )
 
-    async def _is_password_field(self, page, selector: str) -> bool:
-        """True when the selector resolves to a credential input."""
+    @classmethod
+    def _credential_js(cls, include_hidden: bool) -> str:
+        """JS predicate for "is this element a credential field".
+
+        include_hidden distinguishes the read mask (hidden inputs carry CSRF
+        and session tokens, so their values are masked) from the write guard
+        (writing to a plain hidden input is legitimate), matching
+        isPasswordField vs isConcealedValueField in the extension.
+        """
+        tokens = ','.join(f"'{t}'" for t in cls.CREDENTIAL_AUTOCOMPLETE_TOKENS)
+        hidden = " || el.type === 'hidden'" if include_hidden else ""
+        return (
+            "el => !!el && el.tagName === 'INPUT' && (el.type === 'password'"
+            f"{hidden} || "
+            "(el.getAttribute('autocomplete') || '').toLowerCase()"
+            f".split(/\\s+/).some(t => [{tokens}].includes(t)))"
+        )
+
+    async def _is_password_field(self, page, selector: str,
+                                 include_hidden: bool = False) -> bool:
+        """True when the selector resolves to a credential input.
+
+        Raises CredentialProbeFailed when it cannot tell. Returning False on
+        any exception made the guard fail OPEN: a probe that raised
+        (TimeoutError, "Execution context was destroyed" mid-navigation, a
+        detached frame) silently disabled the check while a following
+        page.fill went on to succeed.
+        """
         try:
-            return bool(await page.eval_on_selector(selector, self._IS_PASSWORD_JS))
-        except Exception:
-            # Selector didn't resolve; the caller reports its own error.
-            return False
+            return bool(await page.eval_on_selector(
+                selector, self._credential_js(include_hidden)))
+        except Exception as e:
+            message = str(e)
+            # A selector that genuinely does not match is not a probe failure;
+            # the caller reports its own "not found" error for that.
+            if 'failed to find element' in message.lower() or \
+                    'no element' in message.lower():
+                return False
+            raise CredentialProbeFailed(message) from e
 
     async def _assert_focused_not_password(self, page, args: Dict[str, Any]):
-        """Refuse to type into a focused credential field."""
+        """Refuse to type into a focused credential field.
+
+        Uses the same single predicate as the selector path, and fails CLOSED:
+        this previously swallowed any probe exception and returned, so a
+        destroyed execution context mid-navigation let the credential through.
+        """
         if args.get('allow_password') is True:
             return
         try:
+            predicate = self._credential_js(include_hidden=False)
             is_password = await page.evaluate(
-                "() => { const el = document.activeElement; return !!el && "
-                "el.tagName === 'INPUT' && (el.type === 'password' || "
-                "(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/)"
-                ".some(t => ['current-password','new-password','one-time-code',"
-                "'cc-number','cc-csc'].includes(t))); }")
-        except Exception:
-            return
+                "() => { const el = document.activeElement; "
+                f"return ({predicate})(el); }}")
+        except Exception as e:
+            raise RuntimeError(
+                'Refused: could not determine whether the focused element is a '
+                f'credential field ({e}). Refusing rather than risk typing a '
+                'credential into one.') from e
         if is_password:
             raise RuntimeError(
                 'Refused: the focused element is a credential field. '
@@ -155,10 +211,16 @@ class HeadlessBrowser:
                 '~/.claudecodebrowser/safety.json to override.')
 
     async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
-        """Refuse to fill password fields unless the safety config allows it."""
+        """Refuse to fill credential fields unless the safety config allows it.
+
+        include_hidden=False: writing into a plain hidden input is legitimate
+        (it is how a form carries state), while READING one back is masked
+        because they carry CSRF and session tokens. Same split as
+        isPasswordField vs isConcealedValueField in the extension.
+        """
         if args.get('allow_password') is True:
             return
-        if await self._is_password_field(page, selector):
+        if await self._is_password_field(page, selector, include_hidden=False):
             raise RuntimeError(
                 'Refused: target is a password field. Credentials belong in a '
                 'password manager, not automated typing. Set '
@@ -310,8 +372,9 @@ class HeadlessBrowser:
             # Reading a password field hands the credential to the AI just as
             # typing one would, so the same guard applies. Masked, not refused,
             # so the caller can still tell whether the field is filled.
-            if await self._is_password_field(page, selector) and \
-                    args.get('allow_password') is not True:
+            if args.get('allow_password') is not True and \
+                    await self._is_password_field(page, selector,
+                                                  include_hidden=True):
                 return {
                     'success': True,
                     'value': '***',
@@ -384,18 +447,42 @@ class HeadlessBrowser:
             return {'success': True, 'url': page.url, 'title': await page.title()}
 
         elif action == 'pressKey':
+            selector = args.get('selector')
             key = args.get('key', '')
             if not key:
-                return {'success': False, 'error': 'pressKey requires key'}
-            modifiers = [name for flag, name in
-                         [('ctrl', 'Control'), ('shift', 'Shift'), ('alt', 'Alt'), ('meta', 'Meta')]
-                         if args.get(flag)]
-            combo = '+'.join(modifiers + [key])
-            selector = args.get('selector')
+                # Without this, an omitted key reached keyboard.press(''),
+                # which Playwright rejects with an opaque parse error.
+                return {'success': False, 'error': 'pressKey requires "key"'}
+
+            # The extension's pressKey dispatches synthetic KeyboardEvents,
+            # which are untrusted and have no default action, so it cannot
+            # enter text. Playwright's keyboard.press REALLY types - so this
+            # path could enter a credential one character at a time, which is
+            # the historical bypass in a different costume. A printable key
+            # into a credential field is refused; navigation and editing keys
+            # stay allowed.
+            printable = len(key) == 1 and key.isprintable()
+            if printable and args.get('allow_password') is not True:
+                if selector:
+                    if await self._is_password_field(page, selector,
+                                                     include_hidden=False):
+                        raise RuntimeError(
+                            'Refused: pressing a printable key into a '
+                            'credential field would enter the credential one '
+                            'character at a time. Set "allow_password_typing": '
+                            'true in ~/.claudecodebrowser/safety.json to '
+                            'override.')
+                else:
+                    await self._assert_focused_not_password(page, args)
+
             if selector:
                 await page.focus(selector)
-            await page.keyboard.press(combo)
-            return {'success': True, 'key': combo}
+            modifiers = [m for m, on in (
+                ('Control', args.get('ctrl')), ('Shift', args.get('shift')),
+                ('Alt', args.get('alt')), ('Meta', args.get('meta'))) if on]
+            combination = '+'.join(modifiers + [key]) if modifiers else key
+            await page.keyboard.press(combination)
+            return {'success': True, 'key': combination}
 
         elif action == 'getText':
             selector = args.get('selector') or 'body'

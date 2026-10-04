@@ -20,24 +20,87 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from dataclasses import dataclass
+import urllib.parse
 import urllib.request
 import urllib.error
 
 # Configuration
 MCP_SERVER_URL = os.environ.get('CLAUDE_BROWSER_URL', 'http://127.0.0.1:8765')
-SCREENSHOTS_DIR = Path.home() / '.claudecodebrowser' / 'screenshots'
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
+# Argument names whose values must never be logged or retained. The server
+# redacts exactly these from its own logs and from audit.jsonl; this client
+# printed them in the clear to the terminal, which lands in any tee'd session
+# log or agent transcript.
+_SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
+                   'action_script', 'condition'}
 
-def _api_headers() -> dict:
-    """Return HTTP headers including the API token if available."""
+_LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
+
+
+def _is_loopback(url: str) -> bool:
+    """True when the URL names this machine."""
+    try:
+        host = urllib.parse.urlparse(url).hostname
+    except Exception:
+        return False
+    return host in _LOOPBACK_HOSTS or host == '127.0.0.1'
+
+
+def _redact_result(result):
+    """A log-safe copy of a tool result."""
+    if not isinstance(result, dict):
+        return result
+    safe = {}
+    for key, value in result.items():
+        if key in _SENSITIVE_ARGS:
+            safe[key] = '***'
+        elif key == 'element' and isinstance(value, dict):
+            safe[key] = {k: ('***' if k in _SENSITIVE_ARGS else v)
+                         for k, v in value.items()}
+        else:
+            safe[key] = value
+    return safe
+
+
+def _redact(arguments: dict) -> dict:
+    """A log-safe and history-safe copy of a tool's arguments."""
+    return {k: ('***' if k in _SENSITIVE_ARGS else v)
+            for k, v in (arguments or {}).items()}
+
+
+def _api_headers(url: str = MCP_SERVER_URL) -> dict:
+    """Headers for a request, including the API token for a local server only.
+
+    The token is full control of the user's browser. MCP_SERVER_URL comes from
+    the environment with no validation, so attaching the token unconditionally
+    meant one stray CLAUDE_BROWSER_URL in a shell profile or CI env sent it in
+    cleartext to that host on the first call. Set
+    CLAUDE_BROWSER_ALLOW_REMOTE=1 to override deliberately.
+    """
     headers = {'Content-Type': 'application/json'}
+    if not _is_loopback(url) and os.environ.get('CLAUDE_BROWSER_ALLOW_REMOTE') != '1':
+        return headers
     try:
         if _TOKEN_FILE.exists():
-            headers['X-API-Key'] = _TOKEN_FILE.read_text().strip()
+            token = _TOKEN_FILE.read_text().strip()
+            # An empty token file is "not configured", not an empty credential:
+            # sending '' produced a 403 and told the user they were
+            # unauthorised rather than that their token file was empty.
+            if token:
+                headers['X-API-Key'] = token
     except Exception:
         pass
     return headers
+
+
+class BrowserAgentDenied(RuntimeError):
+    """Raised when the safety guard refused a call.
+
+    Distinct from "the page had nothing": a denial that returns the same
+    empty value as a successful-but-empty read lets a caller report absent
+    content when the guard simply refused to look.
+    """
 
 
 @dataclass
@@ -94,7 +157,7 @@ class BrowserAutomationAgent:
     def call_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
         """Call an MCP tool."""
         self.log(f"Calling tool: {tool_name}")
-        self.log(f"Arguments: {kwargs}")
+        self.log(f"Arguments: {_redact(kwargs)}")
 
         result = self._make_request('/mcp/call', {
             'name': tool_name,
@@ -104,8 +167,11 @@ class BrowserAutomationAgent:
         action = BrowserAction(
             action_type=tool_name,
             description=f"Called {tool_name}",
-            parameters=kwargs,
-            result=result,
+            # Redacted: a plaintext password stored here stayed reachable for
+            # the life of the agent, in any repr() and in any traceback that
+            # renders the frame.
+            parameters=_redact(kwargs),
+            result=_redact_result(result),
             success=result.get('success', False),
             error=result.get('error')
         )
@@ -113,7 +179,10 @@ class BrowserAutomationAgent:
 
         if self.verbose:
             if result.get('success'):
-                self.log(f"Success: {result}")
+                # Results can carry a credential back: browser_get_value
+                # returns a field's contents, and the extension's
+                # element-not-found error embeds the whole options dict.
+                self.log(f"Success: {_redact_result(result)}")
             else:
                 self.log(f"Error: {result.get('error')}")
 
@@ -345,33 +414,75 @@ class BrowserAutomationAgent:
               username_selector: str = '#username, input[name="username"], input[type="email"]',
               password_selector: str = '#password, input[name="password"], input[type="password"]',
               submit_selector: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Perform a login."""
-        results = [
-            self.type_text(username, selector=username_selector, clear=True),
-            self.type_text(password, selector=password_selector, clear=True)
-        ]
+        """Perform a login. Requires allow_password_typing in safety.json.
+
+        This used to type the username, type the password, ignore the result,
+        and then press Enter on the password field - which, with the password
+        step refused by the default policy, submitted the form with a real
+        username and an EMPTY password against the live site, and returned a
+        list whose last element said success. Repeated that way it is an
+        account-lockout generator reported as a success.
+        """
+        username_result = self.type_text(username, selector=username_selector,
+                                         clear=True)
+        results = [username_result]
+
+        password_result = self.type_text(password, selector=password_selector,
+                                         clear=True)
+        results.append(password_result)
+
+        if not password_result.get('success'):
+            # Do not submit. Credentials are refused by default precisely so
+            # they do not pass through the agent; carrying on would send an
+            # empty password to a real login form.
+            results.append({
+                'success': False,
+                'error': 'Login aborted: the password could not be entered '
+                         f'({password_result.get("error", "refused")}). The form '
+                         'was NOT submitted. Credentials are refused by default '
+                         '- use the browser\'s own password manager, or set '
+                         '"allow_password_typing": true in '
+                         '~/.claudecodebrowser/safety.json.',
+                'aborted': True,
+            })
+            return results
 
         if submit_selector:
             results.append(self.click(selector=submit_selector))
         else:
-            results.append(self.type_text('', selector=password_selector, press_enter=True))
+            # Only reached when the password was accepted, so pressing Enter
+            # submits a complete form rather than an empty credential.
+            results.append(self.type_text('', selector=password_selector,
+                                          press_enter=True))
 
         return results
 
     def extract_text(self, selector: str) -> Optional[str]:
         """Extract text content from elements matching selector."""
+        # json.dumps, not interpolation: a selector containing a quote closed
+        # the literal and the rest executed as code, and an ordinary escaped
+        # selector like ".md\\:flex" lost its backslash and silently matched
+        # nothing.
         result = self.execute_script(f"""
-            const elements = document.querySelectorAll('{selector}');
+            const elements = document.querySelectorAll({json.dumps(selector)});
             return Array.from(elements).map(el => el.textContent.trim()).filter(t => t).join('\\n');
         """)
         if result.get('success'):
             return result.get('result')
+        # A safety denial is not "no matching text". Returning None for both
+        # let an agent report that content was absent when the guard refused
+        # to look at it.
+        decision = result.get('safety_decision')
+        if decision:
+            raise BrowserAgentDenied(
+                f"extract_text refused by the safety guard ({decision}): "
+                f"{result.get('error', 'no reason given')}")
         return None
 
     def extract_links(self, selector: str = 'a[href]') -> List[Dict[str, str]]:
         """Extract links from the page."""
         result = self.execute_script(f"""
-            const links = document.querySelectorAll('{selector}');
+            const links = document.querySelectorAll({json.dumps(selector)});
             return Array.from(links).map(a => ({{
                 text: a.textContent.trim(),
                 href: a.href
