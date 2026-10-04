@@ -124,7 +124,8 @@ them is part of releasing, and that is being held for approval.
   and the collection check runs *before* appending, so a single chunk lands in
   full and Firefox can deliver a whole response in one. The passes are
   quadratic on adversarial input: 5,000 characters of punctuation take 30ms,
-  320,000 take nearly two minutes, on the single-threaded background script
+  320,000 take two minutes and 1.3 MB takes half an hour, on the
+  single-threaded background script
   that also services every tool call and the native port. Found by measuring
   rather than trusting the fix; the collected text is now hard-bounded, with
   enough margin to keep the straddle fix working.

@@ -667,7 +667,8 @@ function attachResponseBodyReader(requestId, entry) {
           // Firefox can deliver one response in one chunk - landed in full
           // and the scrubber then ran over all of it. Its passes are
           // quadratic on adversarial input: 5000 characters of quote marks
-          // take 30ms, 320,000 take nearly two minutes, and this is the
+          // take 30ms, 320,000 take two minutes, 1.3MB takes half an hour -
+          // all measured - and this is the
           // single-threaded background script, so a page could stall every
           // tool call by serving a few hundred KB of punctuation.
           collected = collected.slice(0, SCRUB_LIMIT);
