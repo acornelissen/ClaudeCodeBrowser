@@ -23,6 +23,7 @@ Author: dre@ligandal.com
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import stat
@@ -231,6 +232,57 @@ def parse_flag(value: Any, fallback: bool) -> bool:
     return fallback
 
 
+def parse_number(value: Any, fallback: float) -> float:
+    """Read a numeric argument that may have arrived as a string.
+
+    The numeric counterpart of parse_flag, and the same rule as
+    parse_number() in headless_backend.py: anything unparseable, infinite or
+    NaN falls back. json.loads accepts the literals Infinity and NaN, so a
+    client really can send them, and int(float('inf')) raises OverflowError,
+    which a plain `except (TypeError, ValueError)` does not catch.
+    """
+    if value is None or value == '' or isinstance(value, bool):
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(number):
+        return fallback
+    return number
+
+
+def parse_int(value: Any, fallback: int) -> int:
+    """parse_number for arguments that must be whole (lengths, limits, ms)."""
+    return int(parse_number(value, fallback))
+
+
+# The message says how to get a usable id, because the agent cannot guess one.
+_BAD_TAB_ID = ('tab_id must be a whole non-negative tab id (browser_get_tabs '
+               'lists them); got {value!r}')
+
+
+def parse_tab_id(value: Any) -> Optional[int]:
+    """Read a tab id that may have arrived as a string.
+
+    Returns None when no tab was named, which means "the active tab". Raises
+    ValueError for a value that cannot be a tab id, because the alternative -
+    falling back to the active tab - acts on a different page from the one the
+    caller named, and that page may be anything.
+    """
+    if value is None or value == '':
+        return None
+    # bool is an int in Python, so tab_id: true would otherwise mean tab 1.
+    if isinstance(value, bool):
+        raise ValueError(_BAD_TAB_ID.format(value=value))
+    number = parse_number(value, float('nan'))
+    # Tab ids are whole and non-negative; browser.tabs.TAB_ID_NONE is -1, so a
+    # negative id names no tab in any browser.
+    if math.isnan(number) or not number.is_integer() or number < 0:
+        raise ValueError(_BAD_TAB_ID.format(value=value))
+    return int(number)
+
+
 def clamp_tab_limit(value: Any) -> int:
     """Clamp a caller-supplied tab limit.
 
@@ -238,10 +290,7 @@ def clamp_tab_limit(value: Any) -> int:
     {"url_pattern": "stub", "limit": 100000} returned 500 tabs - the user's
     whole browsing surface, from a tool that reads like a search.
     """
-    try:
-        limit = int(value)
-    except (TypeError, ValueError):
-        return DEFAULT_TAB_LIMIT
+    limit = parse_int(value, DEFAULT_TAB_LIMIT)
     if limit < 1:
         return DEFAULT_TAB_LIMIT
     return min(limit, MAX_TAB_LIMIT)
@@ -1241,6 +1290,18 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         """Execute an MCP tool by sending command to browser via native host."""
         logger.info(f"Executing tool: {tool_name} with args: "
                     f"{redact_for_log(arguments)}")
+
+        # Normalise tab_id before anything reads it. A JSON client sends
+        # tab_id: "7", and from here the value goes to the approval prompt,
+        # the command envelope and the headless backend, which looks the tab
+        # up in a dict keyed by int - so "1" reported "No headless tab with
+        # id 1" for a tab that was open. background.js coerces its own
+        # (resolveTabId), but only the id it is handed.
+        if 'tab_id' in arguments:
+            try:
+                arguments['tab_id'] = parse_tab_id(arguments['tab_id'])
+            except ValueError as e:
+                return {'success': False, 'error': str(e)}
 
         # Safety guard: scheme/blocklist checks, read-only mode, script toggle,
         # protected-domain confirmation, rate limiting, audit logging.

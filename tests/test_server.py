@@ -212,6 +212,14 @@ class ScreenshotPruningTests(unittest.TestCase):
         # Pruning only touches a directory this project created, so the tests
         # that expect deletion have to say the directory is ours.
         (self.dir / safety.OWNED_DIR_MARKER).touch()
+        # Both come from CLAUDE_BROWSER_SCREENSHOT_* at import time, so a
+        # developer with either exported ran different tests from CI: with
+        # RETENTION_DAYS=60 the month-old screenshot below survives and two
+        # tests failed for a reason that had nothing to do with the code.
+        for name, pinned in (('SCREENSHOT_RETENTION_DAYS', 7.0),
+                             ('SCREENSHOT_MAX_FILES', 500)):
+            self.addCleanup(setattr, safety, name, getattr(safety, name))
+            setattr(safety, name, pinned)
 
     def _shot(self, name, age_days=0):
         import os, time
@@ -461,6 +469,38 @@ class FlagParsingTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertTrue(server.parse_flag(raw, True))
                 self.assertFalse(server.parse_flag(raw, False))
+
+
+class NumericArgumentTests(unittest.TestCase):
+    """parse_flag covered the booleans and the numbers were left on bare
+    int(). "limit" is the one numeric the server reads itself rather than
+    forwarding, and int() got it wrong twice: int("12.7") raises, so a caller
+    asking for 12 tabs was given the 50-tab default instead, and
+    int(float('inf')) raises OverflowError, which the except clause did not
+    catch - json.loads accepts the literal Infinity, so a client can send
+    it."""
+
+    def test_numeric_strings_are_read_as_numbers(self):
+        self.assertEqual(server.parse_int('12', 5), 12)
+        self.assertEqual(server.parse_int(' 12 ', 5), 12)
+        self.assertEqual(server.parse_int('12.7', 5), 12)
+        self.assertEqual(server.parse_number('1.5', 5.0), 1.5)
+
+    def test_unusable_values_fall_back(self):
+        for raw in (None, '', 'lots', [], {}, True, False,
+                    float('inf'), float('-inf'), float('nan')):
+            with self.subTest(raw=raw):
+                self.assertEqual(server.parse_int(raw, 5), 5)
+
+    def test_a_string_limit_is_honoured_rather_than_replaced(self):
+        self.assertEqual(server.clamp_tab_limit('12'), 12)
+        self.assertEqual(server.clamp_tab_limit('12.7'), 12,
+                         'a caller asking for fewer tabs must not be given '
+                         'the larger default')
+
+    def test_an_infinite_limit_does_not_crash_the_handler(self):
+        self.assertEqual(server.clamp_tab_limit(float('inf')),
+                         server.DEFAULT_TAB_LIMIT)
 
 
 class ScreenshotSaveFlagTests(unittest.TestCase):
@@ -728,6 +768,84 @@ class TabLimitTests(unittest.TestCase):
                          ['active', 'audible', 'title', 'url', 'url_pattern'])
         self.assertIn('limit', tool.input_schema['properties'])
         self.assertIn('at least one filter', tool.description.lower())
+
+
+class TabIdCoercionTests(unittest.TestCase):
+    """A JSON client sends tab_id: "7". Every fixture here passed an int, so
+    the string never reached the transports: the headless backend keys its
+    tab table by int, so "1" answered "No headless tab with id 1" for a tab
+    that was open, and background.js only coerces the id it is handed."""
+
+    def _execute(self, tool, arguments):
+        """Run the real execute_tool and report what it handed the transport."""
+        captured = {}
+
+        def fake_dispatch(action, tab_id, arguments):
+            captured['action'] = action
+            captured['tab_id'] = tab_id
+            captured['arguments'] = arguments
+            return {'success': True}
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._dispatch_action = fake_dispatch
+        result = handler.execute_tool(tool, dict(arguments))
+        return result, captured
+
+    def test_a_string_tab_id_reaches_the_transport_as_an_int(self):
+        result, captured = self._execute('browser_get_page_info',
+                                         {'tab_id': '7'})
+        self.assertTrue(result.get('success'), result)
+        self.assertEqual(captured['tab_id'], 7)
+        self.assertIsInstance(captured['tab_id'], int)
+
+    def test_tab_zero_is_still_a_tab(self):
+        """0 is a real tab id, and it must not collapse to "the active tab"."""
+        _, captured = self._execute('browser_get_page_info', {'tab_id': '0'})
+        self.assertEqual(captured['tab_id'], 0)
+
+    def test_no_tab_id_still_means_the_active_tab(self):
+        _, captured = self._execute('browser_get_page_info', {})
+        self.assertIsNone(captured['tab_id'])
+        _, captured = self._execute('browser_get_page_info', {'tab_id': ''})
+        self.assertIsNone(captured['tab_id'])
+
+    def test_a_value_that_is_not_a_tab_id_is_refused_and_says_why(self):
+        """Falling back to the active tab would act on a different page from
+        the one the caller named."""
+        for raw in ('active', 'last', '7.5', True, [7], -1, float('inf')):
+            with self.subTest(raw=raw):
+                result, captured = self._execute('browser_get_page_info',
+                                                 {'tab_id': raw})
+                self.assertFalse(result['success'])
+                self.assertIn('tab_id', result['error'])
+                self.assertIn('browser_get_tabs', result['error'],
+                              'the message must say how to get a usable id')
+                self.assertEqual(captured, {},
+                                 'a refused call must not be dispatched')
+
+    def test_the_tools_that_take_a_required_tab_id_coerce_it_too(self):
+        for tool in ('browser_get_tab_info', 'browser_close_tab',
+                     'browser_focus_tab'):
+            with self.subTest(tool=tool):
+                _, captured = self._execute(tool, {'tab_id': '7'})
+                self.assertEqual(captured['tab_id'], 7)
+
+    def test_the_audit_tool_coerces_before_dispatching_itself(self):
+        """browser_audit_page bypasses the action map and dispatches
+        executeScript directly."""
+        result, captured = self._execute('browser_audit_page',
+                                         {'tab_id': '3', 'screenshot': False})
+        self.assertTrue(result.get('success'), result)
+        self.assertEqual(captured['action'], 'executeScript')
+        self.assertEqual(captured['tab_id'], 3)
+
+    def test_a_workflow_step_coerces_its_own_tab_id(self):
+        result, captured = self._execute('browser_run_workflow', {
+            'steps': [{'tool': 'browser_get_page_info',
+                       'arguments': {'tab_id': '7'}}],
+            'screenshot_on_failure': False})
+        self.assertTrue(result['success'], result)
+        self.assertEqual(captured['tab_id'], 7)
 
 
 class ObserverLifetimeSchemaTests(unittest.TestCase):

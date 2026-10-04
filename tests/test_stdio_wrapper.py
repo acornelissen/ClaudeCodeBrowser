@@ -11,10 +11,11 @@ Run: python3 -m unittest discover -s tests -t . -v
 """
 
 import os
-import re
 import sys
 import tempfile
+import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -74,23 +75,97 @@ class UntrustedContentFenceTests(unittest.TestCase):
 
 
 class TimeoutTests(unittest.TestCase):
+    """The server blocks while a human looks at a prompt - up to 200s for a
+    captcha, 90s for an approval. A shorter client timeout told the agent the
+    call had failed while the person was still deciding; it retried, and a
+    second approval ran the state-changing action twice.
+
+    Both numbers are taken from the running code. The previous version of
+    this test grepped `urlopen(req, timeout=(\\d+))` and `wait_timeout =
+    ([\\d.]+)` out of the two files, so spelling either one as a named
+    constant left the test green (the server's regex simply stopped matching
+    the longest wait) with the invariant broken.
+    """
+
+    HUMAN_WAIT_ACTIONS = ('requestApproval', 'solveCaptcha')
+
+    def _client_timeout(self):
+        """The timeout the wrapper really hands urlopen for a tool call."""
+        seen = {}
+
+        class FakeResponse:
+            def __enter__(inner):
+                return inner
+
+            def __exit__(inner, *exc_info):
+                return False
+
+            def read(inner):
+                return b'{"success": true}'
+
+        def fake_urlopen(req, timeout=None):
+            seen['timeout'] = timeout
+            return FakeResponse()
+
+        with unittest.mock.patch.object(stdio_wrapper.urllib.request,
+                                        'urlopen', fake_urlopen):
+            result = stdio_wrapper.call_tool('browser_solve_captcha', {})
+
+        self.assertTrue(result.get('success'),
+                        f'the stubbed call should have succeeded: {result}')
+        self.assertIsNotNone(seen.get('timeout'),
+                             'the wrapper must set a timeout at all: without '
+                             'one urlopen waits for ever')
+        return float(seen['timeout'])
+
+    def _server_wait(self, action):
+        """How long _dispatch_action really waits for that action.
+
+        Driven through the real method with the queue's wait stubbed out, so
+        the number is the one the code uses rather than one read out of the
+        source.
+        """
+        waits = []
+
+        class RecordingEvent:
+            def wait(inner, timeout=None):
+                waits.append(timeout)
+                return False  # nobody answers, so the dispatch times out
+
+            def set(inner):
+                pass
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler.server = type('S', (), {})()
+        # Only server.threading is swapped, not the threading module itself:
+        # _dispatch_action's sole use of it is the waiter below.
+        fake_threading = types.SimpleNamespace(Event=RecordingEvent)
+        with unittest.mock.patch.object(server, 'threading', fake_threading), \
+                unittest.mock.patch.object(server, 'HEADLESS_MODE', False):
+            result = handler._dispatch_action(action, None, {})
+
+        self.assertFalse(result['success'],
+                         'no browser answered, so this must report a timeout')
+        self.assertEqual(len(waits), 1, f'expected one wait, got {waits}')
+        return float(waits[0])
 
     def test_the_client_timeout_outlasts_the_servers_human_waits(self):
-        """The server blocks up to 200s showing a captcha prompt and 90s for an
-        approval. A shorter client timeout told the agent the call had failed
-        while the person was still looking at the prompt, and the retry ran the
-        action a second time."""
-        wrapper = (ROOT / 'mcp-server' / 'stdio_wrapper.py').read_text()
-        timeouts = [int(m) for m in re.findall(r'urlopen\(req, timeout=(\d+)\)', wrapper)]
-        self.assertTrue(timeouts, 'expected at least one urlopen timeout')
-        call_timeout = max(timeouts)
+        client = self._client_timeout()
+        for action in self.HUMAN_WAIT_ACTIONS:
+            with self.subTest(action=action):
+                wait = self._server_wait(action)
+                self.assertGreater(
+                    client, wait,
+                    f'client gives up at {client}s but the server waits up to '
+                    f'{wait}s for a human on {action}')
 
-        server_src = (ROOT / 'mcp-server' / 'server.py').read_text()
-        waits = [float(m) for m in re.findall(r'wait_timeout = ([\d.]+)', server_src)]
-        self.assertTrue(waits, 'expected server-side wait timeouts')
-        self.assertGreater(call_timeout, max(waits),
-                           f'client gives up at {call_timeout}s but the server '
-                           f'waits up to {max(waits)}s for a human')
+    def test_a_human_prompt_is_given_longer_than_an_ordinary_command(self):
+        """If the special-casing is ever dropped, every prompt silently gets
+        the 30s command wait and no human can answer in time."""
+        ordinary = self._server_wait('click')
+        for action in self.HUMAN_WAIT_ACTIONS:
+            with self.subTest(action=action):
+                self.assertGreater(self._server_wait(action), ordinary)
 
 
 if __name__ == '__main__':
