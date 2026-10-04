@@ -33,12 +33,19 @@ browser. The guard enforces, in order:
                            allowing screenshots, inspection and log reading.
 5. Script toggle         - browser_execute_script and friends can be turned
                            off entirely (allow_script_execution: false).
+                           browser_audit_page is covered too: it only
+                           observes, but it does so by running a fixed script
+                           in the page, so the toggle and the protected-site
+                           script refusal both apply to it.
 6. Rate limit            - sliding-window cap on actions per minute, so a
                            runaway agent cannot machine-gun the browser.
 7. Audit log             - every decision (allowed, denied, confirmation
                            requested) is appended to
                            ~/.claudecodebrowser/logs/audit.jsonl with
-                           sensitive argument values redacted.
+                           sensitive argument values redacted. A URL keeps
+                           its host and path, which is what makes the entry
+                           useful, and loses the userinfo, query and fragment,
+                           which is where credentials live - see redact_url.
 
 Configuration lives in ~/.claudecodebrowser/safety.json (created with safe
 defaults on first run). Environment overrides:
@@ -101,6 +108,18 @@ _URL_DELIMITERS = ':/?#'
 _FORBIDDEN_HOST_CHARS = frozenset('\x00\t\n\r #/:<>?@[\\]^|%')
 
 
+def _clean_url_text(url: str) -> str:
+    """Strip the characters the browser ignores before it parses a URL.
+
+    Shared by _normalise_url and redact_url so both read the same string the
+    browser does: leading and trailing C0 controls and spaces go, tabs and
+    line breaks go wherever they appear, and a backslash counts as a forward
+    slash.
+    """
+    return url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS).replace(
+        '\\', '/')
+
+
 def _normalise_url(url: str) -> str:
     """Return the URL the browser would load, for matching purposes.
 
@@ -127,8 +146,7 @@ def _normalise_url(url: str) -> str:
     """
     if not isinstance(url, str):
         return url
-    cleaned = url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS)
-    cleaned = cleaned.replace('\\', '/')
+    cleaned = _clean_url_text(url)
     try:
         parts = urlsplit(cleaned)
         host = parts.hostname
@@ -264,12 +282,91 @@ SCRIPT_TOOLS = {
     'browser_inject_observer',
 }
 
+# Tools that only observe, but do it by running a fixed script of our own.
+# They stay available in read-only mode - read-only is about not changing the
+# page, and these change nothing - but they are still JavaScript running in
+# the user's page, so the script toggle and the protected-site script refusal
+# apply. browser_audit_page was an observe tool and nothing else, so the
+# guard returned early and the server dispatched executeScript itself: a user
+# who set allow_script_execution: false to keep JavaScript out of their pages
+# got it anyway, on a protected site, in read-only mode.
+OBSERVE_SCRIPT_TOOLS = {
+    'browser_audit_page',
+}
+
 # Everything else (click, type, navigate, tab management, refresh, ...) is a
 # state-changing ACT tool: blocked in read-only mode, confirmation required on
 # protected domains.
 
-# Argument keys whose values never appear in the audit log.
-_SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps', 'action_script', 'condition'}
+# Argument keys whose values never appear in a log - the audit log here and
+# the application log in server.py, which imports this list rather than
+# keeping a second one. There were two copies and a comment claiming they
+# agreed; 'url' was in server.py's only, so a password-reset link went to
+# audit.jsonl in clear.
+#
+# 'key' is here because browser_press_key logged the key it pressed, one
+# entry per press and in order, so a typed sequence could be read straight
+# off the log. Synthetic KeyboardEvents cannot type in attended Firefox, but
+# the headless backend's keyboard.press does.
+SENSITIVE_ARGS = frozenset({
+    'text', 'script', 'value', 'password', 'steps', 'action_script',
+    'condition', 'key',
+})
+
+# Argument keys holding a URL. Masking these outright would cost the audit log
+# its point - it exists to say what was done - so they are reduced instead;
+# see redact_url.
+URL_ARGS = frozenset({'url'})
+
+
+def redact_url(url: Any) -> Any:
+    """Keep the part of a URL a log needs and drop the parts that carry secrets.
+
+    The scheme, host and path say which page was acted on, which is the whole
+    diagnostic value. Userinfo, the query and the fragment are where
+    credentials live: 'https://alice:hunter2@intranet/' sends that password,
+    and a password-reset or SSO callback link puts the token in the query or
+    the fragment. Each dropped part leaves a marker so the entry does not
+    read as though the URL never had one.
+
+    A scheme the guard refuses outright keeps only its name: a javascript: or
+    data: URL is a payload rather than a location, and the refusal is what
+    the log is recording.
+    """
+    if not isinstance(url, str) or not url:
+        return url
+    normalised = _normalise_url(url)
+    try:
+        parts = urlsplit(normalised)
+    except ValueError:
+        return '***'
+    scheme = (parts.scheme or '').lower()
+    if scheme not in ('http', 'https'):
+        if normalised.lower() == 'about:blank':
+            return normalised
+        return f'{scheme}:***' if scheme else '***'
+    try:
+        had_userinfo = '@' in urlsplit(_clean_url_text(url)).netloc
+    except ValueError:
+        had_userinfo = True
+    # _normalise_url has already dropped the userinfo from netloc.
+    redacted = f"{scheme}://{'***@' if had_userinfo else ''}{parts.netloc}{parts.path}"
+    if parts.query:
+        redacted += '?***'
+    if parts.fragment:
+        redacted += '#***'
+    return redacted
+
+
+def redact_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """A log-safe copy of a tool's arguments."""
+    return {
+        k: ('***' if k in SENSITIVE_ARGS
+            else redact_url(v) if k in URL_ARGS
+            else v)
+        for k, v in arguments.items()
+    }
+
 
 # Accepted values for the two string-valued policy choices. Read through
 # SafetyGuard._choice so that "Human" or " human" lands where it was meant to.
@@ -621,6 +718,11 @@ class SafetyGuard:
             'trusted_url_patterns': self.config.get('trusted_url_patterns', []),
             'deny_scripts_on_protected_urls': self.config.get(
                 'deny_scripts_on_protected_urls', True),
+            # Every tool those two settings cover, including the one that
+            # only observes: browser_audit_page runs a fixed script of ours,
+            # which is still JavaScript in the page. How far the toggle
+            # reaches is what a person inspects this tool to find out.
+            'script_tools': sorted(SCRIPT_TOOLS | OBSERVE_SCRIPT_TOOLS),
             'max_actions_per_minute': self.config.get('max_actions_per_minute', 120),
             'actions_in_last_minute': recent,
             'pending_confirmations': pending,
@@ -680,6 +782,14 @@ class SafetyGuard:
                                   f"not www.example.com, so write "
                                   f"\"(.+\\.)?example\\.com\" for a whole domain tree.")
 
+        # 3b. A tool that observes by running a script of ours is still
+        #     JavaScript in the page, so the script rules are checked before
+        #     the observe shortcut, which is where this one slipped through.
+        if tool_name in OBSERVE_SCRIPT_TOOLS:
+            denial = self._script_denial(tool_name, target_url)
+            if denial is not None:
+                return denial
+
         if is_observe:
             return None
 
@@ -690,29 +800,11 @@ class SafetyGuard:
                               f"(read_only in safety.json or CLAUDE_BROWSER_READ_ONLY=1). "
                               f"Observation tools like browser_screenshot remain available.")
 
-        # 4. Script execution toggle.
-        if is_script and not self.config.get('allow_script_execution', True):
-            return self._deny('scripts_disabled',
-                              f"{tool_name} refused: script execution is disabled "
-                              f"(allow_script_execution in safety.json or "
-                              f"CLAUDE_BROWSER_ALLOW_SCRIPTS=0).")
-
-        # 4b. Arbitrary JavaScript on a protected site is refused outright,
-        #     not merely confirmed. A script can read any field - the
-        #     credential guard does not apply to it - and a confirmation the
-        #     agent itself can satisfy is no control over that.
-        if is_script and self.config.get('deny_scripts_on_protected_urls', True):
-            script_url = target_url if target_url is not None else self._current_url
-            matched = self._matched_protected(script_url)
-            if matched:
-                return self._deny(
-                    'scripts_denied_on_protected_url',
-                    f"{tool_name} refused: {script_url!r} matches protected pattern "
-                    f"{matched!r}, and arbitrary JavaScript is not confirmable on a "
-                    f"protected site - a script can read any field on the page, "
-                    f"including credentials. Use the specific tool for what you "
-                    f"need, or set \"deny_scripts_on_protected_urls\": false in "
-                    f"safety.json if you accept that.")
+        # 4. Script rules: the toggle, and the protected-site refusal.
+        if is_script:
+            denial = self._script_denial(tool_name, target_url)
+            if denial is not None:
+                return denial
 
         # 5. Protected-domain confirmation for state-changing actions.
         if (self.config.get('confirm_protected_actions', True)
@@ -745,6 +837,37 @@ class SafetyGuard:
                     ),
                 }
 
+        return None
+
+    def _script_denial(self, tool_name: str,
+                       target_url: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The two rules that apply to any tool running JavaScript in a page.
+
+        Shared by the script tools and by the observe tools that run a script
+        of ours, so the answer cannot differ between them.
+        """
+        if not self.config.get('allow_script_execution', True):
+            return self._deny('scripts_disabled',
+                              f"{tool_name} refused: script execution is disabled "
+                              f"(allow_script_execution in safety.json or "
+                              f"CLAUDE_BROWSER_ALLOW_SCRIPTS=0).")
+
+        # Arbitrary JavaScript on a protected site is refused outright, not
+        # merely confirmed. A script can read any field - the credential guard
+        # does not apply to it - and a confirmation the agent itself can
+        # satisfy is no control over that.
+        if self.config.get('deny_scripts_on_protected_urls', True):
+            script_url = target_url if target_url is not None else self._current_url
+            matched = self._matched_protected(script_url)
+            if matched:
+                return self._deny(
+                    'scripts_denied_on_protected_url',
+                    f"{tool_name} refused: {script_url!r} matches protected pattern "
+                    f"{matched!r}, and arbitrary JavaScript is not confirmable on a "
+                    f"protected site - a script can read any field on the page, "
+                    f"including credentials. Use the specific tool for what you "
+                    f"need, or set \"deny_scripts_on_protected_urls\": false in "
+                    f"safety.json if you accept that.")
         return None
 
     def _target_url(self, arguments: Dict[str, Any]) -> Optional[str]:
@@ -889,9 +1012,12 @@ class SafetyGuard:
             'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
             'tool': tool_name,
             'decision': decision,
-            'url': target_url or self._current_url,
-            'args': {k: ('***' if k in _SENSITIVE_ARGS else v)
-                     for k, v in arguments.items()},
+            # Reduced the same way as a url argument: this field is the
+            # normalised URL, which drops userinfo but keeps a query string,
+            # so a reset token used to be recorded here in clear even when
+            # the argument was masked.
+            'url': redact_url(target_url or self._current_url),
+            'args': redact_arguments(arguments),
         }
         try:
             _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)

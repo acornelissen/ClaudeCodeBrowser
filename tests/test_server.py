@@ -953,6 +953,95 @@ class ObserverLifetimeSchemaTests(unittest.TestCase):
             {'maxLifetimeMs': 600000})
 
 
+class AuditToolBypassTests(unittest.TestCase):
+    """browser_audit_page dispatches executeScript itself instead of going
+    through the action map, so the toggle a user set to keep JavaScript out
+    of their pages has to be enforced before that dispatch happens."""
+
+    def setUp(self):
+        self.guard = safety.get_safety_guard()
+        self.before = dict(self.guard.config)
+        self.addCleanup(self.guard.config.update, self.before)
+
+    def _execute(self, tool, arguments):
+        captured = []
+
+        def fake_dispatch(action, tab_id, args):
+            captured.append(action)
+            return {'success': True, 'result': {}}
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._dispatch_action = fake_dispatch
+        return handler.execute_tool(tool, dict(arguments)), captured
+
+    def test_no_script_is_dispatched_when_scripts_are_off(self):
+        self.guard.config['allow_script_execution'] = False
+        result, captured = self._execute('browser_audit_page',
+                                         {'screenshot': False})
+        self.assertFalse(result['success'])
+        self.assertEqual(result['safety_decision'], 'scripts_disabled')
+        self.assertEqual(captured, [], 'the script must not reach the browser')
+
+    def test_the_audit_still_runs_when_scripts_are_allowed(self):
+        self.guard.config['allow_script_execution'] = True
+        result, captured = self._execute('browser_audit_page',
+                                         {'screenshot': False})
+        self.assertTrue(result['success'], result)
+        self.assertEqual(captured, ['executeScript'])
+
+
+class HeadlessConsoleDescriptionTests(unittest.TestCase):
+    """browser_get_console_logs told an agent that headless "captures the
+    page console in full". headless_backend._dispatch has no getConsoleLogs
+    branch, so the call comes back "Unsupported headless action" - and an
+    agent that believes the description reads that error as "the page logged
+    nothing"."""
+
+    def _description(self, name):
+        return next(t for t in server.MCP_TOOLS if t.name == name).description
+
+    def test_headless_really_has_no_console_action(self):
+        source = (REPO_ROOT / 'mcp-server' / 'headless_backend.py').read_text()
+        self.assertNotIn("'getConsoleLogs'", source,
+                         'headless implements it now: say so in the tool '
+                         'descriptions instead of removing this test')
+
+    def test_the_console_tool_does_not_promise_a_headless_capture(self):
+        description = self._description('browser_get_console_logs')
+        self.assertNotIn('captures the page console in full', description)
+        self.assertIn('Unsupported headless action', description,
+                      'the agent has to be able to tell the error from an '
+                      'empty console')
+
+    def test_the_observer_tool_names_a_buffer_something_can_read(self):
+        """Its buffer is window.__ccb_mutations, and browser_get_console_logs
+        has never read it."""
+        description = self._description('browser_inject_observer')
+        self.assertNotIn('readable via browser_get_console_logs', description)
+        self.assertIn('__ccb_mutations', description)
+        self.assertIn('browser_execute_script', description)
+
+
+class RedactionListTests(unittest.TestCase):
+    """The application log and the audit log kept separate lists, with a
+    comment here claiming they were in step. They were not: 'url' was in this
+    one only, so a credential in a URL reached audit.jsonl in clear."""
+
+    def test_both_logs_use_one_definition(self):
+        self.assertIs(server.redact_for_log, safety.redact_arguments)
+
+    def test_a_credential_in_a_url_does_not_reach_the_log(self):
+        redacted = server.redact_for_log({
+            'url': 'https://alice:hunter2@intranet.example.com/wiki/Home',
+            'key': 'h',
+            'text': 'secret',
+        })
+        self.assertEqual(redacted['url'],
+                         'https://***@intranet.example.com/wiki/Home')
+        self.assertEqual(redacted['key'], '***')
+        self.assertEqual(redacted['text'], '***')
+
+
 class SafetyGuardTests(unittest.TestCase):
 
     def test_read_only_mode_still_allows_observation(self):

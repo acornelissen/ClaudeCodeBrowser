@@ -111,7 +111,7 @@ MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
 
 from safety import (get_safety_guard, prune_screenshots,
-                    resolve_screenshots_dir)
+                    redact_arguments, resolve_screenshots_dir)
 
 # API token for localhost HTTP authentication
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
@@ -178,21 +178,12 @@ COMMAND_QUEUE_TTL = float(os.environ.get('CLAUDE_BROWSER_COMMAND_TTL', '240'))
 SCREENSHOTS_DIR = resolve_screenshots_dir()
 
 
-# Argument keys whose values never reach a log. Kept in step with safety.py's
-# audit list: the application log used a shorter one, so browser_run_workflow
-# wrote every nested script and typed password into mcp_server.log while
-# audit.jsonl masked them, and 'url' was in neither, so a password-reset or
-# SSO-token URL was retained in clear.
-LOG_SENSITIVE_ARGS = {
-    'text', 'script', 'value', 'password', 'steps', 'action_script',
-    'condition', 'url',
-}
-
-
-def redact_for_log(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """A log-safe copy of a tool's arguments."""
-    return {k: ('***' if k in LOG_SENSITIVE_ARGS else v)
-            for k, v in arguments.items()}
+# The application log and the audit log redact through one function, defined
+# in safety.py. They used to be two lists with a comment here saying they were
+# kept in step: 'url' was in this one only, so a password-reset or SSO-token
+# URL was written to audit.jsonl in clear, and nothing could tell you that by
+# reading either file.
+redact_for_log = redact_arguments
 
 
 # Values a string flag may carry. MCP arguments arrive as JSON, but callers
@@ -791,7 +782,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_console_logs",
-        description="Retrieve captured console output. IMPORTANT in attended Firefox: a content script cannot see the page's own console, so this does NOT return the page's console.log calls. It returns uncaught page errors and unhandled promise rejections (source: \"page\"), plus output from the extension's own scripts including anything browser_execute_script prints (source: \"extension\"). An empty result therefore does not mean the page logged nothing. Headless mode (Playwright) captures the page console in full. Check capturesPageConsole in the result.",
+        description="Retrieve captured console output. IMPORTANT in attended Firefox: a content script cannot see the page's own console, so this does NOT return the page's console.log calls. It returns uncaught page errors and unhandled promise rejections (source: \"page\"), plus output from the extension's own scripts including anything browser_execute_script prints (source: \"extension\"). An empty result therefore does not mean the page logged nothing. Headless mode (Playwright) does not implement this tool at all: the call comes back with \"Unsupported headless action: getConsoleLogs\", which is an error, not an empty console. Check capturesPageConsole in the result.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1002,7 +993,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_audit_page",
-        description="Runs a fixed read-only inspection script, so JavaScript executes even when allow_script_execution is false; do not use it if you need no JS to run in your pages. Audits the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. One call gathers everything needed to critique a page's structure and accessibility basics.",
+        description="Audits the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. It gathers this by running a fixed read-only script in the page, so it is refused when allow_script_execution is false and on a protected URL while deny_scripts_on_protected_urls is on; browser_safety_status lists the tools those settings cover. One call gathers everything needed to critique a page's structure and accessibility basics.",
         input_schema={
             "type": "object",
             "properties": {
@@ -1024,8 +1015,10 @@ MCP_TOOLS: List[MCPTool] = [
     MCPTool(
         name="browser_inject_observer",
         description=(
-            "Inject a MutationObserver into the page that captures DOM changes and console events "
-            "into a buffer, readable via browser_get_console_logs. Useful for watching live UI updates. "
+            "Inject a MutationObserver into the page that records DOM changes (not console output) "
+            "into window.__ccb_mutations in the page. Nothing collects that buffer for you: read it "
+            "with browser_execute_script (return window.__ccb_mutations), which the script toggle "
+            "applies to. browser_get_console_logs does not see it. Useful for watching live UI updates. "
             "HEADLESS MODE ONLY: the Firefox extension does not implement this; "
             "in attended mode it returns \"Unknown action\". Check browser_safety_status."
         ),
@@ -1802,8 +1795,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         """Collect page structure + optional screenshot for visual critique."""
         tab_id = arguments.get('tab_id')
         script_args = {'script': self._AUDIT_JS}
-        # Dispatch directly: the audit is read-only inspection, so it stays
-        # available even when browser_execute_script is policy-disabled.
+        # Dispatched directly rather than through the action map, so no
+        # executeScript call reaches the guard. The guard therefore judges
+        # browser_audit_page itself against the script rules
+        # (OBSERVE_SCRIPT_TOOLS in safety.py) before execute_tool gets here:
+        # this used to be the one way to run JavaScript with
+        # allow_script_execution: false.
         audit = self._dispatch_action('executeScript', tab_id, script_args)
         if not audit.get('success'):
             return {'success': False,

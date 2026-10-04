@@ -9,6 +9,7 @@ These cover the enforcement layers an audit found holes in.
 Run: python3 -m unittest discover -s tests -t . -v
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -388,6 +389,44 @@ class ScriptToggleTests(unittest.TestCase):
         self.assertIsNone(guard().check('browser_execute_script', {'script': 'x'}))
 
 
+class AuditToolScriptTests(unittest.TestCase):
+    """browser_audit_page runs a fixed inspection script. It was an observe
+    tool, so the guard returned early and the server then dispatched
+    executeScript itself - no executeScript ever reached the guard, and a
+    user who set allow_script_execution: false still had JavaScript run in
+    their pages, on a protected site, in read-only mode."""
+
+    def test_the_script_toggle_covers_the_audit_tool(self):
+        g = guard(allow_script_execution=False)
+        denial = g.check('browser_audit_page', {})
+        self.assertIsNotNone(denial, 'the toggle says no JavaScript at all')
+        self.assertEqual(denial['safety_decision'], 'scripts_disabled')
+
+    def test_the_audit_tool_is_refused_on_a_protected_site(self):
+        g = guard()
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_audit_page', {})
+        self.assertIsNotNone(denial)
+        self.assertEqual(denial['safety_decision'],
+                         'scripts_denied_on_protected_url')
+
+    def test_it_is_still_observation_in_read_only_mode(self):
+        """read-only is about not changing the page, and the audit script
+        changes nothing. Blocking a read tool there buys no safety."""
+        self.assertIsNone(guard(read_only=True).check('browser_audit_page', {}))
+
+    def test_it_needs_no_confirmation_on_an_ordinary_page(self):
+        g = guard()
+        g.note_url({'url': 'https://example.com/page'})
+        self.assertIsNone(g.check('browser_audit_page', {}))
+
+    def test_status_names_every_tool_the_toggle_covers(self):
+        """The toggle's reach is what a user inspects this tool for."""
+        listed = guard().status()['script_tools']
+        self.assertIn('browser_audit_page', listed)
+        self.assertIn('browser_execute_script', listed)
+
+
 class RateLimitTests(unittest.TestCase):
 
     def test_the_cap_is_enforced(self):
@@ -537,12 +576,88 @@ class PolicyChoiceTests(unittest.TestCase):
 
 class AuditLogTests(unittest.TestCase):
 
+    def _last_entry(self):
+        return json.loads(safety._AUDIT_FILE.read_text().strip().splitlines()[-1])
+
     def test_sensitive_values_are_not_written(self):
         g = guard()
         g.check('browser_type', {'selector': '#x', 'text': 'hunter2'})
         written = safety._AUDIT_FILE.read_text()
         self.assertNotIn('hunter2', written)
         self.assertIn('browser_type', written)
+
+    def test_a_credential_in_a_url_is_not_written(self):
+        """userinfo is a password, and a reset or SSO link carries a token in
+        the query. Both used to land in audit.jsonl in clear: the url
+        argument was in no redaction list, and the entry's own url field is
+        normalised, which drops userinfo but keeps the query."""
+        g = guard()
+        g.check('browser_navigate',
+                {'url': 'https://alice:hunter2@intranet.example.com/'})
+        g.check('browser_navigate',
+                {'url': 'https://example.com/reset?token=S3CRET-RESET-TOKEN'})
+        g.check('browser_create_tab',
+                {'url': 'https://sso.example.com/cb#id_token=eyJhbGciOi'})
+        written = safety._AUDIT_FILE.read_text()
+        for secret in ('hunter2', 'S3CRET-RESET-TOKEN', 'eyJhbGciOi'):
+            self.assertNotIn(secret, written)
+
+    def test_a_url_keeps_the_part_that_makes_the_entry_useful(self):
+        """Blanking the URL would cost the log its point - it exists to say
+        what was done - so the normalised host and path stay."""
+        g = guard()
+        g.check('browser_navigate',
+                {'url': 'https://alice:hunter2@intranet.example.com/wiki/Home'})
+        entry = self._last_entry()
+        self.assertEqual(entry['args']['url'],
+                         'https://***@intranet.example.com/wiki/Home')
+        # The entry's own url field is the normalised URL, which has had the
+        # userinfo taken off it already, so there is nothing to mark there.
+        self.assertEqual(entry['url'],
+                         'https://intranet.example.com/wiki/Home')
+
+    def test_a_query_and_a_fragment_are_reduced_to_a_marker(self):
+        g = guard()
+        g.check('browser_navigate',
+                {'url': 'https://example.com/reset?token=abc#t=1'})
+        entry = self._last_entry()
+        self.assertEqual(entry['args']['url'], 'https://example.com/reset?***#***')
+
+    def test_an_ordinary_url_is_recorded_as_it_is(self):
+        g = guard()
+        g.check('browser_navigate', {'url': 'https://example.com/docs/page'})
+        self.assertEqual(self._last_entry()['args']['url'],
+                         'https://example.com/docs/page')
+
+    def test_a_refused_scheme_is_recorded_without_its_payload(self):
+        """A javascript: or data: URL is a payload, not a location. The
+        decision is what the log needs; the body of the script is not."""
+        g = guard()
+        g.check('browser_navigate', {'url': 'javascript:alert(document.cookie)'})
+        entry = self._last_entry()
+        self.assertEqual(entry['args']['url'], 'javascript:***')
+        self.assertEqual(entry['decision'], 'blocked_scheme')
+        self.assertNotIn('cookie', safety._AUDIT_FILE.read_text())
+
+    def test_about_blank_is_left_alone(self):
+        g = guard()
+        g.check('browser_navigate', {'url': 'about:blank'})
+        self.assertEqual(self._last_entry()['args']['url'], 'about:blank')
+
+    def test_a_typed_key_sequence_is_not_reconstructible(self):
+        """browser_press_key logged its key, one entry per press, in order.
+        Synthetic KeyboardEvents cannot type in attended Firefox, but
+        headless keyboard.press does, so a password typed key by key was
+        sitting in the log."""
+        g = guard()
+        for char in 'hunter2':
+            g.check('browser_press_key', {'key': char})
+        entries = [json.loads(line) for line
+                   in safety._AUDIT_FILE.read_text().strip().splitlines()
+                   if '"browser_press_key"' in line]
+        self.assertTrue(entries)
+        for entry in entries:
+            self.assertEqual(entry['args']['key'], '***')
 
     def test_the_audit_file_is_not_world_readable(self):
         g = guard()
