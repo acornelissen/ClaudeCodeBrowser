@@ -103,6 +103,20 @@ them is part of releasing, and that is being held for approval.
   clear. The rebuilt text is used only when something was actually redacted,
   because re-serialising turns `12345678901234567890` into `…567000` and
   `1e400` into `null`.
+- **The headless backend's credential guard was the extension's *pre-fix*
+  one.** The widened guard below landed in one of the two implementations, so
+  for everything except `<input type=password>` and the `autocomplete` tokens
+  — `name=passwd`, `id=cvv`, `name="user[password]"`, `otpCode`, `apiKey`, a
+  `<textarea>`, a `contenteditable`, `<sl-input type=password>` — headless
+  returned the value from `browser_get_value` and wrote into it with
+  `browser_type`. `browser_get_text` and `browser_get_elements` applied no
+  credential mask there at all. The entries below, and the README's "in both
+  attended and headless modes", were false for headless until now.
+  The suite was green throughout because its parity test compared only the
+  `autocomplete` token list, so every other dimension of the predicate could
+  diverge silently; it is now a fixture table run through **both**
+  implementations, with the extension's predicate lifted from its source
+  rather than reimplemented.
 - **The DOM credential guard looks at `name` and `id`, and beyond
   `<input>`.** It recognised only `input[type=password]` and the
   `autocomplete` token list, so `<sl-input type="password">` (the

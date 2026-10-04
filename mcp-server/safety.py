@@ -552,6 +552,33 @@ def _mark_as_ours(path: Path) -> None:
         logger.warning(f"Could not mark {path} as prunable: {e}")
 
 
+def screenshot_filename(requested: Any, generated: str) -> str:
+    """The name a screenshot is written under: no directories, always .png.
+
+    Both rules exist for a bug, and both paths need both of them.
+
+    Path('..').name is '..' and Path('.').name is '', so a filename made of
+    nothing but directory components survived the .name strip and resolved to
+    the screenshots directory itself or its parent, where the write failed
+    with an IsADirectoryError naming a path the caller never asked for.
+
+    And the payload is always a PNG, while prune_screenshots and
+    GET /screenshots both look for *.png - so filename "dashboard.jpg" was
+    written, never listed and never pruned, leaving the longest-lived copy of
+    the user's screen in the project. The suffix is corrected rather than the
+    sweep widened: pruning must never consider a file this project did not
+    write. _save_screenshot in server.py corrected it for the attended path
+    and this branch was missed, so the retention fix the CHANGELOG describes
+    as project-wide did not apply in headless mode at all.
+    """
+    filename = Path(requested or generated).name
+    if filename in ('', '.', '..'):
+        filename = generated
+    if not filename.endswith('.png'):
+        filename = Path(filename).with_suffix('.png').name
+    return filename
+
+
 def resolve_screenshots_dir() -> Path:
     """Return the directory screenshots are written to, creating it if needed.
 

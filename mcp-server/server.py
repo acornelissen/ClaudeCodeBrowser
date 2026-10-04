@@ -111,6 +111,7 @@ MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
 
 from safety import (get_safety_guard, prune_screenshots,
+                    screenshot_filename,
                     redact_arguments, resolve_screenshots_dir)
 
 # API token for localhost HTTP authentication
@@ -1827,23 +1828,11 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             # still had the PNG written to disk.
             save_to_file = parse_flag(arguments.get('save_to_file'), True)
             generated = f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
-            # Strip directory components to prevent path traversal. Path('..')
-            # .name is '..' and Path('.').name is '', so a filename of only
-            # directory components survived this and resolved to the parent
-            # directory - O_NOFOLLOW|O_CREAT then failed with EISDIR, reported
-            # as an unrelated error.
-            filename = Path(arguments.get('filename') or generated).name
-            if filename in ('', '.', '..'):
-                filename = generated
-            # The payload is always a PNG, and the retention sweep and
-            # GET /screenshots both look for *.png - so filename:
-            # "dashboard.jpg" was written, never listed and never pruned,
-            # which is the longest-lived copy of the user's screen in the
-            # project. The suffix is corrected, in one spelling, rather than
-            # the sweep widened: pruning must never consider a file this
-            # project did not write.
-            if not filename.endswith('.png'):
-                filename = Path(filename).with_suffix('.png').name
+            # One spelling of both rules, shared with the headless backend.
+            # They were two copies, and the .png correction was added to this
+            # one only - so headless kept writing files the sweep skips. See
+            # screenshot_filename in safety.py for what each rule is for.
+            filename = screenshot_filename(arguments.get('filename'), generated)
 
             if not save_to_file:
                 return result

@@ -170,6 +170,30 @@ class CommandQueueTests(unittest.TestCase):
         self.assertGreater(server.COMMAND_QUEUE_TTL, 200)
 
 
+class ScreenshotFilenameSharingTests(unittest.TestCase):
+    """Both rules were duplicated and the .png correction was added to the
+    attended copy only, so headless kept writing files the retention sweep
+    and GET /screenshots both skip."""
+
+    def test_both_paths_use_the_same_helper(self):
+        import headless_backend
+        self.assertIs(server.screenshot_filename, safety.screenshot_filename)
+        self.assertIs(headless_backend.screenshot_filename,
+                      safety.screenshot_filename)
+
+    def test_neither_path_spells_the_rules_out_again(self):
+        """A second spelling is how the two drifted; this fails if one comes
+        back."""
+        import inspect
+        for name, source in (
+            ('server._save_screenshot',
+             inspect.getsource(server.MCPHTTPHandler._save_screenshot)),
+        ):
+            with self.subTest(where=name):
+                self.assertNotIn("with_suffix('.png')", source,
+                                 f'{name} must call screenshot_filename')
+
+
 class HeadlessDeadlineTests(unittest.TestCase):
     """A headless call that outran its deadline was abandoned, not cancelled,
     so the coroutine kept HeadlessBrowser's lock and every later headless tool
