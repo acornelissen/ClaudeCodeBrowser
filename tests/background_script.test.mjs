@@ -69,6 +69,9 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   const contentMessages = [];
   const tabsOnRemoved = makeEvent();
   const webNavigationOnCommitted = makeEvent();
+  const privateTabs = new Set();
+  let tabGetRejects = false;
+  let tabUrl = 'http://stub.test/';
   const messageListeners = [];
   const externalListeners = [];
   const createdWindows = [];
@@ -89,7 +92,11 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     },
     tabs: {
       query: async () => [{ id: 7, windowId: 1, url: 'http://stub.test/', title: 'stub' }],
-      get: async (id) => ({ id, windowId: 1, url: 'http://stub.test/', title: 'stub' }),
+      get: async (id) => {
+        if (tabGetRejects) throw new Error('No tab with id ' + id);
+        return { id, windowId: 1, url: tabUrl, title: 'stub',
+                 incognito: privateTabs.has(id) };
+      },
       sendMessage: async (tabId, message) => {
         contentMessages.push({ tabId, message });
         return contentScriptReply;
@@ -152,6 +159,9 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     createdWindows, removedWindows, deliver, externalListeners,
     webNavigationOnCommitted,
     failWindowCreate: () => { windowCreateFails = true; },
+    markPrivate: (id) => privateTabs.add(id),
+    failTabGet: () => { tabGetRejects = true; },
+    setTabUrl: (url) => { tabUrl = url; },
     extensionSender: { id: 'ccb@stub' },
     contentScriptSender: { id: 'ccb@stub', tab: { id: 7 } },
   };
@@ -1116,6 +1126,134 @@ test('internal filter bookkeeping does not reach the caller', async () => {
   const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
   assert.equal(entry.filterAttached, undefined,
     'filterAttached is bookkeeping, not something to reason about');
+});
+
+// --------------------------------------------------------------------------
+// Scope and caps
+
+test('logging a private-browsing tab is refused', async () => {
+  const ctx = loadBackground();
+  ctx.markPrivate(7);
+
+  const result = await ctx.command('startLogging', {}, 7);
+
+  assert.equal(result.success, false,
+    'private windows exist so their contents are not retained');
+  assert.match(result.error, /private/i);
+
+  // And nothing is captured for it.
+  fireRequest(ctx.webRequest);
+  const logs = await ctx.command('getNetworkLogs', {}, 7);
+  assert.equal(logs.logs.length, 0);
+});
+
+test('an ordinary tab is still loggable', async () => {
+  const ctx = loadBackground();
+  const result = await ctx.command('startLogging', {}, 7);
+  assert.equal(result.success, true);
+});
+
+test('find_tabs requires a filter rather than dumping every tab', async () => {
+  const ctx = loadBackground();
+
+  const result = await ctx.command('findTabs', {}, undefined);
+
+  assert.equal(result.success, false,
+    'with no filter this returned the entire browsing surface');
+  assert.match(result.error, /at least one filter/i);
+});
+
+test('find_tabs caps its results and says when it did', async () => {
+  const ctx = loadBackground();
+  const many = Array.from({ length: 120 }, (_, i) => ({
+    id: i, url: `http://stub.test/${i}`, title: `t${i}`, active: false,
+    windowId: 1, status: 'complete'
+  }));
+  ctx.context.browser.tabs.query = async () => many;
+
+  const result = await ctx.command('findTabs', { urlPattern: 'stub' }, undefined);
+
+  assert.equal(result.tabs.length, 50, 'default cap, as browser_get_tabs has');
+  assert.equal(result.totalMatched, 120);
+  assert.equal(result.truncated, true);
+});
+
+// --------------------------------------------------------------------------
+// Captured bodies are bytes, and their encoding matters
+
+test('a declared charset is honoured rather than assumed to be utf-8', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, {
+    responseHeaders: [{ name: 'content-type',
+                        value: 'text/html; charset=windows-1252' }],
+    complete: false
+  });
+
+  // 0x93/0x94 are curly quotes in windows-1252 and invalid in utf-8.
+  ctx.filters[0].ondata({ data: new Uint8Array([0x93, 0x68, 0x69, 0x94]) });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.responseCharset, 'windows-1252');
+  assert.ok(!entry.responseBody.includes('\uFFFD'),
+    'decoding with the declared charset must not produce replacement chars');
+  assert.ok(entry.responseBody.includes('hi'));
+});
+
+test('a still-compressed body is not logged as text', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, {
+    responseHeaders: [
+      { name: 'content-type', value: 'application/json' },
+      { name: 'content-encoding', value: 'br' }
+    ]
+  });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(entry.responseBody, /content-encoding br/,
+    'binary noise dressed up as a string is worse than saying nothing');
+  assert.equal(ctx.filters.length, 0);
+});
+
+test('an unsupported charset falls back and says so', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, {
+    responseHeaders: [{ name: 'content-type',
+                        value: 'text/plain; charset=x-made-up-encoding' }],
+    complete: false
+  });
+  ctx.filters[0].ondata({ data: new TextEncoder().encode('plain text') });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(entry.charsetNote, /unsupported charset/);
+  assert.ok(entry.responseBody.includes('plain text'),
+    'the body is still delivered, just flagged');
+});
+
+test('a truncated body is flagged with its real length', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, { complete: false });
+  const big = 'x'.repeat(6000);
+  ctx.filters[0].ondata({ data: new TextEncoder().encode(big) });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.responseBody.length, 5000);
+  assert.equal(entry.responseBodyTruncated, true,
+    'the cap applied silently, so a short body and a cut one looked alike');
+  assert.equal(entry.responseBodyLength, 6000);
 });
 
 // --------------------------------------------------------------------------

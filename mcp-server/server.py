@@ -108,7 +108,8 @@ MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 # giving up. Launching takes ~15s while the HTTP port binds immediately.
 HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
 
-from safety import get_safety_guard, resolve_screenshots_dir
+from safety import (get_safety_guard, prune_screenshots,
+                    resolve_screenshots_dir)
 
 # API token for localhost HTTP authentication
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
@@ -1129,19 +1130,22 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response(result)
 
         elif parsed.path == '/browser/command':
-            # Direct browser command (from native host)
-            action = data.get('action')
-            tab_id = data.get('tabId')
-            command_data = data.get('data', {})
-
-            # Store the command for the extension to poll
-            # In production, this would use WebSocket
-            result = {
-                'success': True,
-                'message': 'Command queued',
-                'action': action
-            }
-            self.send_json_response(result)
+            # This reported {"success": true, "message": "Command queued"}
+            # while queueing nothing at all - the one caller
+            # (forward_to_mcp_server in the native host) was told its work had
+            # been accepted. Commands reach the browser via _dispatch_action,
+            # which puts them on the poll queue; nothing should be posting
+            # them here.
+            logger.warning(
+                "Deprecated POST /browser/command called for action "
+                f"{data.get('action')!r}; it queues nothing. Commands are "
+                "dispatched server-side via the MCP tool path.")
+            self.send_json_response({
+                'success': False,
+                'error': 'POST /browser/command is not implemented and queues '
+                         'nothing. It previously reported success without '
+                         'doing anything. Use the MCP tool interface.'
+            }, 410)
 
         elif parsed.path == '/browser/response':
             # Response from browser extension
@@ -1644,6 +1648,9 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 f.write(image_data)
 
             logger.info(f"Screenshot saved to: {filepath}")
+            # Prune here rather than only at startup: a long-running server
+            # would otherwise accumulate indefinitely.
+            prune_screenshots(SCREENSHOTS_DIR)
 
             return {
                 'success': True,
@@ -1681,6 +1688,17 @@ def run_http_server():
     server = ThreadingHTTPServer((HOST, HTTP_PORT), MCPHTTPHandler)
     logger.info(f"HTTP server starting on {HOST}:{HTTP_PORT}")
     server.serve_forever()
+
+
+# Origins accepted at the WebSocket handshake. None means "no Origin header",
+# which is what a non-browser local client sends; extension pages present a
+# moz-extension:// origin. A web page always sends its own origin, so it is
+# refused here rather than after the handshake. Overridable for a custom
+# client, but the token is still required either way.
+ALLOWED_WS_ORIGINS = [
+    origin.strip() or None
+    for origin in os.environ.get('CLAUDE_BROWSER_WS_ORIGINS', '').split(',')
+] if os.environ.get('CLAUDE_BROWSER_WS_ORIGINS') else [None]
 
 
 async def websocket_handler(websocket, path=None):
@@ -1742,12 +1760,16 @@ async def run_websocket_server():
         logger.warning("websockets module not installed, WebSocket server disabled")
         return
 
-    server = await websockets.serve(websocket_handler, HOST, WS_PORT)
     # WebSockets are exempt from CORS, so any page the user visits can open a
-    # connection to the loopback port. The token check already refuses it, but
-    # rejecting foreign origins at the handshake avoids holding a task per
-    # attempt.
-    logger.info(f"WebSocket server starting on {HOST}:{WS_PORT}")
+    # connection to this loopback port. The token check refuses it, but only
+    # after the handshake completes and a task has been held for up to 10s
+    # waiting for the first frame. Rejecting a foreign Origin at the handshake
+    # closes it before that, and costs nothing: the extension connects from a
+    # moz-extension:// origin, and a legitimate local tool sends no Origin.
+    server = await websockets.serve(
+        websocket_handler, HOST, WS_PORT, origins=ALLOWED_WS_ORIGINS)
+    logger.info(f"WebSocket server starting on {HOST}:{WS_PORT} "
+                f"(allowed origins: {ALLOWED_WS_ORIGINS})")
     await server.wait_closed()
 
 

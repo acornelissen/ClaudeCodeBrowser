@@ -163,6 +163,115 @@ class CommandQueueTests(unittest.TestCase):
         self.assertGreater(server.COMMAND_QUEUE_TTL, 200)
 
 
+class ScreenshotPruningTests(unittest.TestCase):
+    """Screenshots hold whatever was on screen and nothing ever removed them,
+    making the directory the longest-lived record of the user's browsing in
+    the project."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix='ccb-shots-'))
+
+    def _shot(self, name, age_days=0):
+        import os, time
+        path = self.dir / name
+        path.write_bytes(b'\x89PNG\r\n\x1a\n')
+        if age_days:
+            old = time.time() - age_days * 86400
+            os.utime(path, (old, old))
+        return path
+
+    def test_old_screenshots_are_removed(self):
+        fresh = self._shot('fresh.png')
+        stale = self._shot('stale.png', age_days=30)
+
+        safety.prune_screenshots(self.dir)
+
+        self.assertTrue(fresh.exists(), 'a recent screenshot must survive')
+        self.assertFalse(stale.exists(), 'a month-old screenshot must not')
+
+    def test_the_file_cap_removes_the_oldest_first(self):
+        original = safety.SCREENSHOT_MAX_FILES
+        safety.SCREENSHOT_MAX_FILES = 3
+        try:
+            paths = [self._shot(f's{i}.png', age_days=i * 0.001)
+                     for i in range(6)]
+            safety.prune_screenshots(self.dir)
+            surviving = sorted(p.name for p in self.dir.glob('*.png'))
+            self.assertEqual(len(surviving), 3)
+            # s0 is the oldest by mtime, so it should be among those removed.
+            self.assertNotIn('s5.png', surviving)
+        finally:
+            safety.SCREENSHOT_MAX_FILES = original
+
+    def test_retention_can_be_disabled(self):
+        age, cap = safety.SCREENSHOT_RETENTION_DAYS, safety.SCREENSHOT_MAX_FILES
+        safety.SCREENSHOT_RETENTION_DAYS = 0
+        safety.SCREENSHOT_MAX_FILES = 0
+        try:
+            stale = self._shot('ancient.png', age_days=400)
+            safety.prune_screenshots(self.dir)
+            self.assertTrue(stale.exists(),
+                            'keeping an indefinite record must remain possible')
+        finally:
+            safety.SCREENSHOT_RETENTION_DAYS = age
+            safety.SCREENSHOT_MAX_FILES = cap
+
+    def test_a_missing_directory_does_not_raise(self):
+        result = safety.prune_screenshots(self.dir / 'does-not-exist')
+        self.assertEqual(result, {'removed_age': 0, 'removed_count': 0})
+
+    def test_non_png_files_are_left_alone(self):
+        note = self.dir / 'notes.txt'
+        note.write_text('not a screenshot')
+        safety.prune_screenshots(self.dir)
+        self.assertTrue(note.exists())
+
+
+class WebSocketOriginTests(unittest.TestCase):
+    """WebSockets are exempt from CORS, so any page the user visits can open a
+    connection to the loopback port. The token refuses it, but only after the
+    handshake and a 10s wait for the first frame."""
+
+    def test_only_non_browser_origins_are_accepted_by_default(self):
+        self.assertEqual(server.ALLOWED_WS_ORIGINS, [None],
+                         'a web page always sends an Origin; refuse it at the '
+                         'handshake rather than after')
+
+    def test_the_serve_call_actually_passes_the_origin_list(self):
+        """This was commented as intent and left unimplemented once."""
+        import inspect
+        source = inspect.getsource(server.run_websocket_server)
+        self.assertIn('origins=ALLOWED_WS_ORIGINS', source)
+
+
+class DeprecatedEndpointTests(unittest.TestCase):
+
+    def test_browser_command_no_longer_claims_success(self):
+        """It returned {"success": true, "message": "Command queued"} while
+        queueing nothing, so its only caller was told its work was accepted.
+        Driven through the handler rather than grepped, so it asserts
+        behaviour and not the shape of the source."""
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler.path = '/browser/command'
+        handler.headers = {'Content-Length': '0'}
+        handler._check_auth = lambda: True
+        handler.rfile = None
+        captured = {}
+
+        def send(data, status=200):
+            captured['data'] = data
+            captured['status'] = status
+
+        handler.send_json_response = send
+        handler.do_POST()
+
+        self.assertEqual(captured['status'], 410,
+                         'a dead endpoint should say so, not return 200')
+        self.assertIs(captured['data']['success'], False)
+        self.assertIn('queues nothing', captured['data']['error'])
+
+
 class SafetyGuardTests(unittest.TestCase):
 
     def test_read_only_mode_still_allows_observation(self):

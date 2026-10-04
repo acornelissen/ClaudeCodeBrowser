@@ -1214,12 +1214,30 @@
       attributeOldValue: true
     });
 
-    activeObservers.set(observerId, { observer, changes, target: targetSelector });
+    // An observer watching childList + subtree + attributes + characterData
+    // is a measurable drag on an animation-heavy or virtualised page, and the
+    // handle was dropped only by an explicit stopObserving - so an agent that
+    // forgot left it running for the document's lifetime. Auto-expire it, and
+    // say when it will go.
+    const maxLifetimeMs = options.maxLifetimeMs || 300000;
+    const expiry = setTimeout(() => {
+      const record = activeObservers.get(observerId);
+      if (!record) return;
+      record.observer.disconnect();
+      record.expired = true;
+      // Keep the accumulated changes retrievable; only stop watching.
+      activeObservers.set(observerId, record);
+    }, maxLifetimeMs);
+
+    activeObservers.set(observerId, {
+      observer, changes, target: targetSelector, expiry
+    });
 
     return {
       observing: true,
       observerId,
-      target: targetSelector
+      target: targetSelector,
+      expiresInMs: maxLifetimeMs
     };
   }
 
@@ -1231,8 +1249,10 @@
       return { found: false, observerId };
     }
 
-    const { observer, changes, target } = activeObservers.get(observerId);
+    const { observer, changes, target, expiry, expired } =
+      activeObservers.get(observerId);
     observer.disconnect();
+    if (expiry) clearTimeout(expiry);
     activeObservers.delete(observerId);
 
     return {
@@ -1240,7 +1260,9 @@
       observerId,
       target,
       changes,
-      totalChanges: changes.length
+      totalChanges: changes.length,
+      // If it expired, the change list stops where the observer stopped.
+      expired: expired === true
     };
   }
 

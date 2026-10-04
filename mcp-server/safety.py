@@ -186,6 +186,63 @@ _AUDIT_MAX_BYTES = 5 * 1024 * 1024
 _MAX_PENDING_TOKENS = 32
 
 
+# Screenshots accumulate one file per browser_screenshot call, with
+# save_to_file defaulting to true, and nothing ever removed them. They hold
+# whatever was on screen, so an unbounded pile of them is the longest-lived
+# copy of the user's browsing in the whole project.
+SCREENSHOT_RETENTION_DAYS = float(
+    os.environ.get('CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS', '7'))
+SCREENSHOT_MAX_FILES = int(
+    os.environ.get('CLAUDE_BROWSER_SCREENSHOT_MAX_FILES', '500'))
+
+
+def prune_screenshots(directory: Path) -> Dict[str, int]:
+    """Delete screenshots that are too old or too numerous.
+
+    Retention is a deliberate default rather than "keep everything": set
+    CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS=0 and
+    CLAUDE_BROWSER_SCREENSHOT_MAX_FILES=0 to disable, which is a choice to
+    keep an indefinite visual record.
+    """
+    removed_age = 0
+    removed_count = 0
+    try:
+        shots = sorted(
+            (p for p in directory.glob('*.png') if p.is_file()),
+            key=lambda p: p.stat().st_mtime)
+    except OSError as e:
+        logger.warning(f"Could not list screenshots for pruning: {e}")
+        return {'removed_age': 0, 'removed_count': 0}
+
+    if SCREENSHOT_RETENTION_DAYS > 0:
+        cutoff = time.time() - SCREENSHOT_RETENTION_DAYS * 86400
+        remaining = []
+        for shot in shots:
+            try:
+                if shot.stat().st_mtime < cutoff:
+                    shot.unlink()
+                    removed_age += 1
+                else:
+                    remaining.append(shot)
+            except OSError:
+                remaining.append(shot)
+        shots = remaining
+
+    if SCREENSHOT_MAX_FILES > 0 and len(shots) > SCREENSHOT_MAX_FILES:
+        for shot in shots[:len(shots) - SCREENSHOT_MAX_FILES]:
+            try:
+                shot.unlink()
+                removed_count += 1
+            except OSError:
+                pass
+
+    if removed_age or removed_count:
+        logger.info(f"Pruned screenshots: {removed_age} older than "
+                    f"{SCREENSHOT_RETENTION_DAYS}d, {removed_count} over the "
+                    f"{SCREENSHOT_MAX_FILES}-file cap")
+    return {'removed_age': removed_age, 'removed_count': removed_count}
+
+
 def resolve_screenshots_dir() -> Path:
     """Return the directory screenshots are written to, creating it if needed.
 

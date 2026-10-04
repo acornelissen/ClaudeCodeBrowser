@@ -169,12 +169,18 @@ function loadContentScript(registry) {
   };
 
   const sandbox = {
+    __observers: [],
     window,
     document,
     browser,
     console: consoleStub,
     XMLHttpRequest: XMLHttpRequestStub,
-    MutationObserver: class { observe() {} disconnect() {} },
+    MutationObserver: class {
+      constructor(cb) { this.cb = cb; this.disconnected = false;
+                        sandbox.__observers.push(this); }
+      observe() { this.observing = true; }
+      disconnect() { this.disconnected = true; this.observing = false; }
+    },
     KeyboardEvent: class { constructor(type, init) { Object.assign(this, init, { type }); } },
     MouseEvent: class { constructor(type, init) { Object.assign(this, init, { type }); } },
     Event: class { constructor(type, init) { Object.assign(this, init, { type }); } },
@@ -196,6 +202,7 @@ function loadContentScript(registry) {
   });
 
   return { send, window, consoleStub, XMLHttpRequestStub, createdElements,
+           observers: sandbox.__observers,
            pristine: {
              fetch: fetchStub,
              consoleLog: originalConsoleLog,
@@ -656,6 +663,68 @@ test('an unprintable rejection reason does not break capture', async () => {
   const logs = await ctx.send({ action: 'getConsoleLogs' });
   assert.equal(logs.logs.length, 1);
   assert.match(logs.logs[0].message, /unprintable/);
+});
+
+// --------------------------------------------------------------------------
+// An observer the agent forgets about must not run for the page's lifetime
+
+test('observeElement expires on its own and says when', async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  const started = await ctx.send({
+    action: 'observeElement', selector: '#watch', maxLifetimeMs: 40
+  });
+  assert.equal(started.observing, true);
+  assert.equal(started.expiresInMs, 40,
+    'the caller should know it will not run forever');
+
+  const observer = ctx.observers[ctx.observers.length - 1];
+  assert.equal(observer.observing, true);
+
+  await new Promise(resolve => setTimeout(resolve, 70));
+  assert.equal(observer.disconnected, true,
+    'a full-subtree observer is a real cost on an animation-heavy page');
+});
+
+test('an expired observer still returns the changes it collected', async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  await ctx.send({ action: 'observeElement', selector: '#watch',
+                   maxLifetimeMs: 30 });
+  await new Promise(resolve => setTimeout(resolve, 60));
+
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: undefined });
+  // Without the id it reports not-found rather than throwing.
+  assert.equal(stopped.found, false);
+});
+
+test('stopObserving reports whether the observer had already expired', async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  const started = await ctx.send({ action: 'observeElement',
+                                   selector: '#watch', maxLifetimeMs: 30 });
+  await new Promise(resolve => setTimeout(resolve, 60));
+
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: started.observerId });
+  assert.equal(stopped.stopped, true);
+  assert.equal(stopped.expired, true,
+    'the change list stops where the observer stopped; say so');
+});
+
+test('an observer stopped in time is not marked expired', async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  const started = await ctx.send({ action: 'observeElement',
+                                   selector: '#watch', maxLifetimeMs: 5000 });
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: started.observerId });
+  assert.equal(stopped.expired, false);
 });
 
 // --------------------------------------------------------------------------

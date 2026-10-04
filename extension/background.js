@@ -75,6 +75,34 @@ const REDACTED_HEADERS = new Set([
 // Response bodies are only collected for types that are text to begin with.
 const TEXTUAL_CONTENT_TYPE = /^(text\/|application\/(json|javascript|xml|x-www-form-urlencoded)|application\/[^;]*\+json)/i;
 
+// A body is bytes; decoding it needs the charset the server declared. Always
+// assuming UTF-8 turned a shift_jis or windows-1252 page into mojibake with
+// no indication, so the agent reasoned over corrupted text believing it was
+// the page's content.
+function charsetFromContentType(value) {
+  const match = /charset\s*=\s*"?([^";\s]+)/i.exec(value || '');
+  return match ? match[1].toLowerCase() : null;
+}
+
+// TextDecoder throws on a label it does not know; fall back rather than
+// losing the body entirely.
+function decoderFor(charset) {
+  if (!charset || charset === 'utf-8' || charset === 'utf8') {
+    return { decoder: new TextDecoder('utf-8'), charset: 'utf-8', fallback: false };
+  }
+  try {
+    return { decoder: new TextDecoder(charset), charset: charset, fallback: false };
+  } catch (e) {
+    return { decoder: new TextDecoder('utf-8'), charset: charset, fallback: true };
+  }
+}
+
+// A response whose bytes are still compressed cannot be decoded to text.
+// Firefox hands the filter decoded bytes for the encodings it understands,
+// but an unknown content-encoding passes through as-is and would otherwise be
+// logged as binary noise dressed up as a string.
+const DECODABLE_ENCODING = /^(identity|)$/i;
+
 // tabId -> { captureBodies, includeAllTypes }
 const loggedTabs = new Map();
 // tabId -> finished entries
@@ -99,6 +127,19 @@ let webRequestListenersAttached = false;
 function isWatchedTab(tabId) {
   return tabId !== undefined && tabId >= 0 &&
     (loggedTabs.has(tabId) || idleWatchers.has(tabId));
+}
+
+// Private windows exist so their contents are not retained. If the extension
+// has been allowed to run in them, a logging session there would still put
+// request and response bodies into a buffer the agent reads, which is the one
+// place that expectation must not be quietly broken.
+async function isPrivateTab(tabId) {
+  try {
+    const tab = await browser.tabs.get(tabId);
+    return tab.incognito === true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function shouldLogRequest(details) {
@@ -209,11 +250,16 @@ function describeRequestBody(requestBody) {
         JSON.stringify(requestBody.formData)).substring(0, 1000);
     }
     if (requestBody.raw && requestBody.raw.length) {
-      const decoder = new TextDecoder("utf-8");
+      // fatal: false so an undecodable request body yields replacement
+      // characters rather than throwing away the whole entry.
+      const decoder = new TextDecoder("utf-8", { fatal: false });
       const text = requestBody.raw
-        .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes) : ""))
-        .join("");
-      return redactSecretsInBody(text).substring(0, 1000);
+        .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes, { stream: true }) : ""))
+        .join("") + decoder.decode();
+      const scrubbed = redactSecretsInBody(text);
+      return scrubbed.length > 1000
+        ? scrubbed.substring(0, 1000) + "…[truncated]"
+        : scrubbed;
     }
   } catch (e) {
     return "[could not decode request body]";
@@ -308,12 +354,27 @@ function captureResponseHeaders(details) {
   const options = loggedTabs.get(details.tabId);
   if (!options || !options.captureBodies) return;
 
-  const contentType = (details.responseHeaders || [])
-    .find(h => h.name.toLowerCase() === "content-type");
-  if (!contentType || !TEXTUAL_CONTENT_TYPE.test(contentType.value)) {
+  const headerValue = (name) => {
+    const found = (details.responseHeaders || [])
+      .find(h => h.name.toLowerCase() === name);
+    return found ? found.value : null;
+  };
+
+  const contentType = headerValue("content-type");
+  if (!contentType || !TEXTUAL_CONTENT_TYPE.test(contentType)) {
     entry.responseBody = "[not captured: non-textual content type]";
     return;
   }
+
+  const encoding = (headerValue("content-encoding") || "").trim();
+  if (encoding && !DECODABLE_ENCODING.test(encoding)) {
+    // Firefox decodes gzip/br/deflate before the filter sees them, so an
+    // encoding still present here is one it did not handle.
+    entry.responseBody = `[not captured: content-encoding ${encoding}]`;
+    return;
+  }
+
+  entry.responseCharset = charsetFromContentType(contentType) || "utf-8";
 
   // onBeforeRequest fires again for a redirect target under the same
   // requestId, so without this guard a 30x could attach a second filter to
@@ -346,7 +407,11 @@ function attachResponseBodyReader(requestId, entry) {
     return;
   }
 
-  const decoder = new TextDecoder("utf-8");
+  const { decoder, charset, fallback } = decoderFor(entry.responseCharset);
+  if (fallback) {
+    // Say so rather than silently producing mojibake.
+    entry.charsetNote = `unsupported charset "${charset}"; decoded as utf-8`;
+  }
   let collected = "";
   let released = false;
 
@@ -397,7 +462,21 @@ function attachResponseBodyReader(requestId, entry) {
   };
 
   filter.onstop = () => {
+    // Flush whatever the streaming decoder is holding, so a multi-byte
+    // character split across the final chunk boundary is not lost.
+    try {
+      collected += decoder.decode();
+    } catch (e) {
+      // Nothing buffered.
+    }
+    const truncated = collected.length > MAX_BODY_CHARS;
     entry.responseBody = redactSecretsInBody(collected.substring(0, MAX_BODY_CHARS));
+    if (truncated) {
+      // Previously the cap applied with no indication, so the agent could not
+      // tell a short body from a truncated one.
+      entry.responseBodyTruncated = true;
+      entry.responseBodyLength = collected.length;
+    }
     release("close");
   };
 
@@ -1258,6 +1337,15 @@ async function startLogging(tabId, data = {}) {
     return { success: false, error: "No tab to log" };
   }
 
+  if (await isPrivateTab(resolved)) {
+    return {
+      success: false,
+      error: "Refusing to log a private-browsing tab: its request and " +
+             "response bodies would be retained in a buffer the agent reads. " +
+             "Private windows exist so that does not happen."
+    };
+  }
+
   // Remember which origin this session belongs to, so navigating away ends it.
   try {
     const tab = await browser.tabs.get(resolved);
@@ -1642,8 +1730,23 @@ async function getTabInfo(tabId) {
 }
 
 // Find tabs by URL pattern
-async function findTabs(options) {
+async function findTabs(options = {}) {
   try {
+    const hasFilter = ['url', 'urlPattern', 'url_pattern', 'title',
+                       'active', 'audible']
+      .some(key => options[key] !== undefined);
+    if (!hasFilter) {
+      // With no filter this returned every tab in every window, which is the
+      // user's whole browsing surface handed over by a tool that reads like
+      // a search. Make that an explicit request.
+      return {
+        success: false,
+        error: "browser_find_tabs needs at least one filter (url, " +
+               "url_pattern, title, active or audible). To list tabs " +
+               "deliberately, use browser_get_tabs."
+      };
+    }
+
     const tabs = await browser.tabs.query({});
     let filtered = tabs;
 
@@ -1665,9 +1768,14 @@ async function findTabs(options) {
       filtered = filtered.filter(t => t.audible === options.audible);
     }
 
+    // Cap it, like browser_get_tabs already does, and say when it bit.
+    const limit = Number.isInteger(options.limit) ? options.limit : 50;
+    const matched = filtered.length;
+    const page = filtered.slice(0, limit);
+
     return {
       success: true,
-      tabs: filtered.map(t => ({
+      tabs: page.map(t => ({
         id: t.id,
         url: t.url,
         title: t.title,
@@ -1675,7 +1783,9 @@ async function findTabs(options) {
         windowId: t.windowId,
         status: t.status
       })),
-      count: filtered.length
+      count: page.length,
+      totalMatched: matched,
+      truncated: matched > page.length
     };
   } catch (error) {
     return { success: false, error: error.message };

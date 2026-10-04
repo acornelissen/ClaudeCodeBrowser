@@ -122,5 +122,71 @@ class KillTargetSelectionTests(unittest.TestCase):
         self.assertEqual(self.killed, [])
 
 
+class ScreenshotWriteTests(unittest.TestCase):
+    """The host wrote a .png for ANY successful response carrying a `data`
+    field, so non-image payloads became junk files on disk and screenshots
+    were duplicated - server.py already saves them."""
+
+    def setUp(self):
+        self.saved = []
+        self._real = host.handle_local_command
+        host.handle_local_command = self._capture
+        self.addCleanup(setattr, host, 'handle_local_command', self._real)
+
+    def _capture(self, message):
+        if message.get('action') == 'saveScreenshot':
+            self.saved.append(message)
+            return {'success': True, 'filepath': '/tmp/shot.png'}
+        return self._real(message)
+
+    def _process(self, message):
+        host.forward_response_to_server = lambda m: None
+        return host.process_message(message)
+
+    def test_an_image_data_url_is_saved(self):
+        self._process({'requestId': 1, 'success': True,
+                       'data': 'data:image/png;base64,AAAA'})
+        self.assertEqual(len(self.saved), 1)
+
+    def test_a_non_image_payload_is_not_written_as_a_png(self):
+        self._process({'requestId': 1, 'success': True,
+                       'data': 'just some page text, not an image'})
+        self.assertEqual(self.saved, [],
+                         'a text payload must not land on disk as a .png')
+
+    def test_structured_data_is_not_written_as_a_png(self):
+        self._process({'requestId': 1, 'success': True,
+                       'data': {'elements': [1, 2, 3]}})
+        self.assertEqual(self.saved, [])
+
+    def test_a_failed_response_is_not_written(self):
+        self._process({'requestId': 1, 'success': False,
+                       'data': 'data:image/png;base64,AAAA'})
+        self.assertEqual(self.saved, [])
+
+
+class ChildReapingTests(unittest.TestCase):
+    """Each crash-and-restart cycle left a zombie for the life of the host."""
+
+    def test_finished_children_are_reaped(self):
+        class Finished:
+            def __init__(self): self.waited = False
+            def poll(self): return 0
+            def wait(self, timeout=None): self.waited = True
+
+        class Running:
+            def poll(self): return None
+            def wait(self, timeout=None): raise AssertionError('still running')
+
+        finished, running = Finished(), Running()
+        host._spawned_children[:] = [finished, running]
+        host._reap_finished_children()
+
+        self.assertTrue(finished.waited, 'a finished child must be waited on')
+        self.assertEqual(host._spawned_children, [running],
+                         'a running child must be kept')
+        host._spawned_children[:] = []
+
+
 if __name__ == '__main__':
     unittest.main()

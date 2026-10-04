@@ -463,6 +463,26 @@ def kill_existing_server():
     return killed
 
 
+# Children we have spawned, so they can be waited on rather than left as
+# zombies. The server is started with start_new_session, but it is still our
+# child until reaped.
+_spawned_children = []
+
+
+def _reap_finished_children():
+    """Wait on any finished child so it does not linger as a zombie."""
+    still_running = []
+    for child in _spawned_children:
+        if child.poll() is None:
+            still_running.append(child)
+        else:
+            try:
+                child.wait(timeout=0)
+            except Exception:
+                pass
+    _spawned_children[:] = still_running
+
+
 def start_mcp_server():
     """Start the MCP server if it's not running."""
     global server_process, restart_attempts, last_restart_time
@@ -513,6 +533,11 @@ def start_mcp_server():
         restart_attempts += 1
         last_restart_time = time.time()
 
+        # Reap any previously started child, or each crash-and-restart cycle
+        # leaves a zombie behind for the life of this host process.
+        _reap_finished_children()
+
+        _spawned_children.append(server_process)
         logger.info(f"Started MCP server (PID: {server_process.pid}, attempt #{restart_attempts})")
 
         # Save PID for tracking
@@ -645,14 +670,22 @@ def process_message(message):
         logger.info(f"Forwarding response for requestId: {message.get('requestId')}")
 
         # Save screenshot data locally if present
-        if message.get('success') and message.get('data'):
+        # Only an actual image, and only when it looks like one: this fired
+        # for every response carrying a `data` field, writing non-image
+        # payloads to disk as .png junk and duplicating screenshots that
+        # server.py had already saved.
+        data = message.get('data')
+        if (message.get('success') and isinstance(data, str)
+                and data.startswith('data:image/')):
             save_result = handle_local_command({
                 'action': 'saveScreenshot',
-                'data': message.get('data'),
+                'data': data,
                 'filename': f'screenshot_{int(time.time())}.png'
             })
-            if save_result:
+            if save_result and save_result.get('success'):
                 logger.info(f"Screenshot saved: {save_result.get('filepath')}")
+            elif save_result:
+                logger.warning(f"Screenshot not saved: {save_result.get('error')}")
 
         forward_response_to_server(message)
         return message
@@ -807,6 +840,7 @@ def shutdown():
     global health_monitor_running
     logger.info("Shutting down...")
     health_monitor_running = False
+    _reap_finished_children()
 
 
 def main():
