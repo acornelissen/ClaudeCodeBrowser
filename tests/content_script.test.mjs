@@ -75,6 +75,12 @@ function makeElement(tag, props = {}) {
       left: 0, top: 0, width: 10, height: 10,
       x: 0, y: 0, right: 10, bottom: 10
     }),
+    /** Element-scoped queries resolve against the same registry the document
+     *  uses, so a test does not have to hand-stub this - a hand-stubbed
+     *  lookup only ever proves what the stub was told to return. The registry
+     *  is injected by loadContentScript. */
+    querySelector(sel) { return (this._registry?.one(sel)) || null; },
+    querySelectorAll(sel) { return (this._registry?.all(sel)) || []; },
     scrollIntoView() {},
     focus() {},
     click() {},
@@ -124,13 +130,25 @@ function loadContentScript(registry) {
     return Array.isArray(hit) ? hit[0] : hit;
   };
 
+  const lookups = {
+    one: resolveOne,
+    all: (sel) => (all.has(sel) ? all.get(sel) : [])
+  };
   const body = makeElement('body');
+  body._registry = lookups;
   const consoleStub = {
     log() {}, warn() {}, error() {}, info() {}, debug() {}
   };
   const originalConsoleLog = consoleStub.log;
 
   const createdElements = [];
+  // Every element the test registered can answer a scoped query too.
+  for (const entry of all.values()) {
+    for (const el of entry) {
+      if (el && typeof el === 'object') el._registry = lookups;
+    }
+  }
+
   const document = {
     title: 'stub page',
     body,
@@ -833,8 +851,6 @@ test('whole-page get_text does not return a contenteditable credential', async (
   });
   const ctx = loadContentScript({ '[contenteditable]': [pin] });
   ctx.document.body.innerText = 'Enter your code 483920 then continue';
-  ctx.document.body.querySelectorAll = (sel) =>
-    (sel === '[contenteditable]' ? [pin] : []);
 
   const result = await ctx.send({ action: 'getText' });
 
@@ -848,10 +864,8 @@ test('whole-page get_text does not return a contenteditable credential', async (
 test('whole-page get_text leaves ordinary contenteditable text alone', async () => {
   const notes = makeElement('div', { id: 'notes', textContent: 'Buy milk' });
   notes.isContentEditable = true;
-  const ctx = loadContentScript({});
+  const ctx = loadContentScript({ '[contenteditable]': [notes] });
   ctx.document.body.innerText = 'Reminders Buy milk';
-  ctx.document.body.querySelectorAll = (sel) =>
-    (sel === '[contenteditable]' ? [notes] : []);
 
   const result = await ctx.send({ action: 'getText' });
 
