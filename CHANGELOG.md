@@ -306,17 +306,48 @@ them is part of releasing, and that is being held for approval.
   `getPropertyValue` takes a CSS property name. Callers may still pass
   camelCase; the result is keyed by whatever they asked for.
 
+- **The headless screenshot followed a symlink**, truncating the target at
+  mode 0644, while the attended path and the native host had both been
+  hardened to `O_NOFOLLOW` and `0600` — the headless branch wrote through
+  Playwright and never went through the hardened writer. Headless also
+  ignored `save_to_file` entirely, and `browser_press_key`'s credential guard
+  was bypassed by Playwright key *codes*: `KeyA`, `Digit1`, `Space`,
+  `Shift+a` and `Control+v` all type a character and none of them has
+  `len(key) == 1`, so 18 of them reached a password field.
+- **SIGTERM or SIGINT deadlocked the native host permanently**, because the
+  child-process list was guarded by a non-reentrant lock and Python runs
+  signal handlers on the main thread — so a signal arriving mid-reap
+  self-deadlocked, and the process then ignored SIGTERM and SIGINT and needed
+  SIGKILL. Firefox SIGTERMs native hosts when the port closes, so these
+  accumulated.
+- **One slow headless call wedged the whole backend.** `browser_wait_and_act`
+  took an unbounded `timeout_ms`, and the server abandoned the call at 35s
+  without cancelling it — so the coroutine kept the backend lock for the life
+  of the process and every later headless tool blocked. The timeout is capped
+  (and the result says when the cap bit), and an overrunning call is now
+  cancelled.
+
 ### Tests
 
-The suite cleared two `CLAUDE_BROWSER_*` variables, so it gave a different
-answer depending on what you had exported — and `CLAUDE_BROWSER_HEADLESS`
-*hung* it, waiting out the headless startup timeout for a browser that was
-never coming. All of them are cleared now.
+**Nothing in the suite ever executed the headless credential guard's
+JavaScript.** The test double was a Python reimplementation that answered from
+*substrings* of the production script, and several parity tests were source
+greps — so sabotaging the guard to answer "not a credential" for a password
+input, which would let every credential be filled, left the suite green. The
+project's main credential defence had no test that it works. The real
+predicate is now run through `node` against element literals, with the Python
+double's answers compared to node's so it cannot drift; the same sabotage now
+fails 35 assertions.
+
+The suite also cleared two `CLAUDE_BROWSER_*` variables, so it gave a
+different answer depending on what you had exported — and
+`CLAUDE_BROWSER_HEADLESS` *hung* it, waiting out the headless startup timeout
+for a browser that was never coming. All of them are cleared now.
 
 `headless_backend.py`, `agent/browser_agent.py`, `getText`,
 `getComputedStyles`, `_save_screenshot`, the native host's framing and the
-attended human-approval branch had no tests at all. The suite is now 364
-Python tests plus 171 JavaScript ones, with every fix above shown to fail
+attended human-approval branch had no tests at all. The suite is now 421
+Python tests plus 189 JavaScript ones, with every fix above shown to fail
 against the source it replaced. Several fixtures were found to be hiding the
 bugs they were meant to cover: `attachShadow()` discarded its argument, so
 changing the approval prompt's shadow root from `closed` to `open` — which
