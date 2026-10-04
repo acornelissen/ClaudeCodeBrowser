@@ -17,6 +17,33 @@
   let highlightOverlay = null;
   let inspectorMode = false;
 
+  // Feature flags reach this script verbatim: camelize_args() in server.py
+  // renames keys without coercing their values and background.js forwards
+  // content commands as they arrive, so a client that has not loaded the
+  // current schema sends the JSON string "false". Read with bare truthiness
+  // that is true, and read with !== false it is also true - so
+  // browser_type {clear: "false", press_enter: "false", submit_form: "false"}
+  // cleared the field and submitted the form, which is exactly what the
+  // caller had declined.
+  //
+  // This is a copy of parseFlag() in background.js; the two must behave the
+  // same, because the same option can be handled on either side.
+  //
+  // FEATURE flags only. The credential override stays a strict === true (see
+  // passwordAllowed): a fail-closed security switch must not be opened by
+  // anything that merely looks truthy.
+  function parseFlag(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') return value !== 0;
+    if (typeof value === 'string') {
+      const text = value.trim().toLowerCase();
+      if (['true', '1', 'yes', 'on'].includes(text)) return true;
+      if (['false', '0', 'no', 'off'].includes(text)) return false;
+    }
+    return fallback;
+  }
+
   // ============================================
   // Console Logging Infrastructure
   //
@@ -174,7 +201,7 @@
   function startLogging(options = {}) {
     installInterception();
     loggingEnabled = true;
-    if (options.clearExisting) {
+    if (parseFlag(options.clearExisting, false)) {
       consoleLogs = [];
     }
     return {
@@ -236,7 +263,7 @@
   }
 
   function clearLogs(options = {}) {
-    if (options.console !== false) {
+    if (parseFlag(options.console, true)) {
       consoleLogs = [];
     }
     return {
@@ -334,15 +361,63 @@
     'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'
   ]);
 
+  // A field's name or id is the third signal, and on real pages often the
+  // only one: <input type="text" name="passwd"> is a password field that
+  // says type="text", and a contenteditable <div id="otp-code"> is a
+  // credential with no type at all.
+  //
+  // This list must stay at least as strict as SECRET_KEY_RE in
+  // background.js, which scrubs the same names out of captured HTML and
+  // request bodies and whose comment calls them "exactly the thing the
+  // DOM-level guard masks". Change one, change the other. The extras here
+  // (pwd, ssn) are names background.js misses; a name the DOM guard misses
+  // hands a credential to the agent in clear, which is worse than masking a
+  // field that happens to be called "author".
+  const CREDENTIAL_NAME_RE =
+    /(pass(word|wd)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number|ssn)/i;
+
+  function attributeOf(element, name) {
+    if (!element || typeof element.getAttribute !== 'function') return null;
+    return element.getAttribute(name);
+  }
+
   function isPasswordField(element) {
-    if (!element || element.tagName !== 'INPUT') return false;
+    if (!element) return false;
+    // Not restricted to <input>: Shoelace, Ionic and Vaadin wrap a real
+    // input in a shadow root, so <sl-input type="password"> is the only
+    // element an agent can target, and requiring tagName === 'INPUT' let
+    // those through in clear.
     if (element.type === 'password') return true;
-    const autocomplete = element.getAttribute('autocomplete');
-    if (!autocomplete) return false;
-    return autocomplete
-      .toLowerCase()
-      .split(/\s+/)
-      .some(token => CREDENTIAL_AUTOCOMPLETE_TOKENS.has(token));
+    if ((attributeOf(element, 'type') || '').toLowerCase() === 'password') return true;
+
+    const autocomplete = attributeOf(element, 'autocomplete');
+    if (autocomplete && autocomplete
+          .toLowerCase()
+          .split(/\s+/)
+          .some(token => CREDENTIAL_AUTOCOMPLETE_TOKENS.has(token))) {
+      return true;
+    }
+
+    // The name/id rule is only for elements that hold a value somebody
+    // entered. Applied to everything, it would mask the text of any
+    // <div id="user-session-banner"> on the page.
+    if (!holdsEnteredValue(element)) return false;
+
+    // name can be a form path like user[password], which still names a
+    // credential, so this is a substring match rather than an equality test.
+    const name = element.name || attributeOf(element, 'name') || '';
+    const id = element.id || attributeOf(element, 'id') || '';
+    return CREDENTIAL_NAME_RE.test(name) || CREDENTIAL_NAME_RE.test(id);
+  }
+
+  function holdsEnteredValue(element) {
+    const tag = element.tagName || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (element.isContentEditable === true) return true;
+    // A custom element - its tag name must contain a hyphen - is how a
+    // component library ships a field: <sl-input>, <ion-input>,
+    // <vaadin-password-field>.
+    return tag.includes('-');
   }
 
   // Hidden inputs routinely carry CSRF tokens, session ids and order ids.
@@ -362,7 +437,24 @@
     if (element && isConcealedValueField(element) && !passwordAllowed(options)) {
       return element.value ? '***' : null;
     }
-    return element?.value?.substring(0, limit) || null;
+    // .value is not always a string: it is an IDL number on <li>, <progress>
+    // and <meter> (0 for an <li> outside an <ol>) and on custom elements
+    // like <md-slider>. ?. only short-circuits null and undefined, so
+    // (0).substring threw a TypeError here - and performClick builds this
+    // info *after* dispatching the click, so the caller got an error for an
+    // action that had already happened and retried it.
+    const raw = element?.value;
+    if (raw === undefined || raw === null || raw === '') return null;
+    return String(raw).substring(0, limit);
+  }
+
+  // textContent is the value of a contenteditable field, so a credential
+  // held in one leaks through every result that carries element text.
+  function safeElementText(element, limit, options) {
+    if (element && isConcealedValueField(element) && !passwordAllowed(options)) {
+      return element.textContent ? '***' : null;
+    }
+    return element?.textContent?.trim().substring(0, limit) || null;
   }
 
   // The server sets allow_password, but camelize_args() in server.py rewrites
@@ -531,7 +623,7 @@
   // the browser completes the challenge; we detect completion or a Done click.
   function solveCaptcha(options = {}) {
     const detection = detectCaptcha();
-    if (options.detectOnly) {
+    if (parseFlag(options.detectOnly, false)) {
       return { success: true, ...detection };
     }
     if (!detection.present) {
@@ -616,6 +708,41 @@
     });
   }
 
+  // Every tool hands its selector back as the handle for the next call, so a
+  // selector that cannot be parsed again breaks the call after the one that
+  // worked. Real ids are full of characters CSS reads as syntax: Headless UI
+  // emits "headlessui-menu-item-:r1:", Rails and MUI emit "user.email", and
+  // querySelector('#user.email') means "#user with class email", not that id.
+  // Same for Tailwind's "md:flex" class names.
+  //
+  // CSS.escape does this in a browser. It is written out here so the tests
+  // run the same code the extension does, and so this works in any context
+  // the script is injected into.
+  function cssIdentifier(value) {
+    const escaped = String(value)
+      // What CSS.escape does: a NUL becomes a replacement character, every
+      // ASCII character that is not an identifier character is backslashed,
+      // and non-ASCII characters are already legal in an identifier.
+      .replace(/\0/g, '\uFFFD')
+      .replace(/[^a-zA-Z0-9_\u0080-\uFFFF-]/g, (char) => `\\${char}`)
+      // A leading digit, or a hyphen followed by one, cannot start an
+      // identifier, so it goes in as a hex escape.
+      .replace(/^(-?)([0-9])/, (whole, hyphen, digit) => `${hyphen}\\3${digit} `);
+    return escaped;
+  }
+
+  // A caller-supplied needle goes into an attribute selector as a quoted
+  // string: a value containing a double quote otherwise closes the string and
+  // the rest of it is read as selector syntax, so the page can decide which
+  // element the agent "found by name" actually is.
+  function cssString(value) {
+    const escaped = String(value)
+      .replace(/[\\"]/g, '\\$&')
+      // A raw newline is not allowed inside a CSS string.
+      .replace(/[\n\r\f]/g, (char) => `\\${char.charCodeAt(0).toString(16)} `);
+    return `"${escaped}"`;
+  }
+
   // XPath 1.0 has no escape syntax, so a string containing both quote
   // characters has to be built with concat().
   function xpathLiteral(value) {
@@ -655,13 +782,13 @@
     } else if (options.id) {
       element = document.getElementById(options.id);
     } else if (options.name) {
-      element = document.querySelector(`[name="${options.name}"]`);
+      element = document.querySelector(`[name=${cssString(options.name)}]`);
     } else if (options.ariaLabel) {
-      element = document.querySelector(`[aria-label="${options.ariaLabel}"]`);
+      element = document.querySelector(`[aria-label=${cssString(options.ariaLabel)}]`);
     } else if (options.placeholder) {
-      element = document.querySelector(`[placeholder="${options.placeholder}"]`);
+      element = document.querySelector(`[placeholder=${cssString(options.placeholder)}]`);
     } else if (options.role) {
-      element = document.querySelector(`[role="${options.role}"]`);
+      element = document.querySelector(`[role=${cssString(options.role)}]`);
     }
 
     return element;
@@ -687,7 +814,7 @@
     const y = rect.top + rect.height / 2;
 
     // Create and dispatch events
-    if (options.rightClick) {
+    if (parseFlag(options.rightClick, false)) {
       const contextEvent = new MouseEvent('contextmenu', {
         bubbles: true,
         cancelable: true,
@@ -696,7 +823,7 @@
         clientY: y
       });
       element.dispatchEvent(contextEvent);
-    } else if (options.doubleClick) {
+    } else if (parseFlag(options.doubleClick, false)) {
       const dblClickEvent = new MouseEvent('dblclick', {
         bubbles: true,
         cancelable: true,
@@ -754,7 +881,7 @@
   async function performType(options) {
     let element = findElement(options);
 
-    if (!element && options.focusFirst === false) {
+    if (!element && !parseFlag(options.focusFirst, true)) {
       // Type into currently focused element
       element = document.activeElement;
     }
@@ -765,6 +892,24 @@
 
     assertNotPasswordField(element, options);
 
+    // Only a text field or a contenteditable element takes inserted text.
+    // Anything else swallows every character: the key events dispatch, the
+    // value assignment below is skipped, and the old code still returned
+    // typed: true. document.activeElement is <body> whenever nothing is
+    // focused, so focus_first: false hit this on any page the agent had not
+    // clicked into first - the text went nowhere and the result said it had
+    // been typed.
+    const editable = element.tagName === 'INPUT' || element.tagName === 'TEXTAREA'
+      || element.isContentEditable === true;
+    if (!editable) {
+      throw new Error(
+        `Refused: <${element.tagName.toLowerCase()}> cannot receive typed ` +
+        'text (not an input, textarea or contenteditable element). ' +
+        'Nothing was typed. Name the field with "selector", or click into it ' +
+        'first if you are relying on focus_first: false.'
+      );
+    }
+
     // Focus the element
     element.focus();
     element.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -772,7 +917,8 @@
 
     const text = options.text || '';
 
-    if (options.clear) {
+    const clear = parseFlag(options.clear, false);
+    if (clear) {
       // Clear existing content
       if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
         element.value = '';
@@ -782,12 +928,12 @@
       element.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    if (options.instant) {
+    if (parseFlag(options.instant, false)) {
       // Instant input (no typing simulation)
       if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
-        element.value = options.clear ? text : element.value + text;
+        element.value = clear ? text : element.value + text;
       } else if (element.isContentEditable) {
-        element.textContent = options.clear ? text : element.textContent + text;
+        element.textContent = clear ? text : element.textContent + text;
       }
       element.dispatchEvent(new Event('input', { bubbles: true }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
@@ -829,7 +975,7 @@
     }
 
     // Handle Enter key if specified
-    if (options.pressEnter) {
+    if (parseFlag(options.pressEnter, false)) {
       const enterDown = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true });
       const enterUp = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true });
       element.dispatchEvent(enterDown);
@@ -837,7 +983,7 @@
 
       // Submit form if applicable
       const form = element.closest('form');
-      if (form && options.submitForm !== false) {
+      if (form && parseFlag(options.submitForm, true)) {
         form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       }
     }
@@ -872,7 +1018,7 @@
       }
       if (targetElement) {
         targetElement.scrollIntoView({
-          behavior: options.smooth !== false ? 'smooth' : 'auto',
+          behavior: parseFlag(options.smooth, true) ? 'smooth' : 'auto',
           block: options.block || 'center'
         });
         await sleep(500);
@@ -908,7 +1054,7 @@
       const scrollOptions = {
         left: options.x || 0,
         top: options.y || 0,
-        behavior: options.smooth !== false ? 'smooth' : 'auto'
+        behavior: parseFlag(options.smooth, true) ? 'smooth' : 'auto'
       };
 
       if (element) {
@@ -940,39 +1086,53 @@
       '[tabindex]:not([tabindex="-1"])'
     ];
 
-    document.querySelectorAll(selectors.join(', ')).forEach((el, index) => {
-      if (index < 100) { // Limit to prevent huge responses
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          interactiveElements.push({
-            tag: el.tagName.toLowerCase(),
-            type: el.type || null,
-            id: el.id || null,
-            name: el.name || null,
-            text: el.textContent?.trim().substring(0, 100) || null,
-            href: el.href || null,
-            value: safeElementValue(el, 100, options),
-            placeholder: el.placeholder || null,
-            ariaLabel: el.getAttribute('aria-label'),
-            position: {
-              x: rect.left + rect.width / 2,
-              y: rect.top + rect.height / 2,
-              width: rect.width,
-              height: rect.height
-            },
-            visible: isVisible(el),
-            selector: generateSelector(el)
-          });
-        }
-      }
-    });
+    // The cap is on how many elements are COLLECTED, not how many are
+    // examined. Counting matches instead meant 100 zero-size matches (hidden
+    // inputs, offscreen [tabindex] - normal on a real page) used up the whole
+    // budget and the visible checkout button that followed them was reported
+    // in the count but never returned.
+    const MAX_INTERACTIVE_ELEMENTS = 100;
+    const matches = Array.from(document.querySelectorAll(selectors.join(', ')));
+    let stoppedAtCap = false;
 
-    const allInteractive = document.querySelectorAll(selectors.join(', ')).length;
+    for (const el of matches) {
+      if (interactiveElements.length >= MAX_INTERACTIVE_ELEMENTS) {
+        stoppedAtCap = true;
+        break;
+      }
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      interactiveElements.push({
+        tag: el.tagName.toLowerCase(),
+        type: el.type || null,
+        id: el.id || null,
+        name: el.name || null,
+        text: safeElementText(el, 100, options),
+        href: el.href || null,
+        value: safeElementValue(el, 100, options),
+        placeholder: el.placeholder || null,
+        ariaLabel: el.getAttribute('aria-label'),
+        position: {
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          width: rect.width,
+          height: rect.height
+        },
+        visible: isVisible(el),
+        selector: generateSelector(el)
+      });
+    }
+
+    const allInteractive = matches.length;
     return {
       url: window.location.href,
       title: document.title,
       interactiveElementCount: allInteractive,
-      interactiveElementsTruncated: allInteractive > 100,
+      // How many of the matches are actually in the list below. The count
+      // above includes zero-size elements, which are never returned, so the
+      // two differ on most pages.
+      interactiveElementsReturned: interactiveElements.length,
+      interactiveElementsTruncated: stoppedAtCap,
       documentHeight: document.documentElement.scrollHeight,
       documentWidth: document.documentElement.scrollWidth,
       viewportHeight: window.innerHeight,
@@ -1130,7 +1290,7 @@
           changes.push(change);
 
           // Check if we should resolve now
-          if (options.waitForAll !== true) {
+          if (!parseFlag(options.waitForAll, false)) {
             resolved = true;
             observer.disconnect();
             resolve({
@@ -1147,10 +1307,10 @@
 
       observer.observe(target, {
         childList: true,
-        subtree: options.subtree !== false,
-        attributes: options.attributes !== false,
-        characterData: options.characterData === true,
-        attributeOldValue: options.attributeOldValue === true
+        subtree: parseFlag(options.subtree, true),
+        attributes: parseFlag(options.attributes, true),
+        characterData: parseFlag(options.characterData, false),
+        attributeOldValue: parseFlag(options.attributeOldValue, false)
       });
 
       // Timeout
@@ -1182,9 +1342,17 @@
     const observerId = options.observerId ||
       `obs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Stop existing observer with same ID
-    if (activeObservers.has(observerId)) {
-      activeObservers.get(observerId).disconnect();
+    // Stop existing observer with same ID. observer_id is a documented
+    // parameter, so reusing one has to replace the observer; the map holds a
+    // record, not the observer, and calling .disconnect() on the record threw
+    // instead. The old expiry timer has to go with it: it looks the id up
+    // again when it fires, so it would disconnect the replacement and mark it
+    // expired.
+    const previous = activeObservers.get(observerId);
+    if (previous) {
+      previous.observer.disconnect();
+      if (previous.expiry) clearTimeout(previous.expiry);
+      activeObservers.delete(observerId);
     }
 
     const changes = [];
@@ -1302,7 +1470,7 @@
     }
 
     // Restore original scroll position if requested
-    if (options.restore !== false) {
+    if (parseFlag(options.restore, true)) {
       window.scrollTo({ top: originalScroll, behavior: 'instant' });
     }
 
@@ -1446,9 +1614,10 @@
     // The context menu reports page (document) coordinates; elementFromPoint
     // takes viewport coordinates, so on any scrolled page the wrong element
     // was inspected.
-    const viewportX = options.viewport === true
+    const viewportCoords = parseFlag(options.viewport, false);
+    const viewportX = viewportCoords
       ? options.x : options.x - window.scrollX;
-    const viewportY = options.viewport === true
+    const viewportY = viewportCoords
       ? options.y : options.y - window.scrollY;
     const element = document.elementFromPoint(viewportX, viewportY);
     if (!element) {
@@ -1473,7 +1642,8 @@
     // Reading a password field would hand the credential to the AI just as
     // surely as typing one would, so the same guard applies. Masking rather
     // than refusing keeps the tool useful: you can still see whether the
-    // field is filled.
+    // field is filled. This covers the textContent branch below as well: a
+    // contenteditable field is just as much a credential holder as an input.
     if (isConcealedValueField(element) && !passwordAllowed(options)) {
       return {
         value: '***',
@@ -1619,6 +1789,22 @@
       if (!element) throw new Error('Element not found');
     }
 
+    // Asking for the text of a credential field is asking for its value.
+    // Only the named element is checked: scrubbing the whole page's innerText
+    // is not something this can do honestly, so document-wide text stays the
+    // caller's own risk.
+    if (isConcealedValueField(element) && !passwordAllowed(options)) {
+      return {
+        text: '***',
+        masked: true,
+        note: 'Credential field text withheld. Use browser_get_value with ' +
+              '"allow_password_typing": true in ~/.claudecodebrowser/safety.json ' +
+              'to read credentials through the agent.',
+        url: window.location.href,
+        title: document.title
+      };
+    }
+
     const maxLength = options.maxLength || 20000;
     const text = element.innerText || element.textContent || '';
 
@@ -1727,7 +1913,7 @@
       classes: Array.from(element.classList),
       name: element.name || null,
       type: element.type || null,
-      text: element.textContent?.trim().substring(0, 200) || null,
+      text: safeElementText(element, 200, {}),
       value: value,
       href: element.href || null,
       src: element.src || null,
@@ -1750,7 +1936,7 @@
   }
 
   function generateSelector(element) {
-    if (element.id) return `#${element.id}`;
+    if (element.id) return `#${cssIdentifier(element.id)}`;
 
     const path = [];
     let current = element;
@@ -1759,7 +1945,7 @@
       let selector = current.tagName.toLowerCase();
 
       if (current.id) {
-        selector = `#${current.id}`;
+        selector = `#${cssIdentifier(current.id)}`;
         path.unshift(selector);
         break;
       }
@@ -1767,7 +1953,7 @@
       if (current.className && typeof current.className === 'string') {
         const classes = current.className.trim().split(/\s+/).filter(c => c && !c.match(/^[0-9]/));
         if (classes.length > 0) {
-          selector += '.' + classes.slice(0, 2).join('.');
+          selector += '.' + classes.slice(0, 2).map(cssIdentifier).join('.');
         }
       }
 
@@ -1786,7 +1972,7 @@
   }
 
   function generateXPath(element) {
-    if (element.id) return `//*[@id="${element.id}"]`;
+    if (element.id) return `//*[@id=${xpathLiteral(element.id)}]`;
 
     const parts = [];
     let current = element;

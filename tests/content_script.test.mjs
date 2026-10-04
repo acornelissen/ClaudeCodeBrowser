@@ -40,7 +40,11 @@ function makeElement(tag, props = {}) {
         : null;
     },
     setAttribute(name, value) { this._attributes[name] = value; },
-    attachShadow() {
+    /** Records the init it was given: a prompt in an open root is one the
+     *  page can read and whose buttons it can find, so the mode is part of
+     *  what the tests have to check. */
+    attachShadow(init) {
+      this._shadowInit = init;
       this._shadow = { children: [], appendChild(c) { this.children.push(c); } };
       return this._shadow;
     },
@@ -55,7 +59,10 @@ function makeElement(tag, props = {}) {
     emit(type, isTrusted) {
       (this._listeners[type] || []).forEach(fn => fn({ type, isTrusted }));
     },
-    getBoundingClientRect: () => ({
+    /** Real pages are full of zero-size elements - hidden inputs, offscreen
+     *  [tabindex] holders - and they report an all-zero rect, so a fixture
+     *  can ask for one. */
+    getBoundingClientRect: () => (props.rect || {
       left: 0, top: 0, width: 10, height: 10,
       x: 0, y: 0, right: 10, bottom: 10
     }),
@@ -92,7 +99,9 @@ function loadContentScript(registry) {
     body,
     forms: registry.__forms__ || [],
     documentElement: { scrollHeight: 1000, scrollWidth: 800, lang: 'en' },
-    activeElement: null,
+    // A real document always has something focused: <body> when nothing
+    // else is. null made focus_first: false look like "no element".
+    activeElement: body,
     querySelector: resolveOne,
     querySelectorAll: (sel) => {
       if (all.has(sel)) return all.get(sel);
@@ -201,8 +210,13 @@ function loadContentScript(registry) {
     setTimeout(() => reject(new Error(`no response for ${message.action}`)), 2000);
   });
 
-  return { send, window, consoleStub, XMLHttpRequestStub, createdElements,
+  return { send, window, document, consoleStub, XMLHttpRequestStub,
+           createdElements,
            observers: sandbox.__observers,
+           /** Evaluate source inside the sandbox. An Error built out here is
+            *  not `instanceof Error` in there, so a cross-realm object would
+            *  quietly test the wrong branch of content.js. */
+           evalInSandbox: (source) => runInContext(source, context),
            pristine: {
              fetch: fetchStub,
              consoleLog: originalConsoleLog,
@@ -544,6 +558,8 @@ test('the prompt is rendered in a closed shadow root', async () => {
   const host = ctx.createdElements.find(e => e.id === '__ccb_approval_host');
   assert.ok(host, 'the prompt needs its own host element');
   assert.ok(host._shadow, 'the banner must live in a shadow root, not the page DOM');
+  assert.equal(host._shadowInit?.mode, 'closed',
+    'an open root lets page script read the prompt and click its buttons');
   assert.match(host.getAttribute('style') || '', /!important/,
     'host styling must resist a page !important rule');
 });
@@ -594,15 +610,24 @@ test('page errors and unhandled rejections are captured', async () => {
     message: 'Uncaught TypeError: x is not a function',
     filename: 'http://stub.test/app.js', lineno: 12, colno: 3
   });
-  ctx.window.emit('unhandledrejection', { reason: new Error('boom') });
+  // The Error has to be built inside the sandbox: one made out here is not
+  // `instanceof Error` across the vm realm, so content.js would fall through
+  // to its String(reason) path and the name/message branch would never run.
+  // toString is overridden so the two branches produce different text and
+  // the test can tell which one ran.
+  ctx.window.emit('unhandledrejection', {
+    reason: ctx.evalInSandbox(
+      '(() => { const e = new TypeError("boom");'
+      + ' e.toString = () => "via String()"; return e; })()')
+  });
 
   const logs = await ctx.send({ action: 'getConsoleLogs' });
   const messages = Array.from(logs.logs, l => l.message);
   assert.equal(logs.logs.length, 2);
   assert.ok(messages[0].includes('x is not a function'));
   assert.ok(messages[0].includes('app.js:12:3'), 'location should be included');
-  assert.ok(messages[1].includes('Unhandled promise rejection'));
-  assert.ok(messages[1].includes('boom'));
+  assert.equal(messages[1], 'Unhandled promise rejection: TypeError: boom',
+    'an Error reason is reported by name and message, not via String()');
   assert.ok(logs.logs.every(l => l.source === 'page'));
 });
 
@@ -725,6 +750,411 @@ test('an observer stopped in time is not marked expired', async () => {
   const stopped = await ctx.send({ action: 'stopObserving',
                                    observerId: started.observerId });
   assert.equal(stopped.expired, false);
+});
+
+// --------------------------------------------------------------------------
+// The credential guard, against the markup real pages ship.
+//
+// The guard used to look only at input[type=password] and the autocomplete
+// token list, which three normal patterns walk straight past. background.js
+// already scrubbed the same names out of captured HTML with SECRET_KEY_RE,
+// so the extension was masking a field in one result and printing it in
+// another.
+
+test('a shadow-DOM credential host is guarded, not just a bare <input>', async () => {
+  // Shoelace, Ionic and Vaadin put the real input in a shadow root, so the
+  // host element is the only thing an agent can target.
+  const pw = makeElement('sl-input', {
+    id: 'pw', value: 'SuperSecret123!', attributes: { type: 'password' }
+  });
+  const { send } = loadContentScript({ '#pw': pw });
+
+  const result = await send({ action: 'getValue', selector: '#pw' });
+
+  assert.equal(result.value, '***');
+  assert.equal(result.masked, true);
+  assert.ok(!JSON.stringify(result).includes('SuperSecret123!'));
+});
+
+test('typing into a shadow-DOM credential host is refused too', async () => {
+  const pw = makeElement('sl-input', {
+    id: 'pw', value: '', attributes: { type: 'password' }
+  });
+  const { send } = loadContentScript({ '#pw': pw });
+
+  const result = await send({ action: 'type', selector: '#pw', text: 'nope' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /password field/i);
+});
+
+test('a credential-shaped name or id is guarded whatever the type says', async () => {
+  const names = ['passwd', 'pwd', 'cvv', 'otp', 'ssn', 'user[password]',
+                 'privateKey', 'sessionToken', 'card-number', 'api_key'];
+  for (const name of names) {
+    const byName = makeElement('input', { id: 'f', name, type: 'text', value: 'SECRET' });
+    const byName_ctx = loadContentScript({ '#f': byName });
+    const byNameResult = await byName_ctx.send({ action: 'getValue', selector: '#f' });
+    assert.equal(byNameResult.value, '***', `name="${name}" must be guarded`);
+
+    const byId = makeElement('input', { id: name, type: 'text', value: 'SECRET' });
+    const byId_ctx = loadContentScript({ [`#${name}`]: byId });
+    const byIdResult = await byId_ctx.send({ action: 'getValue', selector: `#${name}` });
+    assert.equal(byIdResult.value, '***', `id="${name}" must be guarded`);
+  }
+});
+
+test('writing to a credential-shaped name is refused as well', async () => {
+  const field = makeElement('input', { id: 'f', name: 'passwd', type: 'text', value: '' });
+  const { send } = loadContentScript({ '#f': field });
+
+  const typed = await send({ action: 'type', selector: '#f', text: 'nope' });
+  assert.equal(typed.success, false);
+  assert.match(typed.error, /password field/i);
+  assert.equal(field.value, '');
+
+  const set = await send({ action: 'setValue', selector: '#f', value: 'nope' });
+  assert.equal(set.success, false);
+  assert.equal(field.value, '');
+});
+
+test('ordinary fields are not swept up by the name guard', async () => {
+  const cases = [
+    ['email', 'a@b.test'],
+    ['search', 'shoes'],
+    ['first-name', 'Albert'],
+    ['quantity', '2']
+  ];
+  for (const [name, value] of cases) {
+    const el = makeElement('input', { id: 'f', name, type: 'text', value });
+    const { send } = loadContentScript({ '#f': el });
+    const result = await send({ action: 'getValue', selector: '#f' });
+    assert.equal(result.value, value, `name="${name}" is not a credential`);
+    assert.notEqual(result.masked, true);
+  }
+});
+
+test('ordinary page text is not masked by the name guard', async () => {
+  // The name/id rule is for fields, not for every element that happens to
+  // have "session" or "auth" in its id.
+  const banner = makeElement('div', {
+    id: 'user-session-banner', textContent: 'Signed in as albert'
+  });
+  const { send } = loadContentScript({ '#user-session-banner': banner,
+                                       div: [banner] });
+
+  const text = await send({ action: 'getText', selector: '#user-session-banner' });
+  assert.equal(text.text, 'Signed in as albert');
+  assert.notEqual(text.masked, true);
+
+  const elements = await send({ action: 'getElements', selector: 'div' });
+  assert.equal(elements.elements[0].text, 'Signed in as albert');
+});
+
+test('a contenteditable credential field is masked, value and text', async () => {
+  // No type, no value property: the code path that leaks is textContent.
+  const pin = makeElement('div', { id: 'otp-code', textContent: '482913' });
+  pin.isContentEditable = true;
+  const { send } = loadContentScript({ '#otp-code': pin, div: [pin] });
+
+  const value = await send({ action: 'getValue', selector: '#otp-code' });
+  assert.equal(value.value, '***');
+  assert.equal(value.masked, true);
+  assert.ok(!JSON.stringify(value).includes('482913'));
+
+  const text = await send({ action: 'getText', selector: '#otp-code' });
+  assert.ok(!JSON.stringify(text).includes('482913'),
+    'get_text on a credential field is just another way to read it');
+
+  const elements = await send({ action: 'getElements', selector: 'div' });
+  assert.ok(!JSON.stringify(elements).includes('482913'),
+    'element text is incidental metadata; a credential in it is still a leak');
+});
+
+test('browser_get_page_info leaks none of the three', async () => {
+  const host = makeElement('sl-input', {
+    id: 'pw', value: 'HOST-SECRET', attributes: { type: 'password', tabindex: '0' }
+  });
+  const named = makeElement('input', { id: 'c', name: 'cvv', type: 'text', value: 'CVV-SECRET' });
+  const pin = makeElement('div', { id: 'otp-code', textContent: 'PIN-SECRET' });
+  pin.isContentEditable = true;
+  const { send } = loadContentScript({ __interactive__: [host, named, pin] });
+
+  const result = await send({ action: 'getPageInfo' });
+
+  const serialized = JSON.stringify(result);
+  for (const secret of ['HOST-SECRET', 'CVV-SECRET', 'PIN-SECRET']) {
+    assert.ok(!serialized.includes(secret), `${secret} must not be returned`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// A numeric .value must not turn a completed click into an error
+
+test('browser_click on an element with a numeric value still reports success', async () => {
+  // .value is an IDL number on <li>, <progress>, <meter> and on custom
+  // elements like <md-slider>. The old reader called .substring on it and
+  // threw - after the click had been dispatched - so an agent that retried
+  // clicked twice.
+  let clicks = 0;
+  const item = makeElement('li', { id: 'opt', value: 0, textContent: 'Option' });
+  item.dispatchEvent = (event) => {
+    if (event.type === 'click') clicks++;
+    return true;
+  };
+  const { send } = loadContentScript({ '#opt': item });
+
+  const result = await send({ action: 'click', selector: '#opt' });
+
+  assert.notEqual(result.success, false,
+    `a delivered click must not be reported as a failure: ${result.error}`);
+  assert.equal(result.clicked, true);
+  assert.equal(clicks, 1);
+  assert.equal(result.element.value, '0');
+});
+
+test('a numeric value is reported in element metadata, not thrown over', async () => {
+  const meter = makeElement('meter', { id: 'm', value: 42 });
+  const slider = makeElement('md-slider', { id: 's', value: 0 });
+  const { send } = loadContentScript({ '[role="slider"]': [meter, slider] });
+
+  const result = await send({ action: 'getElements', selector: '[role="slider"]' });
+
+  assert.notEqual(result.success, false, `${result.error}`);
+  assert.deepEqual(Array.from(result.elements, e => e.value), ['42', '0']);
+});
+
+// --------------------------------------------------------------------------
+// Feature flags arrive as strings. "false" must mean false.
+
+test('browser_type honours string "false" for clear, press_enter and submit_form', async () => {
+  const field = makeElement('input', { id: 'q', type: 'text', value: 'keep' });
+  const keys = [];
+  const submits = [];
+  field.dispatchEvent = (event) => {
+    if (event.type.startsWith('key')) keys.push(event.key);
+    return true;
+  };
+  field.closest = () => ({
+    tagName: 'FORM',
+    dispatchEvent: (event) => { submits.push(event.type); return true; }
+  });
+  const { send } = loadContentScript({ '#q': field });
+
+  const result = await send({
+    action: 'type', selector: '#q', text: 'x', instant: 'true',
+    clear: 'false', pressEnter: 'false', submitForm: 'false'
+  });
+
+  assert.equal(result.typed, true);
+  assert.equal(field.value, 'keepx', 'clear: "false" must not clear the field');
+  assert.deepEqual(keys, [], 'press_enter: "false" must not press Enter');
+  assert.deepEqual(submits, [], 'submit_form: "false" must not submit the form');
+});
+
+test('submit_form: "false" holds even when Enter is asked for', async () => {
+  const field = makeElement('input', { id: 'q', type: 'text', value: '' });
+  const submits = [];
+  field.closest = () => ({
+    tagName: 'FORM',
+    dispatchEvent: (event) => { submits.push(event.type); return true; }
+  });
+  const { send } = loadContentScript({ '#q': field });
+
+  await send({
+    action: 'type', selector: '#q', text: 'x', instant: 'true',
+    pressEnter: 'true', submitForm: 'false'
+  });
+
+  assert.deepEqual(submits, [],
+    'submitting a form the caller declined is destructive and not undoable');
+});
+
+test('string flags are read elsewhere too: inspect_element viewport', async () => {
+  const ctx = loadContentScript({});
+  const asked = [];
+  ctx.document.elementFromPoint = (x, y) => { asked.push([x, y]); return null; };
+  ctx.window.scrollY = 100;
+
+  await ctx.send({ action: 'inspectElement', x: 10, y: 10, viewport: 'true' });
+
+  assert.deepEqual(asked, [[10, 10]],
+    'viewport: "true" means the coordinates are already viewport-relative');
+});
+
+// --------------------------------------------------------------------------
+// get_page_info must return the elements it counts
+
+test('a visible element after 100 zero-size matches is still returned', async () => {
+  // Hidden inputs and offscreen [tabindex] holders are normal on a real page
+  // and report an all-zero rect. The cap used to count matches rather than
+  // collected elements, so they ate the whole budget.
+  const zeroRect = { left: 0, top: 0, width: 0, height: 0,
+                     x: 0, y: 0, right: 0, bottom: 0 };
+  const hidden = [];
+  for (let i = 0; i < 100; i++) {
+    hidden.push(makeElement('input', { id: `h${i}`, type: 'hidden', rect: zeroRect }));
+  }
+  const checkout = makeElement('button', { id: 'checkout', textContent: 'Place order' });
+  const { send } = loadContentScript({ __interactive__: [...hidden, checkout] });
+
+  const result = await send({ action: 'getPageInfo' });
+
+  assert.equal(result.interactiveElementCount, 101);
+  assert.equal(result.interactiveElementsReturned, 1);
+  assert.equal(result.interactiveElementsTruncated, false,
+    'nothing was dropped, so the result must not claim it was');
+  assert.deepEqual(Array.from(result.interactiveElements, e => e.id), ['checkout']);
+});
+
+test('get_page_info still caps the list and says when it did', async () => {
+  const many = [];
+  for (let i = 0; i < 150; i++) {
+    many.push(makeElement('button', { id: `b${i}`, textContent: `b${i}` }));
+  }
+  const { send } = loadContentScript({ __interactive__: many });
+
+  const result = await send({ action: 'getPageInfo' });
+
+  assert.equal(result.interactiveElementsReturned, 100);
+  assert.equal(result.interactiveElementCount, 150);
+  assert.equal(result.interactiveElementsTruncated, true);
+});
+
+// --------------------------------------------------------------------------
+// Reusing an observer_id replaces the observer
+
+test('observe_element with a reused observer_id replaces the old observer', async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  const first = await ctx.send({ action: 'observeElement', selector: '#watch',
+                                 observerId: 'obs-1', maxLifetimeMs: 40 });
+  assert.equal(first.observing, true);
+
+  const second = await ctx.send({ action: 'observeElement', selector: '#watch',
+                                  observerId: 'obs-1', maxLifetimeMs: 5000 });
+  assert.notEqual(second.success, false,
+    `observer_id is documented, so reusing one must work: ${second.error}`);
+  assert.equal(second.observing, true);
+  assert.equal(second.observerId, 'obs-1');
+
+  const [old, current] = ctx.observers.slice(-2);
+  assert.equal(old.disconnected, true, 'the replaced observer must be let go');
+  assert.equal(current.observing, true);
+});
+
+test("the replaced observer's expiry timer does not stop the new one", async () => {
+  const target = makeElement('div', { id: 'watch' });
+  const ctx = loadContentScript({ '#watch': target });
+
+  await ctx.send({ action: 'observeElement', selector: '#watch',
+                   observerId: 'obs-1', maxLifetimeMs: 30 });
+  await ctx.send({ action: 'observeElement', selector: '#watch',
+                   observerId: 'obs-1', maxLifetimeMs: 5000 });
+
+  // Past the first observer's lifetime. Its timer looks the id up again when
+  // it fires, so it would find - and kill - the replacement.
+  await new Promise(resolve => setTimeout(resolve, 60));
+
+  const current = ctx.observers[ctx.observers.length - 1];
+  assert.equal(current.observing, true, 'the new observer must still be watching');
+
+  const stopped = await ctx.send({ action: 'stopObserving', observerId: 'obs-1' });
+  assert.equal(stopped.stopped, true);
+  assert.equal(stopped.expired, false,
+    'the replacement had 5s left; it must not be reported as expired');
+});
+
+// --------------------------------------------------------------------------
+// A selector is handed back as the handle for the next call, so it has to
+// survive being parsed again
+
+test('generateSelector escapes an id that CSS reads as syntax', async () => {
+  const headless = makeElement('input', { id: 'headlessui-menu-item-:r1:', value: 'a' });
+  const dotted = makeElement('input', { id: 'user.email', value: 'b' });
+  const { send } = loadContentScript({ input: [headless, dotted] });
+
+  const result = await send({ action: 'getElements', selector: 'input' });
+
+  assert.equal(result.elements[0].selector, '#headlessui-menu-item-\\:r1\\:',
+    'an unescaped colon makes querySelector throw');
+  assert.equal(result.elements[1].selector, '#user\\.email',
+    '#user.email means "#user with class email", not that id');
+});
+
+test('generateSelector escapes class names too', async () => {
+  const el = makeElement('div', { className: 'md:flex w-1/2' });
+  el.parentElement = null;
+  const { send } = loadContentScript({ div: [el] });
+
+  const result = await send({ action: 'getElements', selector: 'div' });
+
+  assert.equal(result.elements[0].selector, 'div.md\\:flex.w-1\\/2');
+});
+
+test('a name needle containing a quote cannot re-target the lookup', async () => {
+  const ctx = loadContentScript({});
+  const asked = [];
+  ctx.document.querySelector = (sel) => { asked.push(sel); return null; };
+
+  await ctx.send({ action: 'click', name: 'a"],[name="transfer-all' });
+
+  assert.deepEqual(asked, ['[name="a\\"],[name=\\"transfer-all"]'],
+    'the needle must stay one quoted string, not become selector syntax');
+});
+
+test('generateXPath quotes an id containing a quote', async () => {
+  const el = makeElement('div', { id: 'a"b' });
+  const ctx = loadContentScript({ '#a\\"b': el });
+  ctx.document.elementFromPoint = () => el;
+
+  const result = await ctx.send({ action: 'inspectElement', x: 1, y: 1,
+                                  viewport: true });
+
+  assert.equal(result.xpath, '//*[@id=\'a"b\']',
+    'an unescaped quote closes the literal and the rest is read as XPath');
+});
+
+// --------------------------------------------------------------------------
+// browser_type must not claim to have typed into something that cannot type
+
+test('typing with focus_first:false into <body> does not claim success', async () => {
+  // document.activeElement is <body> whenever nothing is focused, and <body>
+  // swallows every character. Reporting typed: true there is a lie the agent
+  // builds its next step on.
+  const ctx = loadContentScript({});
+
+  const result = await ctx.send({
+    action: 'type', text: 'hello', focusFirst: false, instant: true
+  });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /cannot receive typed text/i);
+  assert.match(result.error, /Nothing was typed/);
+});
+
+test('typing into a plain <div> does not claim success either', async () => {
+  const div = makeElement('div', { id: 'box' });
+  const { send } = loadContentScript({ '#box': div });
+
+  const result = await send({ action: 'type', selector: '#box', text: 'hello' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /cannot receive typed text/i);
+});
+
+test('typing into a contenteditable element still works', async () => {
+  const editor = makeElement('div', { id: 'editor' });
+  editor.isContentEditable = true;
+  const { send } = loadContentScript({ '#editor': editor });
+
+  const result = await send({
+    action: 'type', selector: '#editor', text: 'hello', instant: true
+  });
+
+  assert.equal(result.typed, true);
+  assert.equal(editor.textContent, 'hello');
 });
 
 // --------------------------------------------------------------------------
