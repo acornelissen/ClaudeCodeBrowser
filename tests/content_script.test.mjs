@@ -821,6 +821,45 @@ test('an observer stopped in time is not marked expired', async () => {
   assert.equal(stopped.expired, false);
 });
 
+test('whole-page get_text does not return a contenteditable credential', async () => {
+  // <body> is the default target, so browser_get_text with no selector
+  // returned a contenteditable PIN in the middle of the page dump. Only
+  // contenteditable credentials can reach innerText - an <input> contributes
+  // nothing to it whatever its value - so enumerating them covers it.
+  const pin = makeElement('div', { id: 'otp-code', textContent: '483920' });
+  pin.isContentEditable = true;
+  const body = makeElement('body', {
+    textContent: 'Enter your code 483920 then continue'
+  });
+  const ctx = loadContentScript({ '[contenteditable]': [pin] });
+  ctx.document.body.innerText = 'Enter your code 483920 then continue';
+  ctx.document.body.querySelectorAll = (sel) =>
+    (sel === '[contenteditable]' ? [pin] : []);
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.ok(!result.text.includes('483920'),
+            `the PIN was returned in the page text: ${result.text}`);
+  assert.equal(result.maskedFields, 1);
+  assert.ok(result.text.includes('Enter your code'),
+            'the rest of the page stays readable');
+});
+
+test('whole-page get_text leaves ordinary contenteditable text alone', async () => {
+  const notes = makeElement('div', { id: 'notes', textContent: 'Buy milk' });
+  notes.isContentEditable = true;
+  const ctx = loadContentScript({});
+  ctx.document.body.innerText = 'Reminders Buy milk';
+  ctx.document.body.querySelectorAll = (sel) =>
+    (sel === '[contenteditable]' ? [notes] : []);
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.ok(result.text.includes('Buy milk'),
+            'an ordinary editable field is not a credential');
+  assert.equal(result.maskedFields, undefined);
+});
+
 // --------------------------------------------------------------------------
 // The credential guard, against the markup real pages ship.
 //

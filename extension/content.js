@@ -1840,9 +1840,6 @@
     }
 
     // Asking for the text of a credential field is asking for its value.
-    // Only the named element is checked: scrubbing the whole page's innerText
-    // is not something this can do honestly, so document-wide text stays the
-    // caller's own risk.
     if (isConcealedValueField(element) && !passwordAllowed(options)) {
       return {
         text: '***',
@@ -1863,17 +1860,63 @@
     // The fallback is still needed where innerText does not exist (an SVG
     // element, a detached node), so keep it and say which one was read.
     const visible = typeof element.innerText === 'string';
-    const text = visible ? element.innerText : (element.textContent || '');
+    const raw = visible ? element.innerText : (element.textContent || '');
     const source = visible ? 'innerText' : 'textContent';
+
+    const { text, masked } = withoutNestedCredentialText(raw, element, options);
 
     return {
       text: text.slice(0, maxLength),
       truncated: text.length > maxLength,
       totalLength: text.length,
       source,
+      ...(masked ? {
+        maskedFields: masked,
+        note: `${masked} credential field(s) inside this element had their ` +
+              'text replaced with ***.'
+      } : {}),
       url: window.location.href,
       title: document.title
     };
+  }
+
+  // The element named by the caller is checked directly, but a credential can
+  // also sit INSIDE it - and <body> is the default, so browser_get_text with
+  // no selector returned a <div contenteditable> PIN in the middle of the
+  // page dump. Only contenteditable credentials can reach this: an <input>
+  // contributes nothing to innerText whatever its value, which is why
+  // enumerating them is enough rather than scrubbing prose with a regex.
+  const MAX_SCRUBBED_FIELDS = 50;
+
+  function withoutNestedCredentialText(text, root, options) {
+    if (!text || passwordAllowed(options)) return { text, masked: 0 };
+    let candidates;
+    try {
+      candidates = root.querySelectorAll
+        ? Array.from(root.querySelectorAll('[contenteditable]')).slice(
+            0, MAX_SCRUBBED_FIELDS)
+        : [];
+    } catch (e) {
+      candidates = [];
+    }
+
+    let out = text;
+    let masked = 0;
+    for (const field of candidates) {
+      if (field === root) continue;      // already handled above
+      if (!isPasswordField(field)) continue;
+      const own = typeof field.innerText === 'string'
+        ? field.innerText
+        : (field.textContent || '');
+      const secret = own.trim();
+      // A one- or two-character "secret" is not worth masking every
+      // occurrence of across a whole page.
+      if (secret.length < 3) continue;
+      if (!out.includes(secret)) continue;
+      out = out.split(secret).join('***');
+      masked++;
+    }
+    return { text: out, masked };
   }
 
   // Select option
