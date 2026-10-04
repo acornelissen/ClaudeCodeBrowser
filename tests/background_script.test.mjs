@@ -82,13 +82,17 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   const createdWindows = [];
   const removedWindows = [];
   let windowCreateFails = false;
+  const nativeMessages = [];
+  const menuListeners = [];
 
   const browserStub = {
     runtime: {
       connectNative: () => ({
         onMessage: { addListener() {} },
         onDisconnect: { addListener() {} },
-        postMessage() {}
+        // Recorded, not swallowed: what the extension says to the native
+        // host is the whole of what a context-menu item does.
+        postMessage(message) { nativeMessages.push(message); }
       }),
       onMessage: { addListener: (fn) => messageListeners.push(fn) },
       onMessageExternal: { addListener: (fn) => externalListeners.push(fn) },
@@ -148,7 +152,14 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     webRequest,
     webNavigation: { onCommitted: webNavigationOnCommitted },
     notifications: { create: async () => 'id' },
-    contextMenus: { create() {}, onClicked: { addListener() {} } }
+    contextMenus: {
+      create() {},
+      // The listener was discarded, so neither menu item was reachable from
+      // a test - which is how "Take Screenshot for Claude" could post an
+      // action the native host has no handler for, and do nothing at all,
+      // for its entire life.
+      onClicked: { addListener: (fn) => menuListeners.push(fn) }
+    }
   };
 
   const sandbox = {
@@ -186,6 +197,15 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     markPrivate: (id) => privateTabs.add(id),
     failTabGet: () => { tabGetRejects = true; },
     setTabUrl: (url) => { tabUrl = url; },
+    nativeMessages,
+    clickMenuItem: async (menuItemId, info = {}) => {
+      for (const fn of menuListeners) {
+        await fn({ menuItemId, ...info }, { id: 7, url: 'http://stub.test/',
+                                            title: 'stub' });
+      }
+      // The handlers are fire-and-forget, so let their promises settle.
+      await new Promise(resolve => setTimeout(resolve, 0));
+    },
     extensionSender: { id: 'ccb@stub' },
     contentScriptSender: { id: 'ccb@stub', tab: { id: 7 } },
   };
@@ -1523,6 +1543,35 @@ test('a file upload names the file instead of logging an empty body', async () =
 
   const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
   assert.match(String(entry.requestBody), /tax-return\.pdf/);
+});
+
+test('the screenshot menu item posts an action the native host handles', async () => {
+  // It posted "screenshotTaken", for which the host has no handler, so the
+  // message fell through to the /browser/command endpoint and the menu item
+  // did nothing at all. The host's only screenshot handler is
+  // "saveScreenshot" - see handle_local_command in
+  // native-host/claudecodebrowser_host.py.
+  const ctx = loadBackground();
+
+  await ctx.clickMenuItem('claude-screenshot');
+
+  const posted = ctx.nativeMessages.filter(m => m && m.action);
+  assert.equal(posted.length, 1, 'the menu item must say something');
+  assert.equal(posted[0].action, 'saveScreenshot',
+    `the host has no handler for "${posted[0].action}"`);
+  assert.ok(posted[0].data, 'it must carry the image');
+});
+
+test('the screenshot menu item declines a private window', async () => {
+  // The native host writes this file itself, so the server's refusal to
+  // persist a private-window screenshot does not cover this path.
+  const ctx = loadBackground();
+  ctx.markPrivate(7);
+
+  await ctx.clickMenuItem('claude-screenshot');
+
+  assert.deepEqual(ctx.nativeMessages.filter(m => m && m.action), [],
+    'a private window must not be written to disk');
 });
 
 test('a click that navigates reports the page it landed on', async () => {
