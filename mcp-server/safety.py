@@ -120,6 +120,28 @@ def _clean_url_text(url: str) -> str:
         '\\', '/')
 
 
+def _strip_userinfo_text(url: str) -> str:
+    """Drop 'user:pass@' from a URL that cannot be parsed.
+
+    The authority is what follows '//' up to the next '/', '?' or '#'. Only
+    the authority's own last '@' counts: an '@' in the path or query is
+    ordinary data.
+    """
+    marker = url.find('//')
+    if marker < 0:
+        return url
+    start = marker + 2
+    end = len(url)
+    for ch in '/?#':
+        found = url.find(ch, start)
+        if found >= 0:
+            end = min(end, found)
+    authority = url[start:end]
+    if '@' not in authority:
+        return url
+    return url[:start] + authority.rpartition('@')[2] + url[end:]
+
+
 def _normalise_url(url: str) -> str:
     """Return the URL the browser would load, for matching purposes.
 
@@ -137,45 +159,80 @@ def _normalise_url(url: str) -> str:
     guard matched the text as written and saw neither a protected domain nor
     a blocklist hit.
 
-    Userinfo is dropped too. That is not a normalisation the browser performs
-    - it sends the credentials - but ':' is both this guard's delimiter and
-    the userinfo password separator, so 'https://localhost:3000@evil.com/'
-    satisfied a permit pattern anchored on 'https://localhost' while loading
-    evil.com. Only this copy is rewritten; the URL handed to the browser is
-    the one the caller sent.
+    Userinfo is dropped too, on every exit from this function. That is not a
+    normalisation the browser performs - it sends the credentials - but ':' is
+    both this guard's delimiter and the userinfo password separator, so
+    'https://localhost:3000@evil.com/' satisfied a permit pattern anchored on
+    'https://localhost' while loading evil.com. "On every exit" is the part
+    that was wrong: the drop used to happen only after the host checks
+    passed, and an IPv6 literal never reached it, so the fix covered domains
+    and not addresses. Only this copy is rewritten; the URL handed to the
+    browser is the one the caller sent.
     """
     if not isinstance(url, str):
         return url
     cleaned = _clean_url_text(url)
     try:
         parts = urlsplit(cleaned)
+    except ValueError:
+        # Not a URL the browser will load either, so the host is not ours to
+        # rewrite - but the userinfo still goes. urlsplit raises on, among
+        # other things, a bracketed host that is not an address, and that
+        # exception used to carry 'user:pass@' out of the function with it.
+        # Done on the text, since there is nothing parsed to work from.
+        return _strip_userinfo_text(cleaned)
+
+    # Separate from the split, because .hostname does its own parsing and
+    # raises on things urlsplit accepted - and that exception used to carry
+    # the userinfo out with it.
+    try:
         host = parts.hostname
     except ValueError:
-        # Not a URL the browser will load either. Leave the text as it came
-        # so the scheme guard and the blocklist still see the original.
-        return cleaned
+        host = None
     if not host:
-        # about:blank, or a string with no authority at all.
-        return cleaned
+        # about:blank or no authority at all, in which case there is nowhere
+        # for userinfo to hide; or a host .hostname could not parse, in which
+        # case it is not ours to rewrite but the userinfo still goes.
+        if '@' not in parts.netloc:
+            return cleaned
+        return urlunsplit((parts.scheme, parts.netloc.rpartition('@')[2],
+                           parts.path, parts.query, parts.fragment))
+    # Everything up to and including the last '@' is userinfo. Taken FIRST,
+    # and used on every exit below: this used to be computed after the host
+    # checks, so any URL whose host could not be normalised kept its
+    # userinfo - and an IPv6 literal always took that exit, because urlsplit
+    # strips the brackets and the bare address therefore contains ':', which
+    # is in _FORBIDDEN_HOST_CHARS. So the whole userinfo fix applied to
+    # domains and not to IPv6 targets:
+    # 'https://localhost:3000@[2606:4700::1]/steal' satisfied a permit
+    # pattern anchored on 'https://localhost' while loading 2606:4700::1.
+    # The port text is kept verbatim because parts.port raises on a port that
+    # is not a number, and a URL the browser rejects is not ours to rewrite.
+    hostport = parts.netloc.rpartition('@')[2]
+    is_ipv6 = hostport.startswith('[')
+
+    def rebuilt(authority):
+        return urlunsplit((parts.scheme, authority, parts.path, parts.query,
+                           parts.fragment))
+
     host = unquote(host).rstrip('.').lower()
-    if not host or _FORBIDDEN_HOST_CHARS.intersection(host):
-        return cleaned
-    if ':' in host:
+    # ':' is legal inside an IPv6 literal and forbidden everywhere else.
+    forbidden = (_FORBIDDEN_HOST_CHARS - {':'}) if is_ipv6 \
+        else _FORBIDDEN_HOST_CHARS
+    if not host or forbidden.intersection(host):
+        # The host is not ours to rewrite, but the userinfo still goes.
+        return rebuilt(hostport)
+    if is_ipv6:
         # urlsplit strips the brackets off an IPv6 literal; put them back or
         # the colon reads as a port separator.
         host = f'[{host}]'
-    # Everything up to and including the last '@' is userinfo. The port text
-    # is kept verbatim because parts.port raises on a port that is not a
-    # number, and a URL the browser rejects is not ours to rewrite.
-    hostport = parts.netloc.rpartition('@')[2]
-    if hostport.startswith('['):
+    if is_ipv6:
         tail = hostport.partition(']')[2]
         port = tail if tail.startswith(':') else ''
     else:
         _, found, tail = hostport.rpartition(':')
         port = f':{tail}' if found else ''
-    return urlunsplit((parts.scheme, host + port, parts.path, parts.query,
-                       parts.fragment))
+    return rebuilt(host + port)
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {

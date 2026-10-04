@@ -239,19 +239,33 @@ class UrlPolicyTests(unittest.TestCase):
     def test_userinfo_does_not_satisfy_a_permit_pattern(self):
         """':' is this guard's delimiter and also the userinfo password
         separator, so the match stopped at the ':' and never looked at the
-        authority: https://localhost:3000@evil.com/ loads evil.com."""
-        hostile = 'https://localhost:3000@evil.com/steal'
-        g = guard(allowed_url_patterns=[r'^https://localhost'])
-        denial = g.check('browser_navigate', {'url': hostile})
-        self.assertIsNotNone(denial, 'this URL loads evil.com')
-        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+        authority: https://localhost:3000@evil.com/ loads evil.com.
 
-        t = guard(unlisted_domains='confirm',
-                  trusted_url_patterns=[r'^https://localhost'])
-        t.note_url({'url': hostile})
-        denial = t.check('browser_click', {'selector': '#x'})
-        self.assertIsNotNone(denial, 'evil.com is not trusted')
-        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+        The IPv6 cases are the ones the first fix missed. urlsplit hands back
+        an IPv6 literal without its brackets, so the host always holds ':',
+        the forbidden-host test rejected it and _normalise_url returned the
+        URL untouched - taking the userinfo drop down with it.
+        """
+        hostile_urls = (
+            'https://localhost:3000@evil.com/steal',
+            'https://localhost:3000@[2606:4700::1]/steal',
+            'https://localhost:3000@[2606:4700::1]:8443/steal',
+            'https://localhost:3000@[::ffff:93.184.216.34]/steal',
+        )
+        for hostile in hostile_urls:
+            with self.subTest(url=hostile):
+                g = guard(allowed_url_patterns=[r'^https://localhost'])
+                denial = g.check('browser_navigate', {'url': hostile})
+                self.assertIsNotNone(denial, 'this URL loads another host')
+                self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
+                t = guard(unlisted_domains='confirm',
+                          trusted_url_patterns=[r'^https://localhost'])
+                t.note_url({'url': hostile})
+                denial = t.check('browser_click', {'selector': '#x'})
+                self.assertIsNotNone(denial, 'the real host is not trusted')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
 
     def test_an_encoded_host_does_not_evade_the_blocklist(self):
         """The browser percent-decodes the host, so chase%2Ecom loads
@@ -341,6 +355,38 @@ class ProtectedDomainNormalisationTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertIsNone(guard().check('browser_navigate',
                                                 {'url': url}))
+                # The IPv6 case passed even while normalisation bailed out of
+                # it entirely, which is how it hid the userinfo hole. Pin the
+                # rewrite, not just the decision.
+                self.assertEqual(safety._normalise_url(url), url)
+
+    def test_userinfo_is_dropped_from_an_ipv6_target(self):
+        """The one rewrite that must not depend on the host being
+        normalisable. An IPv6 literal is not, and the early exit handed the
+        URL back with 'localhost:3000@' still on the front of it."""
+        cases = {
+            'https://localhost:3000@[::1]:9/admin': 'https://[::1]:9/admin',
+            'https://alice:pw@[2606:4700::1]/x': 'https://[2606:4700::1]/x',
+            'https://localhost@[::ffff:93.184.216.34]/x':
+                'https://[::ffff:93.184.216.34]/x',
+            'https://a:b@[2606:4700::1]:8443/x?q=1#f':
+                'https://[2606:4700::1]:8443/x?q=1#f',
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(safety._normalise_url(url), expected)
+
+    def test_userinfo_is_dropped_even_from_a_host_we_cannot_normalise(self):
+        """A host still holding a forbidden character once decoded is a URL
+        the browser refuses, so there is nothing to normalise it towards - but
+        handing the text back left the userinfo in place, and that is what a
+        permit pattern reads."""
+        self.assertEqual(
+            safety._normalise_url('https://localhost:3000@ev%2Fil.com/x'),
+            'https://ev%2Fil.com/x')
+        self.assertEqual(
+            safety._normalise_url('https://localhost:3000@[not:an:address%2F]/x'),
+            'https://[not:an:address%2F]/x')
 
 
 class ToolClassificationTests(unittest.TestCase):
