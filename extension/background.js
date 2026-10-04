@@ -1609,7 +1609,7 @@ async function sendToContentScript(tabId, message, { allFrames = false } = {}) {
     const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
     const options = allFrames ? undefined : { frameId: 0 };
     const result = await browser.tabs.sendMessage(tab.id, message, options);
-    return contentScriptResult(result, message.action);
+    return await contentScriptResult(result, message.action, tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1623,7 +1623,7 @@ async function sendToContentScript(tabId, message, { allFrames = false } = {}) {
 // rejects instead, which is already handled; this is the receiver that is
 // there but silent, which includes every action the content script's handler
 // map does not cover.
-function contentScriptResult(result, action) {
+async function contentScriptResult(result, action, tabId) {
   if (result === undefined || result === null) {
     return {
       success: false,
@@ -1631,7 +1631,20 @@ function contentScriptResult(result, action) {
              `handle that action, or the page may have navigated away.`
     };
   }
-  return { success: true, ...result };
+  // Re-read the tab's URL after the action. A click or an Enter keypress can
+  // navigate, and the server's safety guard tracks the current page from tool
+  // results - with no url in a click result it went on judging the next
+  // action against the PREVIOUS page, so a click that landed on a bank left
+  // protected-domain confirmation, the blocklist and the allowlist all
+  // looking at the wrong URL. A result that reports its own url keeps it.
+  let url;
+  try {
+    if (tabId !== undefined) url = (await browser.tabs.get(tabId)).url;
+  } catch (e) {
+    // Tab closed between the action and this read; the caller still gets its
+    // result, and the guard is no worse off than before.
+  }
+  return url ? { success: true, url, ...result } : { success: true, ...result };
 }
 
 // Click functionality
@@ -1644,7 +1657,7 @@ async function performClick(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "click");
+    return await contentScriptResult(result, "click", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1660,7 +1673,7 @@ async function performType(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "type");
+    return await contentScriptResult(result, "type", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1676,7 +1689,7 @@ async function performScroll(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "scroll");
+    return await contentScriptResult(result, "scroll", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1750,7 +1763,7 @@ async function getElements(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "getElements");
+    return await contentScriptResult(result, "getElements", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1781,7 +1794,7 @@ async function highlightElement(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "highlight");
+    return await contentScriptResult(result, "highlight", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1797,7 +1810,7 @@ async function waitForElement(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return contentScriptResult(result, "waitForElement");
+    return await contentScriptResult(result, "waitForElement", tab.id);
   } catch (error) {
     return { success: false, error: error.message };
   }

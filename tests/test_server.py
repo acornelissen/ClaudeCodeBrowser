@@ -495,6 +495,43 @@ class ScreenshotSaveFlagTests(unittest.TestCase):
         self._save({'save_to_file': False})
         self.assertFalse(self.path.exists())
 
+    def test_a_private_window_screenshot_is_not_written_to_disk(self):
+        """The image still goes to the agent, but a copy kept for the
+        retention window is the longer-lived record private windows exist to
+        prevent - and startLogging already refuses a private tab."""
+        result = {'success': True, 'data': self.PNG, 'privateWindow': True,
+                  'tab': {'id': 1, 'url': 'https://example.com/x', 'title': 'x'}}
+        out = self.handler._save_screenshot(
+            result, {'filename': self.name})
+
+        self.assertFalse(self.path.exists(),
+                         'a private window was recorded on disk')
+        self.assertEqual(out['saved'], False)
+        self.assertIn('private', out['note'].lower())
+        self.assertEqual(out['data'], self.PNG,
+                         'the caller still gets the image it asked for')
+
+    def test_an_ordinary_window_screenshot_is_written(self):
+        self.handler._save_screenshot(
+            {'success': True, 'data': self.PNG, 'tab': {'id': 1}},
+            {'filename': self.name})
+        self.assertTrue(self.path.exists())
+
+    def test_a_filename_of_only_directory_components_is_replaced(self):
+        """Path('..').name is '..', so this resolved to the parent directory
+        and O_NOFOLLOW|O_CREAT failed with EISDIR - reported as an unrelated
+        error."""
+        for hostile in ('..', '.', '/', '../'):
+            with self.subTest(filename=hostile):
+                out = self.handler._save_screenshot(
+                    {'success': True, 'data': self.PNG, 'tab': {}},
+                    {'filename': hostile})
+                self.assertTrue(out.get('success'), out.get('error'))
+                written = Path(out['filepath'])
+                self.addCleanup(lambda p=written: p.unlink(missing_ok=True))
+                self.assertEqual(written.parent, server.SCREENSHOTS_DIR)
+                self.assertTrue(written.is_file())
+
     def test_the_default_still_saves(self):
         out = self._save({})
         self.assertTrue(self.path.exists(), 'the documented default is to save')

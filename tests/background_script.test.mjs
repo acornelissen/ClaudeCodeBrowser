@@ -1366,6 +1366,35 @@ test('a single screenshot says when it came from a private window', async () => 
   assert.equal(result.privateWindow, true);
 });
 
+test('a click that navigates reports the page it landed on', async () => {
+  // The server's safety guard tracks the current page from tool results, and
+  // a click result carried no url - so after a click that navigated, the
+  // blocklist, the allowlist and protected-domain confirmation were all
+  // still judging the previous page.
+  const ctx = loadBackground();
+  let url = 'http://before.test/';
+  ctx.context.browser.tabs.get = async (id) => ({ id, url, title: 't' });
+  ctx.context.browser.tabs.sendMessage = async () => {
+    url = 'https://chase.com/transfer';   // the click navigated
+    return { clicked: true };
+  };
+
+  const result = await ctx.command('click', { selector: '#go' }, 7);
+
+  assert.equal(result.url, 'https://chase.com/transfer');
+});
+
+test('a result that reports its own url keeps it', async () => {
+  const ctx = loadBackground({
+    contentScriptReply: { url: 'http://from-the-page.test/' }
+  });
+  ctx.context.browser.tabs.get = async (id) => ({ id, url: 'http://tab.test/' });
+
+  const result = await ctx.command('getPageInfo', {}, 7);
+
+  assert.equal(result.url, 'http://from-the-page.test/');
+});
+
 test('a content script that answers nothing is not reported as success', async () => {
   // A receiver that exists but returns neither true nor a Promise resolves
   // the sender's promise with undefined, and `{success: true, ...undefined}`

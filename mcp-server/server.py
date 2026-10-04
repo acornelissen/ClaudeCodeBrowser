@@ -346,6 +346,8 @@ MCP_TOOLS: List[MCPTool] = [
                 "amount": {"type": "integer", "description": "Scroll amount in pixels.", "default": 300},
                 "selector": {"type": "string", "description": "CSS selector for scrollable element."},
                 "to_element": {"type": "string", "description": "CSS selector of element to scroll into view."},
+                "x": {"type": "integer", "description": "Absolute horizontal scroll position. Both backends accept it; it was reachable only by bypassing this schema."},
+                "y": {"type": "integer", "description": "Absolute vertical scroll position."},
                 "tab_id": {"type": "integer", "description": "Optional tab ID."}
             }
         }
@@ -1723,11 +1725,31 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             # bool("false") is True, so a caller that explicitly declined
             # still had the PNG written to disk.
             save_to_file = parse_flag(arguments.get('save_to_file'), True)
-            # Strip directory components to prevent path traversal
-            filename = Path(arguments.get('filename') or f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png').name
+            generated = f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+            # Strip directory components to prevent path traversal. Path('..')
+            # .name is '..' and Path('.').name is '', so a filename of only
+            # directory components survived this and resolved to the parent
+            # directory - O_NOFOLLOW|O_CREAT then failed with EISDIR, reported
+            # as an unrelated error.
+            filename = Path(arguments.get('filename') or generated).name
+            if filename in ('', '.', '..'):
+                filename = generated
 
             if not save_to_file:
                 return result
+
+            # A screenshot of a private window is not written to disk. The
+            # image still goes to the agent, which is what the caller asked
+            # for, but keeping a copy for a week is the longer-lived record
+            # that private windows exist to prevent - and startLogging
+            # already refuses a private tab for the same reason.
+            if result.get('privateWindow') is True:
+                return {
+                    **result,
+                    'saved': False,
+                    'note': 'Not written to disk: this is a private-browsing '
+                            'window. The image is in this response only.'
+                }
 
             # Handle base64 data URL
             if data.startswith('data:image'):
