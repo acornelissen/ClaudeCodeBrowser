@@ -900,6 +900,24 @@ test('a credential field past the 50th editable element is still masked', async 
   assert.equal(result.maskedFields, 1);
 });
 
+test('a not-found error names the locator, never the text being typed', async () => {
+  // These errors embedded JSON.stringify(options), and `text` is the value
+  // being TYPED - so a failed browser_type put the password into the error,
+  // which the agent printed and kept in its action history. The client-side
+  // scrub catches it now too, but not building the string that way is the
+  // better fix: the value is never part of the locator.
+  const ctx = loadContentScript({});
+
+  const result = await ctx.send({ action: 'type', name: 'password',
+                                  text: 'hunter2-correct-horse' });
+
+  assert.equal(result.success, false);
+  assert.ok(!result.error.includes('hunter2-correct-horse'),
+            `the typed value is in the error: ${result.error}`);
+  assert.match(result.error, /name="password"/,
+               'the locator must still be named, or the error is useless');
+});
+
 test('a textarea holding a credential is masked in whole-page text', async () => {
   // The comment claimed "an <input> contributes nothing to innerText", which
   // is true, and then relied on that for every form control. A <textarea>'s

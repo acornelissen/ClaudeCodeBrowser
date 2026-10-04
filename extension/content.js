@@ -385,6 +385,28 @@
       String(name == null ? '' : name).replace(/([a-z0-9])([A-Z])/g, '$1_$2'));
   }
 
+  // The locator an element was looked up by, safe to put in an error.
+  // These errors used to embed JSON.stringify(options), which carries the
+  // TEXT being typed - so a failed browser_type printed the password into the
+  // agent's log and kept it in the action history. The value is never part of
+  // the locator, so naming only the locator loses nothing.
+  function describeLocator(options) {
+    const parts = [];
+    for (const key of ['selector', 'xpath', 'name', 'id', 'placeholder',
+                       'role', 'ariaLabel', 'aria_label', 'tag', 'index']) {
+      if (options && options[key] !== undefined && options[key] !== null
+          && options[key] !== '') {
+        parts.push(`${key}=${JSON.stringify(options[key])}`);
+      }
+    }
+    if (options && options.text !== undefined) {
+      // Matching BY text is a locator, so say the length rather than nothing -
+      // but never the text itself, since the same key carries typed input.
+      parts.push(`text=<${String(options.text).length} chars>`);
+    }
+    return parts.length ? parts.join(', ') : 'no locator given';
+  }
+
   function attributeOf(element, name) {
     if (!element || typeof element.getAttribute !== 'function') return null;
     return element.getAttribute(name);
@@ -808,7 +830,7 @@
     const element = findElement(options);
 
     if (!element) {
-      throw new Error(`Element not found with options: ${JSON.stringify(options)}`);
+      throw new Error(`Element not found with options: ${describeLocator(options)}`);
     }
 
     let defaultPrevented = null;
@@ -896,7 +918,7 @@
     }
 
     if (!element) {
-      throw new Error(`Element not found with options: ${JSON.stringify(options)}`);
+      throw new Error(`Element not found with options: ${describeLocator(options)}`);
     }
 
     assertNotPasswordField(element, options);
