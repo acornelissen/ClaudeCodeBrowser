@@ -281,6 +281,18 @@ Mozilla without a public listing:
 4. Install the signed `.xpi` in Firefox: `about:addons` → gear →
    *Install Add-on From File*.
 
+> **Second and later versions may need the Developer Hub.** `web-ext sign`
+> creates a new add-on happily, but adding a *version* to an existing unlisted
+> add-on requires addressing it by GUID — and AMO answers 404 for every
+> GUID-addressed path on an unlisted add-on, on both the submission API
+> (`POST /addons/addon/{guid}/versions/`) and the signing API
+> (`PUT /addons/{guid}/versions/{version}/`). web-ext then fails late with
+> `Getting details failed: Not Found`, after the upload has already validated
+> cleanly. If that happens, upload the `.xpi` through
+> <https://addons.mozilla.org/developers/> instead; the most likely cause is
+> an add-on left in an incomplete state, which the Developer Hub will show and
+> let you finish.
+>
 > **Extension ID.** The manifest uses `claudecodebrowser@ligandal.com`, the
 > upstream author's ID. AMO will reject a submission under an ID registered
 > to a different account, so if you are signing from a fork you may need your
