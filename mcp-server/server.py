@@ -200,6 +200,13 @@ class MCPTool:
     input_schema: Dict[str, Any]
 
 
+# Tools implemented only by the Playwright backend. In attended Firefox they
+# return "Unknown action", which is a confusing way to learn a tool does not
+# apply; browser_safety_status reports this list.
+HEADLESS_ONLY_TOOLS = {
+    'browser_eval_chain', 'browser_wait_and_act', 'browser_inject_observer',
+}
+
 # Define available MCP tools
 MCP_TOOLS: List[MCPTool] = [
     MCPTool(
@@ -381,7 +388,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_screenshot_all_tabs",
-        description="Take screenshots of all open tabs (or filtered by URL pattern). Cycles through tabs and restores original focus.",
+        description="Activates and photographs EVERY tab in EVERY window in turn (unless filtered by URL pattern), so it reaches tabs you were never pointed at. Treated as a state-changing action: blocked in read-only mode and subject to protected-site confirmation. Restores the original focus afterwards.",
         input_schema={
             "type": "object",
             "properties": {
@@ -543,6 +550,7 @@ MCP_TOOLS: List[MCPTool] = [
             "properties": {
                 "timeout": {"type": "integer", "description": "Max time to wait in ms.", "default": 10000},
                 "idle_time": {"type": "integer", "description": "How long network must be idle (ms).", "default": 500},
+                "persistent_after": {"type": "integer", "description": "A request still open after this many ms counts as a persistent channel (WebSocket, SSE, long-poll) and stops blocking idle. Without it, any page holding a live socket is never idle.", "default": 10000},
                 "tab_id": {"type": "integer", "description": "Optional tab ID."}
             }
         }
@@ -672,7 +680,9 @@ MCP_TOOLS: List[MCPTool] = [
             "Execute a sequence of JavaScript expressions in the page, sharing state between steps. "
             "Each step can inspect the result of the previous one and branch conditionally. "
             "Console output (console.log/warn/error) is captured per step. "
-            "Ideal for multi-turn inspection tasks without round-tripping per expression."
+            "Ideal for multi-turn inspection tasks without round-tripping per expression. "
+            "HEADLESS MODE ONLY: the Firefox extension does not implement this; "
+            "in attended mode it returns \"Unknown action\". Check browser_safety_status."
         ),
         input_schema={
             "type": "object",
@@ -700,7 +710,9 @@ MCP_TOOLS: List[MCPTool] = [
         name="browser_wait_and_act",
         description=(
             "Poll the page until a condition is met, then execute an action. "
-            "Use for waiting on async UI state (e.g. 'wait until #result is visible, then click it')."
+            "Use for waiting on async UI state (e.g. 'wait until #result is visible, then click it'). "
+            "HEADLESS MODE ONLY: the Firefox extension does not implement this; "
+            "in attended mode it returns \"Unknown action\". Check browser_safety_status."
         ),
         input_schema={
             "type": "object",
@@ -835,7 +847,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_audit_page",
-        description="Audit the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. One call gathers everything needed to critique a page's structure and accessibility basics.",
+        description="Runs a fixed read-only inspection script, so JavaScript executes even when allow_script_execution is false; do not use it if you need no JS to run in your pages. Audits the current page for review and visual critique: heading structure, images missing alt text, unlabeled form inputs, empty links/buttons, meta/title info, viewport and element counts — plus a screenshot. One call gathers everything needed to critique a page's structure and accessibility basics.",
         input_schema={
             "type": "object",
             "properties": {
@@ -848,7 +860,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Safety
     MCPTool(
         name="browser_safety_status",
-        description="Show the active safety guard policy: read-only mode, script toggle, protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
+        description="Show the active safety guard policy and which mode you are in (attended Firefox or headless Playwright), including which tools are headless-only. Call this first if a tool returns 'Unknown action'. Policy: read-only mode, script toggle, protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
         input_schema={
             "type": "object",
             "properties": {}
@@ -858,7 +870,9 @@ MCP_TOOLS: List[MCPTool] = [
         name="browser_inject_observer",
         description=(
             "Inject a MutationObserver into the page that captures DOM changes and console events "
-            "into a buffer, readable via browser_get_console_logs. Useful for watching live UI updates."
+            "into a buffer, readable via browser_get_console_logs. Useful for watching live UI updates. "
+            "HEADLESS MODE ONLY: the Firefox extension does not implement this; "
+            "in attended mode it returns \"Unknown action\". Check browser_safety_status."
         ),
         input_schema={
             "type": "object",
@@ -986,7 +1000,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.5.1',
+                'version': '1.6.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -1151,7 +1165,13 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
         # Handled entirely server-side, no browser round-trip needed.
         if tool_name == 'browser_safety_status':
-            return guard.status()
+            status = guard.status()
+            # Several tools exist in only one mode, and the agent had no way to
+            # find out which it was in except by calling one and failing.
+            status['mode'] = 'headless' if HEADLESS_MODE else 'attended'
+            status['headless_only_tools'] = sorted(HEADLESS_ONLY_TOOLS)
+            status['browsers_connected'] = len(connection_manager.browser_connections)
+            return status
         if tool_name == 'browser_run_workflow':
             return self._run_workflow(arguments)
         if tool_name == 'browser_audit_page':
@@ -1712,7 +1732,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|          ClaudeCodeBrowserX MCP Server v1.5.1                |
+|          ClaudeCodeBrowserX MCP Server v1.6.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |

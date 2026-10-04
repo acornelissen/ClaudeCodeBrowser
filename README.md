@@ -1,7 +1,7 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.5.1-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
+[![Version](https://img.shields.io/badge/version-1.6.0-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -20,9 +20,9 @@ messaging host and install directory keep the `claudecodebrowser` name.
 
 This repository is a **fork** maintained by Albert Cornelissen
 ([@acornelissen](https://github.com/acornelissen)). All of the original design
-and implementation is Andre's work; the fork adds the changes listed under
-[1.5.0 in the changelog](CHANGELOG.md) and is distributed under the same MIT
-license, with the original copyright retained.
+and implementation is Andre's work; the fork's changes are listed from 1.5.0
+onwards in [the changelog](CHANGELOG.md), and it is distributed under the same
+MIT license with the original copyright retained.
 
 ## Features
 
@@ -102,9 +102,13 @@ flowchart TB
 The native messaging host (`claudecodebrowser_host.py`) provides an alternative communication path:
 - Used when the browser extension needs to communicate with the local file system
 - Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/`, created `0700` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`)
-- Starts the MCP server when it is not running, and restarts it if it dies. It
-  only ever terminates its own server: if something else holds port 8765 it
-  reports a failure and leaves that process alone
+- Starts the MCP server when it is not running, and restarts it if it dies.
+  Before trusting whatever is on port 8765 it requires proof that the listener
+  holds the shared API token, so a process that squats the port cannot receive
+  the token or issue browser commands. It only ever terminates a Python
+  process whose script argument is our own server, re-checked immediately
+  before each signal; anything else holding the port is left alone and
+  reported as a failure
 
 ## Installation
 
@@ -112,9 +116,13 @@ The native messaging host (`claudecodebrowser_host.py`) provides an alternative 
 
 **System Python websockets** (required for WebSocket server on port 8766):
 ```bash
-sudo apt install python3-websockets   # Linux
-pip3 install websockets              # macOS
+sudo apt install python3-websockets      # Linux
+python3 -m pip install websockets        # macOS
 ```
+
+Use `python3 -m pip`, not `pip3`: on a machine with both mise and Homebrew
+Pythons they can be different interpreters, and the server only sees the one
+`python3` resolves to.
 
 Without this, the server runs in HTTP-only mode and `browsers_connected` will always show 0. Everything else still works over HTTP.
 
@@ -589,6 +597,17 @@ browser-agent --start-logging
 # Get console logs (errors, warnings, debug output)
 browser-agent --get-console-logs
 
+> **Logs on disk.** `~/.claudecodebrowser/logs/` holds `mcp_server.log`,
+> `native_host.log` and the guard's `audit.jsonl`. All three are created `0600`
+> in a `0700` directory and rotate at 5 MB. The server and native host log at
+> INFO and record the shape of a command, not its payload — raise them with
+> `CLAUDE_BROWSER_DEBUG=1` / `CLAUDE_BROWSER_HOST_DEBUG=1` when you need the
+> detail, and remember that detail includes page content. Sensitive argument
+> values (`text`, `script`, `value`, `password`, `steps`, `action_script`,
+> `condition`, `url`) are masked in both the application log and the audit log.
+> `audit.jsonl` still records which URLs were visited, which is the point of
+> an audit log and also a browsing history.
+
 > **How network capture works.** Requests are recorded in the extension's
 > background script through Firefox's `webRequest` API, not by replacing the
 > page's `fetch`/`XHR`. That means `fetch` is captured (Firefox's content-script
@@ -599,8 +618,12 @@ browser-agent --get-console-logs
 > attached at all. Credential-bearing headers (`Authorization`, `Cookie`,
 > `Set-Cookie`, `X-API-Key`, …) are reported as `***`. Response bodies are
 > collected for textual content types up to 5000 characters, and can be
-> switched off with `capture_bodies: false`. By default only API-shaped traffic
-> is logged — pass `include_all_types: true` for images, fonts and stylesheets.
+> switched off with `capture_bodies: false`, which suppresses request **and**
+> response bodies. Bodies are additionally run through a credential-key
+> scrubber, because redacting an `Authorization` header is worth little if the
+> body that minted the token is kept verbatim. By default only API-shaped
+> traffic is logged — pass `include_all_types: true` for images, fonts and
+> stylesheets, which also attaches a response filter to documents and scripts.
 > Console capture stays in the content script, since console output only exists
 > inside the page.
 
@@ -920,7 +943,11 @@ the `browser_safety_status` tool.
 | **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
 | **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
 | **Password fields (writing)** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
-| **Password fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. Reading a credential hands it to the AI just as surely as typing one does. The same `allow_password_typing` setting lifts it. Note that `browser_execute_script` can still read any field — see below. |
+| **Credential fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. One function decides this for every read path. "Credential" covers `type=password`, `autocomplete` of `current-password`/`new-password`/`one-time-code`/`cc-*` (matched case-insensitively across the token list), and `type=hidden` — hidden inputs carry CSRF and session tokens. The same `allow_password_typing` setting lifts it. `browser_execute_script` can still read any field — see below. |
+| **Human approval** | The Approve/Deny prompt renders in a **closed shadow root** and only acts on trusted events, so the page cannot hide it, read it, or click Approve on its own behalf. It is sent to the top frame of the tab being acted on. If it cannot be shown or is not answered, the action is **refused** rather than falling back to a token the agent could satisfy itself. |
+| **Confirmation tokens** | A `confirm_token` is bound to a hash of the exact call — tool, arguments and URL — so one earned on a harmless call cannot be spent on a dangerous one. Single-use, 120s. |
+| **Blocklist scope** | `blocked_url_patterns` / `allowed_url_patterns` apply to the page a tool acts on, not only to a navigation argument, so blocking a domain also refuses reads on an already-open tab there. |
+| **Low-risk acts** | `browser_scroll`, `browser_hover`, `browser_highlight` and `browser_focus_tab` change state, so read-only mode blocks them, but they do not raise a protected-site prompt — prompting on every scroll teaches people to click Approve without reading. `browser_screenshot_all_tabs` is **not** observation: it activates and photographs every tab in every window. |
 | **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus an Approve/Deny banner on the current page. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
 | **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
 | **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, and `browser_inject_observer` entirely. |

@@ -14,10 +14,8 @@ from pathlib import Path
 # Point HOME at a throwaway directory before importing the server: it creates
 # its API token, config and screenshot directories under the home directory at
 # import time, and a test run must not touch the real installation.
-_TMP_HOME = tempfile.mkdtemp(prefix='ccb-test-home-')
-os.environ['HOME'] = _TMP_HOME
-os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
-os.environ.pop('CLAUDE_BROWSER_SAFETY_CONFIG', None)
+
+from tests import TEST_HOME  # noqa: F401  (redirects HOME on import)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'mcp-server'))
@@ -33,7 +31,7 @@ class ScreenshotLocationTests(unittest.TestCase):
     def test_default_directory_is_under_the_home_directory(self):
         self.assertEqual(
             server.SCREENSHOTS_DIR,
-            Path(_TMP_HOME) / '.claudecodebrowser' / 'screenshots')
+            Path(TEST_HOME) / '.claudecodebrowser' / 'screenshots')
 
     def test_default_directory_is_not_in_shared_tmp(self):
         self.assertFalse(str(server.SCREENSHOTS_DIR).startswith('/tmp/'))

@@ -15,8 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_TMP_HOME = tempfile.mkdtemp(prefix='ccb-test-home-')
-os.environ['HOME'] = _TMP_HOME
+from tests import TEST_HOME  # noqa: F401  (redirects HOME before the import below)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'native-host'))
 
@@ -33,9 +32,16 @@ class ProcessOwnershipTests(unittest.TestCase):
         host._process_command = lambda pid: command
 
     def test_our_own_server_is_ours_to_kill(self):
-        self._with_command(
-            '/usr/bin/python3 /Users/someone/.claudecodebrowser/mcp-server/server.py')
-        self.assertTrue(host._is_our_server(1234))
+        for command in (
+            '/usr/bin/python3 /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            'python3 /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            'python3.12 /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            '/opt/x/bin/python3 -u /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            'python3 /Users/someone/.claudecodebrowser/mcp-server/server.py --headless',
+        ):
+            with self.subTest(command=command):
+                self._with_command(command)
+                self.assertTrue(host._is_our_server(1234), command)
 
     def test_server_started_from_a_checkout_is_ours_to_kill(self):
         self._with_command('python3 /Users/someone/src/ClaudeCodeBrowser/mcp-server/server.py')
@@ -48,6 +54,15 @@ class ProcessOwnershipTests(unittest.TestCase):
             'docker-proxy -container-port 8765',
             '/opt/homebrew/bin/postgres -D /opt/homebrew/var/postgres',
             'python3 /Users/someone/other-project/server.py',
+            # These hold our path open without being a server. A bare
+            # substring test killed the first three; requiring the marker to
+            # be an argument still killed them, because the path IS their
+            # argument. Only an interpreter running it counts.
+            'vim /Users/someone/src/ClaudeCodeBrowser/mcp-server/server.py',
+            'tail -f /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            'node esbuild.js --watch src mcp-server/server.py',
+            'grep -r pattern mcp-server/server.py',
+            'python3 -m http.server 8765 # mcp-server/server.py',
         ):
             with self.subTest(command=command):
                 self._with_command(command)

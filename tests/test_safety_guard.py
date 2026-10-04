@@ -15,9 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-_TMP_HOME = tempfile.mkdtemp(prefix='ccb-test-home-')
-os.environ['HOME'] = _TMP_HOME
-os.environ.pop('CLAUDE_BROWSER_SAFETY_CONFIG', None)
+
+from tests import TEST_HOME  # noqa: F401  (redirects HOME on import)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'mcp-server'))

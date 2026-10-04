@@ -9,6 +9,126 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.6.0]
+
+A security and correctness release following a six-dimension audit of the
+fork. Several findings were defects in 1.5.x introduced by this fork; the rest
+were inherited and long-standing. **Upgrade is recommended**: 1.5.1 contains a
+response-filter bug that can stall a page's network requests.
+
+### Security
+- **`browser_get_page_info` returned password values in plaintext.** Its
+  `forms[]` branch masked and its `interactiveElements[]` branch did not, and
+  the selector list includes `input` — so a filled, visible password field
+  yielded its first 100 characters to the tool an agent calls first on every
+  page. It is an observation tool, so it worked in read-only mode with no
+  confirmation. One function now decides what any element's value looks like,
+  and every read path goes through it.
+- **The credential definition was too narrow.** `autocomplete` is a
+  case-insensitive token list, so `Current-Password` and
+  `section-login current-password` were not matched; one-time codes, card
+  fields and hidden inputs (CSRF and session tokens) were not covered at all.
+- **The approval prompt could be clicked by the page.** It was a plain button
+  in the page's own DOM at a fixed id, styled inline so a page `!important`
+  rule beat it, with no `isTrusted` check — so a site could hide the prompt
+  and approve its own protected action, and the audit log recorded
+  `allowed_by_human`. It now renders in a closed shadow root and acts only on
+  trusted events. It was also dispatched with the tab id stripped and
+  broadcast to every frame, so a hidden iframe in an unrelated tab could
+  approve an action on a banking tab; it now goes to the top frame of the
+  acting tab. An undeliverable prompt is a refusal, not a fallback to a token
+  the agent can satisfy itself.
+- **The native host trusted whatever answered on port 8765.** Any response
+  containing "ok" was accepted as the MCP server, so a process that bound the
+  port first received the API token on every poll and could return commands
+  that the extension executed with the safety guard never consulted. The
+  server now has to prove it holds the shared token.
+- **`native_host.log` was a cleartext transcript of the session** — DEBUG
+  level, every message in both directions, no redaction, `0644`. Page text,
+  tab URLs, typed text and base64 screenshots all landed there.
+- **`confirm_token` was bound to the tool name only**, so a token earned
+  clicking a harmless element authorised any click on any URL for two minutes.
+  It is now bound to the exact call.
+- **The blocklist confined nothing.** It was checked only against a `url`
+  argument, and no read tool takes one, so blocking a domain stopped
+  navigating there while leaving every read tool free on an already-open tab.
+- Scroll, hover, highlight and focus_tab were classified as observation
+  despite changing state, so read-only mode allowed them.
+  `browser_screenshot_all_tabs` was too, despite activating and photographing
+  every tab in every window.
+- `enabled: false` returned before the scheme guard, so one config key
+  re-enabled `file://` and `javascript:` navigation. The `.gov` pattern missed
+  `irs.gov?x=1`, so a query string disarmed the guard.
+- Headless mode's password guard was bypassed by omitting `selector` and
+  typing into the focused element.
+- The API token was written before `chmod` and an existing loose file was
+  never tightened; `_check_auth` used `==` on a 64-character secret.
+- Request and response bodies in network logs are now run through a
+  credential-key scrubber, and `capture_bodies: false` suppresses request
+  bodies too — it previously only suppressed responses.
+- Tool results carrying page content are labelled as untrusted data. This
+  narrows prompt injection; it does not solve it.
+
+### Fixed
+- **The response-body filter could hang a page.** Firefox keeps a response
+  alive until the extension calls `close()` or `disconnect()`; the only
+  `close()` was in `onstop`, `onerror` returned without releasing, and nothing
+  handled a channel that delivers neither. With `include_all_types` that
+  covers documents and scripts, so it could stall page loads. Every exit path
+  now releases exactly once, with a watchdog.
+- **Response bodies were probably never captured at all**:
+  `filterResponseData` requires its listener registered with `"blocking"`.
+- `wait_for_network_idle` was permanently poisoned for a tab by one timeout,
+  and a WebSocket or long-poll made idle unreachable; requests older than
+  `persistent_after` no longer block it.
+- Redirects overwrote the first hop's entry and could attach two filters to
+  one channel.
+- Every `browser_click` fired twice, so non-idempotent handlers ran twice.
+- The `text` selector was interpolated into an XPath expression unescaped, so
+  a crafted label could redirect the click.
+- `browser_get_tabs` silently ignored `current_window_only`, `url_pattern` and
+  `include_favicon` — `camelize_args` renames them before dispatch.
+- Content-script messages go to the top frame, so an ad or payment iframe can
+  no longer answer `getText` or `getPageInfo` for the page.
+- The stdio wrapper's 30s timeout was shorter than the server's 90s and 200s
+  human waits, so approvals could not complete and a retry ran the action
+  twice.
+- `browser_navigate` reported the requested URL rather than where the tab
+  landed, so a redirect left the guard checking the wrong page.
+- `eval_chain` reported success for a failed chain and leaked a console
+  listener per step; `wait_and_act` could re-fire a side-effecting action up to
+  75 times.
+- The inspect context menu used document coordinates against a viewport API;
+  observer ids collided within a millisecond; `browser_scroll` reported
+  success when its target did not exist; truncated results now say so.
+- Release tooling: the Windows packager had no signed-build guard and would
+  destroy a signed artifact; `publish-release.sh` verified neither the
+  signature nor the version and ignored upload failures; the unsigned zip
+  excluded only nested dotfiles; `updates.json` was written before the
+  artifact existed and can now carry retired extension ids so older installs
+  are not stranded; signing credentials no longer travel in argv.
+- `uninstall.sh` said screenshots were preserved and then deleted them. Added
+  `scripts/uninstall.ps1`, which did not exist.
+
+### Changed
+- Logs default to INFO with rotation at 5 MB, `0600` in a `0700` directory.
+  `CLAUDE_BROWSER_DEBUG=1` and `CLAUDE_BROWSER_HOST_DEBUG=1` restore detail.
+- `browser_safety_status` reports the mode and which tools are headless-only;
+  the three headless-only tools say so in their descriptions.
+- The extension's `author` and `homepage_url` name this fork, since it is
+  signed and distributed from here; the description credits the original
+  author where users see it, in `about:addons`.
+- The agent definition documents the safety model, and no longer carries
+  another project's context or encourages unprompted browser driving.
+
+### Added
+- 131 tests, up from 69: the safety guard's token binding, URL policy, tool
+  classification, rate limiter and audit redaction; the stdio wrapper's
+  untrusted-content fence and timeout ordering; the response filter's
+  release-exactly-once paths; and the registration contract — the background
+  harness previously discarded `addListener`'s `extraInfoSpec`, so stripping
+  every entry kept the suite green while disabling the feature in Firefox.
+
 ## [1.5.1]
 
 ### Changed

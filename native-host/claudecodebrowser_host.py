@@ -26,6 +26,7 @@ import logging
 import os
 import socket
 import time
+import re
 import signal
 import subprocess
 from pathlib import Path
@@ -354,20 +355,46 @@ def _process_identity(pid):
     return line or None
 
 
-def _is_our_server(pid):
-    """True only when the PID is running our own MCP server script.
+# A process is ours only if a Python interpreter is running our script. The
+# marker alone is not enough: as a bare substring it matched
+# "vim .../mcp-server/server.py", and even as an argument it still matches
+# "tail -f .../mcp-server/server.py" - an editor or tail holding that path
+# open is not a server, and killing it would be someone's unsaved work.
+_INTERPRETER_RE = re.compile(r'(^|/)(python|python3|python3\.\d+|pythonw)$')
 
-    The marker must appear as a whitespace-delimited argument, not merely
-    somewhere in the command line: a bare substring test also matched
-    "vim .../mcp-server/server.py" and "tail -f .../mcp-server/server.py".
+
+def _is_our_server(pid):
+    """True only when the PID is a Python interpreter whose *script argument*
+    is our server script.
+
+    Checking every argument was still too loose: "python3 -m http.server
+    8765 # mcp-server/server.py" has the marker in a trailing comment. Only
+    the script Python was actually told to run counts.
     """
     command = _process_command(pid)
     if not command:
         return False
-    for argument in command.split():
-        if any(argument.endswith(marker) for marker in _SERVER_SCRIPT_MARKERS):
-            return True
-    return False
+    parts = command.split()
+    if not parts or not _INTERPRETER_RE.search(parts[0]):
+        return False
+
+    script = None
+    arguments = parts[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in ('-m', '-c'):
+            # Running a module or an inline program, not a script file.
+            return False
+        if argument.startswith('-'):
+            index += 1
+            continue
+        script = argument
+        break
+
+    if script is None:
+        return False
+    return any(script.endswith(marker) for marker in _SERVER_SCRIPT_MARKERS)
 
 
 def _terminate(pid):
