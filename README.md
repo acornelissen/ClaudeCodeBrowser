@@ -1,7 +1,7 @@
 # ClaudeCodeBrowser
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.5.0-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
+[![Version](https://img.shields.io/badge/version-1.5.1-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -9,10 +9,20 @@
 
 A browser automation system for Claude Code that enables AI-powered interaction with web pages — with **built-in safety guards for humans**. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers. Drive your real Firefox through the extension, or run fully headless (Firefox, Chromium, or WebKit) via Playwright.
 
-**Author:** Andre Watson ([@nanogenomic](https://github.com/nanogenomic)) - dre@ligandal.com
-**Organization:** [Ligandal Inc.](https://ligandal.com)
-**License:** MIT
-**Copyright:** 2025 Ligandal Inc.
+The browser extension installs as **ClaudeCodeBrowserX**; the MCP server, native
+messaging host and install directory keep the `claudecodebrowser` name.
+
+## Credits
+
+**Originally created by Andre Watson** ([@nanogenomic](https://github.com/nanogenomic)) — dre@ligandal.com
+**Organization:** [Ligandal Inc.](https://ligandal.com) · <https://github.com/nanogenomic/ClaudeCodeBrowser>
+**License:** MIT · **Copyright:** 2025 Andre Watson (nanogenomic), Ligandal Inc.
+
+This repository is a **fork** maintained by Albert Cornelissen
+([@acornelissen](https://github.com/acornelissen)). All of the original design
+and implementation is Andre's work; the fork adds the changes listed under
+[1.5.0 in the changelog](CHANGELOG.md) and is distributed under the same MIT
+license, with the original copyright retained.
 
 ## Features
 
@@ -24,7 +34,7 @@ A browser automation system for Claude Code that enables AI-powered interaction 
 - **Element Inspection** - Find elements, get page info, highlight elements
 - **JavaScript Execution** - Run arbitrary JS in browser context
 - **Console & Network Logging** - Capture console output and network traffic (fetch, XHR, WebSocket, beacons) for debugging
-- **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, audit log ([details](#safety-guards))
+- **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, credential-field protection, audit log ([details](#safety-guards))
 - **Headless Mode** - Unattended automation via Playwright: Firefox, Chromium, or WebKit
 - **MCP Integration** - Model Context Protocol server for Claude Code
 
@@ -42,7 +52,7 @@ Attended mode drives your real browser with your logged-in sessions. Headless mo
 
 ClaudeCodeBrowser consists of four main components:
 
-1. **Firefox WebExtension** - Runs in the browser to execute automation commands
+1. **Firefox WebExtension** (*ClaudeCodeBrowserX*) - Runs in the browser to execute automation commands
 2. **Native Messaging Host** - Bridge between the extension and local server
 3. **MCP Server** - Model Context Protocol server exposing browser automation tools
 4. **Browser Agent** - Python agent for high-level browser automation
@@ -91,8 +101,10 @@ flowchart TB
 
 The native messaging host (`claudecodebrowser_host.py`) provides an alternative communication path:
 - Used when the browser extension needs to communicate with the local file system
-- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`)
-- Enables clipboard operations and file downloads
+- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/`, created `0700` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`)
+- Starts the MCP server when it is not running, and restarts it if it dies. It
+  only ever terminates its own server: if something else holds port 8765 it
+  reports a failure and leaves that process alone
 
 ## Installation
 
@@ -290,25 +302,26 @@ Mozilla without a public listing:
 > `update_url` points at GitHub, not AMO), but you cannot ship another
 > version under that ID. Leave unwanted add-ons in place instead.
 >
-> **Second and later versions may need the Developer Hub.** `web-ext sign`
-> creates a new add-on happily, but adding a *version* to an existing unlisted
-> add-on requires addressing it by GUID — and AMO answers 404 for every
-> GUID-addressed path on an unlisted add-on, on both the submission API
-> (`POST /addons/addon/{guid}/versions/`) and the signing API
-> (`PUT /addons/{guid}/versions/{version}/`). web-ext then fails late with
-> `Getting details failed: Not Found`, after the upload has already validated
-> cleanly. If that happens, upload the `.xpi` through
-> <https://addons.mozilla.org/developers/> instead; the most likely cause is
-> an add-on left in an incomplete state, which the Developer Hub will show and
-> let you finish.
+> **If signing fails with `Getting details failed: Not Found`.** That is
+> web-ext failing *after* the upload has already validated cleanly, when it
+> tries to attach the new version to the existing add-on. Adding a version
+> addresses the add-on by GUID, and AMO can answer 404 there — on both the
+> submission API (`POST /addons/addon/{guid}/versions/`) and the signing API
+> (`PUT /addons/{guid}/versions/{version}/`). Signing later versions normally
+> works fine, so when this does happen suspect the add-on's state on AMO
+> rather than the tooling: open
+> <https://addons.mozilla.org/developers/>, check whether it is listed as
+> incomplete, and either finish it there or upload the `.xpi` through that
+> page.
 >
-> **Extension ID.** The manifest uses `claudecodebrowser@ligandal.com`, the
-> upstream author's ID. AMO will reject a submission under an ID registered
-> to a different account, so if you are signing from a fork you may need your
-> own — change `browser_specific_settings.gecko.id`, and update
-> `allowed_extensions` in `native-host/claudecodebrowser.json` **and** the
-> generator in `scripts/install.sh` to match, or native messaging will stop
-> working.
+> **Extension ID.** This fork uses a generated GUID, not upstream's
+> `claudecodebrowser@ligandal.com`: AMO rejects a submission under an ID
+> registered to a different account. If you fork this in turn you will need
+> your own ID again — change `browser_specific_settings.gecko.id` and
+> `allowed_extensions` in `native-host/claudecodebrowser.json`. Both
+> installers read the ID from the manifest, so there is nothing else to edit,
+> and `tests/test_extension_identity.py` checks the two agree. Get it wrong
+> and native messaging fails silently.
 
 **Auto-update is already wired** to GitHub Releases. The manifest carries:
 
@@ -471,10 +484,12 @@ agent.click(selector="button.submit")
 # Type text
 agent.type_text("Hello, World!", selector="#search-input")
 
-# Fill a form
+# Fill a form. Note: password fields are refused by default - use the
+# browser's own password manager for credentials, or set
+# "allow_password_typing": true in ~/.claudecodebrowser/safety.json.
 agent.fill_form({
     "username": "myuser",
-    "password": "mypass"
+    "email": "myuser@example.com"
 }, submit=True)
 ```
 
@@ -516,10 +531,13 @@ agent.fill_form({
 #### Tab Management
 | Tool | Description |
 |------|-------------|
-| `browser_get_tabs` | List all open browser tabs |
+| `browser_get_tabs` | List open tabs (current window by default; `current_window_only=false` for all) |
+| `browser_get_tab_info` | Detailed info for one tab, including its page info |
+| `browser_find_tabs` | Find tabs by URL, URL pattern, title, active or audible state |
 | `browser_create_tab` | Create a new tab |
 | `browser_close_tab` | Close a tab by ID |
 | `browser_focus_tab` | Focus/activate a tab by ID |
+| `browser_screenshot_all_tabs` | Cycle through tabs capturing a screenshot of each |
 
 #### Waiting & Synchronization
 | Tool | Description |
@@ -539,8 +557,8 @@ agent.fill_form({
 #### Console & Network Logging
 | Tool | Description |
 |------|-------------|
-| `browser_start_logging` | Start capturing console logs and network requests |
-| `browser_stop_logging` | Stop capturing logs (logs are preserved) |
+| `browser_start_logging` | Start capturing console output and network traffic. `capture_bodies=false` for headers/metadata only; `include_all_types=true` to include images, fonts and stylesheets |
+| `browser_stop_logging` | Stop capturing (logs are preserved; page globals are restored) |
 | `browser_get_console_logs` | Retrieve captured console.log/error/warn/info/debug |
 | `browser_get_network_logs` | Retrieve captured requests and responses (credential headers redacted) |
 | `browser_clear_logs` | Clear all captured logs |
@@ -757,9 +775,13 @@ curl -X POST http://localhost:8765/mcp/call \
 | Path | Description |
 |------|-------------|
 | `~/.claudecodebrowser/` | Main installation directory |
-| `~/.claudecodebrowser/screenshots/` | Saved screenshots |
-| `~/.claudecodebrowser/logs/` | Log files |
-| `~/.mozilla/native-messaging-hosts/` | Firefox native messaging manifests |
+| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`; override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`) |
+| `~/.claudecodebrowser/logs/` | Log files, including the safety guard's `audit.jsonl` |
+| `~/.claudecodebrowser/api_token` | HTTP/WebSocket API token (`0600`, generated on first run) |
+| `~/.claudecodebrowser/safety.json` | Safety guard configuration (written with defaults on first run) |
+| `~/.mozilla/native-messaging-hosts/` | Firefox native messaging manifests (Linux) |
+| `~/Library/Application Support/Mozilla/NativeMessagingHosts/` | Firefox native messaging manifests (macOS) |
+| `mise.local.toml` | Local-only AMO signing credentials (gitignored) |
 
 ## Troubleshooting
 
@@ -786,6 +808,9 @@ curl -X POST http://localhost:8765/mcp/call \
 
 ## Development
 
+Tooling is pinned with [mise](https://mise.jdx.dev) (Python, Node and
+`web-ext`): run `mise install` once.
+
 ### Running in development mode
 
 1. Start the MCP server with debug logging:
@@ -804,6 +829,46 @@ curl -X POST http://localhost:8765/mcp/call \
 - Open Firefox Developer Tools (F12)
 - Go to the Console tab
 - Filter by "ClaudeCodeBrowser"
+
+### Tests
+
+No external test dependencies — `unittest` for the Python side, and Node
+harnesses that evaluate `content.js` and `background.js` against stubbed
+`browser.*`/DOM objects and drive them through their real message entry
+points.
+
+```bash
+mise run test            # everything
+mise run test-python     # MCP server, safety guard, native host, identity
+mise run test-extension  # content script + background script
+```
+
+What the suites cover, beyond the obvious:
+
+- The credential guard masks password reads as well as refusing writes, in the
+  content script and the headless backend.
+- Network capture is opt-in: asserted against the source that `content.js`
+  never assigns to `window.fetch` or `XMLHttpRequest.prototype`.
+- The response-body stream filter writes every chunk back unmodified and
+  always closes, including when a chunk cannot be decoded — a filter that
+  alters a response breaks the page.
+- The native host only terminates its own server process.
+- The extension ID, `update_url`, `updates.json` key and version strings agree
+  across the manifest, the native-host template, both installers, the MCP
+  server, the README badge and the changelog.
+
+### Packaging and releasing
+
+```bash
+mise run package   # unsigned .xpi (temporary load only)
+mise run sign      # AMO-signed .xpi + updates.json  (see Signing below)
+mise run release   # GitHub release with both assets
+```
+
+The unsigned path refuses to overwrite a signed `.xpi`: both land on the same
+filename and `publish-release.sh` uploads it, so a stray rebuild would
+otherwise ship a build nobody can install permanently.
+
 
 ## Workflow Testing & Page Audits
 
@@ -854,7 +919,8 @@ the `browser_safety_status` tool.
 | **URL scheme guard** | Navigation is limited to `http://`, `https://`, and `about:blank`. `file:`, `javascript:`, `data:`, `chrome:`, `resource:`, and `moz-extension:` targets are always refused. |
 | **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
 | **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
-| **Password fields** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
+| **Password fields (writing)** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
+| **Password fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. Reading a credential hands it to the AI just as surely as typing one does. The same `allow_password_typing` setting lifts it. Note that `browser_execute_script` can still read any field — see below. |
 | **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus an Approve/Deny banner on the current page. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
 | **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
 | **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, and `browser_inject_observer` entirely. |
@@ -969,7 +1035,14 @@ claude mcp remove claudecodebrowser
 - A configurable safety guard (see [Safety Guards](#safety-guards)) enforces
   URL restrictions, protected-site confirmation, read-only mode, rate
   limiting, and audit logging
-- Screenshots are stored locally in user's home directory
+- Screenshots are stored under `~/.claudecodebrowser/screenshots` with `0700`
+  permissions, not in a world-readable shared `/tmp`
+- Password fields are protected in both directions: neither typed into nor
+  read back without an explicit opt-in
+- Network capture is off until you ask for it, happens in the extension's
+  background script via `webRequest`, and never replaces a page's own
+  `fetch`, `XMLHttpRequest` or `console`
+- Credential-bearing headers are redacted out of captured network logs
 - No data is sent to external servers
 
 ## License
@@ -977,3 +1050,10 @@ claude mcp remove claudecodebrowser
 MIT License - Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
 
 See [LICENSE](LICENSE) for full details.
+
+This fork is published under the same license and retains the original
+copyright. ClaudeCodeBrowser was created by
+**Andre Watson** ([@nanogenomic](https://github.com/nanogenomic), [Ligandal
+Inc.](https://ligandal.com)) — upstream:
+<https://github.com/nanogenomic/ClaudeCodeBrowser>. See
+[Credits](#credits).

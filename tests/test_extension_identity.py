@@ -93,6 +93,59 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn(f'version-{self.version()}-blue', readme)
 
 
+class AttributionTests(unittest.TestCase):
+    """This repository is a fork. Upstream authorship must stay visible: it is
+    an MIT condition for the copyright line, and the right thing to do for the
+    rest. Rebranding a fork is exactly when it gets dropped by accident."""
+
+    UPSTREAM_AUTHOR = 'Andre Watson'
+    UPSTREAM_REPO = 'nanogenomic/ClaudeCodeBrowser'
+
+    def test_license_keeps_the_original_copyright(self):
+        license_text = (ROOT / 'LICENSE').read_text()
+        self.assertIn('MIT License', license_text)
+        self.assertIn(self.UPSTREAM_AUTHOR, license_text)
+        self.assertIn('Ligandal', license_text)
+
+    def test_readme_credits_the_original_author(self):
+        readme = (ROOT / 'README.md').read_text()
+        self.assertIn(self.UPSTREAM_AUTHOR, readme)
+        self.assertIn(self.UPSTREAM_REPO, readme,
+                      'the README should link upstream, not just name the author')
+        self.assertIn('fork', readme.lower(),
+                      'the README should state that this is a fork')
+
+    def test_changelog_credits_the_original_author(self):
+        changelog = (ROOT / 'CHANGELOG.md').read_text()
+        self.assertIn(self.UPSTREAM_AUTHOR, changelog)
+
+    SOURCE_FILES = (
+        'extension/background.js',
+        'extension/content.js',
+        'extension/popup/popup.js',
+        'mcp-server/server.py',
+        'mcp-server/safety.py',
+        'mcp-server/headless_backend.py',
+        'mcp-server/stdio_wrapper.py',
+        'native-host/claudecodebrowser_host.py',
+        'agent/browser_agent.py',
+    )
+
+    def test_source_headers_credit_the_original_author(self):
+        """Every source file carries the attribution in its header comment.
+        Checked against the header rather than the whole file, so a mention
+        further down does not satisfy it."""
+        for path in self.SOURCE_FILES:
+            with self.subTest(path=path):
+                header = '\n'.join((ROOT / path).read_text().splitlines()[:45])
+                self.assertIn('Copyright', header,
+                              f'{path} has no copyright line in its header')
+                self.assertIn(self.UPSTREAM_AUTHOR, header,
+                              f'{path} does not credit the original author')
+                self.assertIn('MIT License', header,
+                              f'{path} does not state its license')
+
+
 class PermissionTests(unittest.TestCase):
 
     def test_webrequest_permissions_are_declared(self):

@@ -68,8 +68,9 @@ You have access to the ClaudeCodeBrowser MCP tooling at localhost:8765, which pr
 - **browser_get_elements**: Find elements by CSS selector
 - **browser_highlight**: Visually highlight an element on the page
 - **browser_wait_for_element**: Wait for an element to appear
-- **browser_get_value**: Get input/select values
-- **browser_set_value**: Set input values directly
+- **browser_get_value**: Get input/select values. Password fields come back as
+  `***` with `masked: true` — the guard covers reads, not just writes
+- **browser_set_value**: Set input values directly (refuses password fields)
 
 ### Tab Management
 - **browser_get_tabs**: List all open tabs
@@ -82,10 +83,28 @@ You have access to the ClaudeCodeBrowser MCP tooling at localhost:8765, which pr
 ### Dynamic Content Handling (for SPAs and AJAX)
 - **browser_click_and_wait**: Click + automatically wait for DOM changes or specific element
 - **browser_wait_for_change**: Wait for DOM mutations after actions
-- **browser_wait_for_network_idle**: Wait for fetch/XHR requests to settle
+- **browser_wait_for_network_idle**: Wait for network traffic to settle.
+  Counted via `webRequest`, so it covers fetch, XHR and subresources — a page
+  still pulling images is not idle
 - **browser_observe_element**: Start continuous observation of element changes
 - **browser_stop_observing**: Stop observation and get accumulated changes
 - **browser_scroll_and_capture**: Scroll through page collecting visible element info
+
+### Console & Network Logging
+Capture is **off** until you start it, and stops when you stop it — nothing is
+recorded in between.
+
+- **browser_start_logging**: Begin capturing console output and network
+  traffic. `capture_bodies=false` for headers and metadata only;
+  `include_all_types=true` to include images, fonts and stylesheets
+- **browser_stop_logging**: Stop capturing (logs are kept)
+- **browser_get_console_logs**: Console output, filterable by level and search
+- **browser_get_network_logs**: Requests and responses, filterable by URL
+  pattern, method, status or errors-only. Captured in the extension's
+  background script via `webRequest`, so fetch and XHR are both covered.
+  Credential-bearing headers (`Authorization`, `Cookie`, `Set-Cookie`,
+  `X-API-Key`, …) read back as `***`
+- **browser_clear_logs**: Discard captured logs
 
 ## Operational Guidelines
 
@@ -118,7 +137,11 @@ You have access to the ClaudeCodeBrowser MCP tooling at localhost:8765, which pr
 ### When Typing Text
 1. Identify the target input field clearly
 2. Ensure the field is focused before typing
-3. For sensitive fields (passwords), note that you're entering test data
+3. Password fields are refused by default, in both directions: you can neither
+   type into one nor read one back. Do not try to work around it with
+   `browser_execute_script` — if a login is genuinely needed, ask the person to
+   sign in themselves, or have them set `"allow_password_typing": true` in
+   `~/.claudecodebrowser/safety.json`
 4. Verify the text was entered correctly
 
 ### When Refreshing Pages

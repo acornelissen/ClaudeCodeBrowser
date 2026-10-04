@@ -4,11 +4,42 @@ All notable changes to ClaudeCodeBrowser are documented here. Versions follow
 [semantic versioning](https://semver.org/). The MCP server, extension, and
 docs are versioned together.
 
+ClaudeCodeBrowser was created by Andre Watson
+([@nanogenomic](https://github.com/nanogenomic), Ligandal Inc.); 1.1.0–1.4.0
+are his releases. 1.5.0 onwards are from the fork at
+<https://github.com/acornelissen/ClaudeCodeBrowser>.
+
+## [1.5.1]
+
+### Changed
+- Attribution headers added to the source files that shipped without one
+  (`popup.js`, `headless_backend.py`, `stdio_wrapper.py`,
+  `claudecodebrowser_host.py`), so every file now carries the MIT line and
+  credits the original author. `tests/test_extension_identity.py` enforces
+  this, along with the credit in the README, the changelog and `LICENSE`.
+- Documentation brought in line with 1.5.0: the three previously undocumented
+  tools (`browser_find_tabs`, `browser_get_tab_info`,
+  `browser_screenshot_all_tabs`), the new logging options, the credential-read
+  guard, the file-location table, and a Development section covering the test
+  suites and the packaging tasks.
+
+Version bumped only because `popup.js` is part of the signed archive, and AMO
+will not re-sign a version that already exists.
+
 ## [1.5.0]
 
-First release of this fork (`acornelissen/ClaudeCodeBrowser`). The extension is
-renamed **ClaudeCodeBrowserX** and carries a fork-owned extension ID, so it is a
-separate add-on from upstream's: remove the old one before installing this.
+First release of this fork (`acornelissen/ClaudeCodeBrowser`), building on
+Andre Watson's 1.4.0.
+
+The extension is renamed **ClaudeCodeBrowserX** and carries a fork-owned
+extension ID (`{efac2f8e-6c88-4c94-a050-f45cd0298aeb}`), because AMO will not
+let a different account sign under upstream's ID. It is therefore a separate
+add-on: remove any earlier ClaudeCodeBrowser before installing this one, and
+note that an older install will not auto-update to it.
+
+The MCP server, native messaging host and install directory keep the
+`claudecodebrowser` name, so existing `mcp__claudecodebrowser__*` tool names
+and `~/.claudecodebrowser` paths are unchanged.
 
 ### Security
 - **Credential reads are guarded.** `browser_type` and `browser_set_value`

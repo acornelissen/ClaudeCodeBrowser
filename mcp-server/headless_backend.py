@@ -7,6 +7,10 @@ Activated when CLAUDE_BROWSER_HEADLESS=1 or --headless is passed.
 Pick the engine with CLAUDE_BROWSER_ENGINE=firefox|chromium|webkit (default firefox).
 
 Install: pip install playwright && playwright install firefox   (or chromium/webkit)
+
+MIT License
+Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+Author: dre@ligandal.com
 """
 
 import asyncio

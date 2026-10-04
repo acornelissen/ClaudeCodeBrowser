@@ -4,6 +4,10 @@ MCP stdio wrapper for ClaudeCodeBrowser
 
 This wrapper translates between MCP stdio protocol and the HTTP-based browser server.
 It handles the JSON-RPC communication that Claude Code expects.
+
+MIT License
+Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+Author: dre@ligandal.com
 """
 
 import sys

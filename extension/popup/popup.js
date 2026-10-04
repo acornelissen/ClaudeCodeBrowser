@@ -1,5 +1,9 @@
 /**
  * ClaudeCodeBrowser - Popup Script
+ *
+ * MIT License
+ * Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+ * Author: dre@ligandal.com
  */
 
 document.addEventListener('DOMContentLoaded', async () => {

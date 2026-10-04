@@ -11,6 +11,10 @@ Features:
 - Monitors server health and restarts on failure
 - Self-healing with exponential backoff
 - No external process managers required
+
+MIT License
+Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+Author: dre@ligandal.com
 """
 
 import sys
