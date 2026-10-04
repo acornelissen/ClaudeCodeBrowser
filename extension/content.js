@@ -374,7 +374,7 @@
   // hands a credential to the agent in clear, which is worse than masking a
   // field that happens to be called "author".
   const CREDENTIAL_NAME_RE =
-    /(pass(word|wd)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number|ssn)/i;
+    /(pass(?:word|wd|phrase|code)|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|authorization|authenticat|auth[-_]?(?:token|key|code|header|secret)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
 
   function attributeOf(element, name) {
     if (!element || typeof element.getAttribute !== 'function') return null;

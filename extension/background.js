@@ -247,11 +247,21 @@ function redactHeaderList(headers) {
 // verbatim one request earlier. This cannot be complete - a body is arbitrary
 // data - so bodies stay off by default for anything but textual responses and
 // can be disabled entirely with capture_bodies: false.
-// "pin" is the only one anchored: unanchored it matches shipping, mapping and
-// spinner. The rest are deliberately loose, because over-redacting a log
-// entry costs nothing and under-redacting one costs a credential.
+// Names that mark a value as a credential. One list, mirrored in
+// extension/content.js's CREDENTIAL_NAME_RE - change one, change the other,
+// and a test pins them together.
+//
+// Deliberately loose, because over-redacting a log costs nothing and
+// under-redacting one costs a credential - but the short and
+// prefix-ambiguous ones are anchored, because they were matching words that
+// cannot name a credential: `auth` hid every `author` object in every
+// captured API response, `session` hid `sessionCount` and `sessionStorage`,
+// `pass` hid `passed` and `bypassCache`, and `otp` hid `notPublished`.
+// Anchoring them loses no credential name: `authorization`, `auth_token`,
+// `session_id`, `JSESSIONID`, `password`, `passphrase` and a bare `auth`,
+// `session`, `pass`, `otp` or `pin` all still match.
 const SECRET_KEY_RE =
-  /(pass(word|wd|phrase)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+  /(pass(?:word|wd|phrase|code)|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|authorization|authenticat|auth[-_]?(?:token|key|code|header|secret)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
 
 // Markup carries credentials in attributes, not just in JSON keys: a
 // server-rendered form with a prefilled password puts it in value="...",

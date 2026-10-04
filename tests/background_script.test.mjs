@@ -719,6 +719,58 @@ test('credential-shaped values inside bodies are scrubbed', async () => {
   assert.ok(entry.responseBody.includes('expires_in'), 'the rest of the body stays');
 });
 
+test('the credential-name list matches credentials and not ordinary words', () => {
+  // The short, prefix-ambiguous entries are anchored. Unanchored they matched
+  // words that cannot name a credential, and the cost is real in both
+  // directions: `auth` hid every `author` object in every captured API
+  // response, while missing a name hands over a secret.
+  const SECRET_KEY_RE = new RegExp(
+    SOURCE.match(/const SECRET_KEY_RE =\n  \/(.*)\/i;/)[1], 'i');
+
+  const credentials = [
+    'password', 'passwd', 'passphrase', 'passcode', 'pass', 'user[password]',
+    'pwd', 'secret', 'client_secret', 'token', 'access_token',
+    'refresh_token', 'credential', 'one-time-code', 'otp', 'otp_code',
+    'authorization', 'Authorization', 'authentication', 'auth_token',
+    'authToken', 'x-auth', 'auth', 'api_key', 'apiKey', 'private_key',
+    'session', 'session_id', 'sessionToken', 'JSESSIONID', 'PHPSESSID',
+    'cvv', 'cvc', 'card_number', 'jwt', 'bearer', 'signature', 'ssn',
+    'pin', 'PIN'
+  ];
+  for (const name of credentials) {
+    assert.ok(SECRET_KEY_RE.test(name), `${name} must be treated as a credential`);
+  }
+
+  const ordinary = [
+    'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
+    'bypassCache', 'compass', 'sessionCount', 'sessionStorage',
+    'notPublished', 'shipping', 'mapping', 'spinner', 'pinned', 'email',
+    'username', 'title', 'views', 'published', 'tags', 'id', 'name'
+  ];
+  for (const name of ordinary) {
+    assert.ok(!SECRET_KEY_RE.test(name),
+              `${name} is not a credential and must stay readable`);
+  }
+
+  // Accepted over-redaction: a bare `session` followed by a delimiter is what
+  // catches `session=abcdef` in a cookie-shaped body, and that rule cannot
+  // tell `session_duration` from `session_id`. Redacting a duration costs
+  // nothing; missing a session token costs the session.
+  assert.ok(SECRET_KEY_RE.test('session_duration'));
+});
+
+test('the DOM guard and the body scrubber use the same name list', () => {
+  // The two have to agree, or a field is *** in the network log and
+  // plaintext from browser_get_value - which is exactly what happened.
+  const contentSource = readFileSync(
+    join(here, '..', 'extension', 'content.js'), 'utf8');
+  const fromBackground = SOURCE.match(/const SECRET_KEY_RE =\n  \/(.*)\/i;/)[1];
+  const fromContent = contentSource.match(
+    /const CREDENTIAL_NAME_RE =\n    \/(.*)\/i;/)[1];
+  assert.equal(fromContent, fromBackground,
+    'content.js CREDENTIAL_NAME_RE has drifted from background.js SECRET_KEY_RE');
+});
+
 test('an HTML form login does not log the password', async () => {
   // webRequest hands an ordinary <form method=POST> over as requestBody
   // .formData, whose values are ARRAYS. Every fixture here used raw bytes, so
