@@ -1356,14 +1356,79 @@ test('a single screenshot says when it came from a private window', async () => 
   // The image still goes to the agent, but the server needs to know not to
   // write it to disk for a week.
   const ctx = loadBackground();
-  ctx.context.browser.tabs.query = async () => ([
-    { id: 2, url: 'http://secret.test/', title: 'b', windowId: 2,
-      active: true, incognito: true }
-  ]);
+  ctx.markPrivate(7);   // the harness's active tab
 
   const result = await ctx.command('screenshot', {}, undefined);
 
   assert.equal(result.privateWindow, true);
+});
+
+test('a tab argument of 0 is not mistaken for "no tab"', async () => {
+  // `tabId ? await browser.tabs.get(tabId) : activeTab` was falsy for tab id
+  // 0 at thirteen call sites, so a request naming that tab silently acted on
+  // whichever tab happened to be in front.
+  const ctx = loadBackground();
+  const asked = [];
+  ctx.context.browser.tabs.get = async (id) => {
+    asked.push(id);
+    return { id, windowId: 1, url: 'http://zero.test/', title: 'zero' };
+  };
+
+  await ctx.command('getText', {}, 0);
+
+  assert.ok(asked.includes(0), `tab 0 was never asked for: ${asked}`);
+});
+
+test('a tab argument given as a string still names that tab', async () => {
+  const ctx = loadBackground();
+  const asked = [];
+  ctx.context.browser.tabs.get = async (id) => {
+    asked.push(id);
+    return { id, windowId: 1, url: 'http://seven.test/', title: 's' };
+  };
+
+  await ctx.command('getText', {}, '7');
+
+  assert.ok(asked.includes(7),
+            `a JSON client's "7" was passed through unconverted: ${asked}`);
+});
+
+test('an invalid url_pattern says which argument was wrong', async () => {
+  const ctx = loadBackground();
+  const result = await ctx.command('findTabs', { urlPattern: 'what(' },
+                                   undefined);
+  assert.equal(result.success, false);
+  assert.match(result.error, /url_pattern/,
+    'the regex parser message was returned as the whole error');
+});
+
+test('a non-object runtime message does not throw inside the listener', () => {
+  const ctx = loadBackground();
+  assert.doesNotThrow(() => ctx.deliver(null));
+  assert.doesNotThrow(() => ctx.deliver('hello'));
+});
+
+test('a request body Firefox could not read is not logged as no body', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { method: 'POST',
+                            requestBody: { error: 'Request body too large' } });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(String(entry.requestBody), /not available/i,
+    'an unreadable body read as a POST with no body at all');
+});
+
+test('a file upload names the file instead of logging an empty body', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestBody: { raw: [{ file: '/home/albert/tax-return.pdf' }] }
+  });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(String(entry.requestBody), /tax-return\.pdf/);
 });
 
 test('a click that navigates reports the page it landed on', async () => {

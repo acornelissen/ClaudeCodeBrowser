@@ -369,6 +369,12 @@ function redactSecretsInBody(text) {
 function describeRequestBody(requestBody) {
   if (!requestBody) return null;
   try {
+    // Firefox sets this when it could not read the body at all (too large,
+    // or already consumed). Returning null made that look like a request
+    // with no body, so the agent concluded the POST was empty.
+    if (requestBody.error) {
+      return `[body not available: ${requestBody.error}]`;
+    }
     if (requestBody.formData) {
       // Structural, not a scrub of the serialised form: formData values are
       // arrays ({"password":["hunter2"]}), which the string passes cannot see.
@@ -379,17 +385,27 @@ function describeRequestBody(requestBody) {
       // fatal: false so an undecodable request body yields replacement
       // characters rather than throwing away the whole entry.
       const decoder = new TextDecoder("utf-8", { fatal: false });
+      // A chunk with a `file` and no `bytes` is an upload: Firefox gives the
+      // filename rather than the contents. Both were dropped silently, so a
+      // file upload logged as an empty body.
+      const files = requestBody.raw
+        .filter(chunk => chunk.file)
+        .map(chunk => chunk.file);
       const text = requestBody.raw
         .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes, { stream: true }) : ""))
         .join("") + decoder.decode();
+      if (files.length && !text) {
+        return `[file upload: ${files.join(", ")}]`;
+      }
       // Scrub a bounded window rather than the whole body: only the first
       // 1000 characters are kept, and a multi-megabyte upload would otherwise
       // run every regex pass over all of it. The window is wide enough that a
       // credential straddling the 1000-character cut is still scrubbed first.
       const scrubbed = redactSecretsInBody(text.substring(0, 4000));
-      return text.length > 1000
+      const body = text.length > 1000
         ? scrubbed.substring(0, 1000) + "…[truncated]"
         : scrubbed;
+      return files.length ? `${body} [files: ${files.join(", ")}]` : body;
     }
   } catch (e) {
     return "[could not decode request body]";
@@ -792,7 +808,7 @@ function getNetworkLogsFor(tabId, options = {}) {
 
   const urlPattern = options.urlPattern || options.url_pattern;
   if (urlPattern) {
-    const pattern = new RegExp(urlPattern, "i");
+    const pattern = compilePattern(urlPattern, "url_pattern", "i");
     logs = logs.filter(log => pattern.test(log.url));
   }
   if (options.method) {
@@ -1179,10 +1195,12 @@ async function handleCommand(message) {
 async function takeScreenshot(tabId, options = {}) {
   try {
     const currentTab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
-    const targetTab = tabId ? await browser.tabs.get(tabId) : currentTab;
+    const targetTab = await tabFor(tabId);
 
-    // Check if we need to temporarily focus the tab for screenshot
-    const needsFocus = tabId && tabId !== currentTab?.id;
+    // Check if we need to temporarily focus the tab for screenshot.
+    // Compared on the resolved tab, not the raw argument: `tabId &&` was
+    // falsy for tab id 0, and a numeric string never equalled the id.
+    const needsFocus = targetTab && targetTab.id !== currentTab?.id;
     let originalActiveTab = null;
 
     if (needsFocus && parseFlag(options.allowFocus, true)) {
@@ -1268,7 +1286,7 @@ async function screenshotAllTabs(options = {}) {
                                       t.incognito !== true);
 
     if (options.urlPattern) {
-      const regex = new RegExp(options.urlPattern);
+      const regex = compilePattern(options.urlPattern, "url_pattern");
       targetTabs = targetTabs.filter(t => regex.test(t.url));
     }
 
@@ -1475,7 +1493,7 @@ async function solveCaptcha(tabId, data = {}) {
 // History navigation (Back/Forward buttons)
 async function navigateHistory(tabId, direction) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
     if (direction === "back") {
       await browser.tabs.goBack(tab.id);
     } else {
@@ -1491,8 +1509,36 @@ async function navigateHistory(tabId, direction) {
 }
 
 // Resolve an optional tab id to a concrete one (the active tab when omitted).
+// A caller-supplied pattern is data. new RegExp on an unbalanced "(" threw a
+// parser message as the tool's whole error, which reads like an internal
+// fault rather than "that pattern is not valid".
+function compilePattern(pattern, argumentName, flags) {
+  try {
+    return new RegExp(pattern, flags);
+  } catch (e) {
+    throw new Error(
+      `${argumentName} is not a valid regular expression: ${e.message}`);
+  }
+}
+
+// Resolve a tab argument, accepting the id 0 and a numeric string. Thirteen
+// call sites used `tabId ? await browser.tabs.get(tabId) : activeTab`, which
+// is falsy for tab id 0 - so a request naming that tab silently acted on
+// whichever tab happened to be in front.
+async function tabFor(tabId) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    throw new Error("No tab to act on");
+  }
+  return await browser.tabs.get(resolved);
+}
+
 async function resolveTabId(tabId) {
-  if (tabId !== undefined && tabId !== null) return tabId;
+  if (tabId !== undefined && tabId !== null && tabId !== '') {
+    // A JSON client sends tab_id: "7", which browser.tabs.get rejects.
+    const asNumber = Number(tabId);
+    return Number.isInteger(asNumber) ? asNumber : tabId;
+  }
   const active = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
   return active?.id;
 }
@@ -1606,7 +1652,7 @@ async function clearLogs(tabId, data = {}) {
 // behalf. Pass allFrames: true to opt into the old broadcast.
 async function sendToContentScript(tabId, message, { allFrames = false } = {}) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
     const options = allFrames ? undefined : { frameId: 0 };
     const result = await browser.tabs.sendMessage(tab.id, message, options);
     return await contentScriptResult(result, message.action, tab.id);
@@ -1650,7 +1696,7 @@ async function contentScriptResult(result, action, tabId) {
 // Click functionality
 async function performClick(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "click",
@@ -1666,7 +1712,7 @@ async function performClick(tabId, data) {
 // Type functionality
 async function performType(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "type",
@@ -1682,7 +1728,7 @@ async function performType(tabId, data) {
 // Scroll functionality
 async function performScroll(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "scroll",
@@ -1698,7 +1744,7 @@ async function performScroll(tabId, data) {
 // Navigation
 async function navigateTo(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     await browser.tabs.update(tab.id, { url: data.url });
 
@@ -1737,7 +1783,7 @@ async function navigateTo(tabId, data) {
 // Get page information
 async function getPageInfo(tabId) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "getPageInfo"
@@ -1756,7 +1802,7 @@ async function getPageInfo(tabId) {
 // Get elements by selector
 async function getElements(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "getElements",
@@ -1772,7 +1818,7 @@ async function getElements(tabId, data) {
 // Execute arbitrary script
 async function executeScript(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.executeScript(tab.id, {
       code: data.script
@@ -1787,7 +1833,7 @@ async function executeScript(tabId, data) {
 // Highlight element
 async function highlightElement(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "highlight",
@@ -1803,7 +1849,7 @@ async function highlightElement(tabId, data) {
 // Wait for element
 async function waitForElement(tabId, data) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "waitForElement",
@@ -1843,7 +1889,7 @@ async function getAllTabs(options = {}) {
     const includeFavicon = parseFlag(options.includeFavicon, false)
       || parseFlag(options.include_favicon, false);
     const rawPattern = options.urlPattern || options.url_pattern;
-    const urlPattern = rawPattern ? new RegExp(rawPattern) : null;
+    const urlPattern = rawPattern ? compilePattern(rawPattern, "url_pattern") : null;
     const limit = tabResultLimit(options.limit);
 
     const queryOpts = currentWindowOnly ? { currentWindow: true } : {};
@@ -1974,7 +2020,7 @@ async function findTabs(options = {}) {
       filtered = filtered.filter(t => t.url.startsWith(options.url));
     }
     if (options.urlPattern) {
-      const regex = new RegExp(options.urlPattern);
+      const regex = compilePattern(options.urlPattern, "url_pattern");
       filtered = filtered.filter(t => regex.test(t.url));
     }
     if (options.title) {
@@ -2053,7 +2099,7 @@ async function focusTab(tabId) {
 // Refresh/Reload functionality
 async function refreshTab(tabId, options = {}) {
   try {
-    const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+    const tab = await tabFor(tabId);
 
     // bypassCache: true = hard refresh (Ctrl+Shift+R), false = normal refresh
     // (F5). Parsed once and used for both the reload and the report: the
@@ -2116,7 +2162,7 @@ async function reloadAllTabs(options = {}) {
 
       // Filter by URL pattern if provided
       if (options.urlPattern) {
-        const regex = new RegExp(options.urlPattern);
+        const regex = compilePattern(options.urlPattern, "url_pattern");
         if (!regex.test(tab.url)) {
           continue;
         }
@@ -2158,7 +2204,7 @@ async function reloadTabsByUrl(options) {
         matches = tab.url === options.url || tab.url.startsWith(options.url);
       } else if (options.urlPattern) {
         // Regex pattern match
-        const regex = new RegExp(options.urlPattern);
+        const regex = compilePattern(options.urlPattern, "url_pattern");
         matches = regex.test(tab.url);
       }
 
@@ -2181,6 +2227,7 @@ async function reloadTabsByUrl(options) {
 
 // Listen for messages from content scripts
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || typeof message !== "object") return;
   if (message.target === "background") {
     handleCommand({ ...message, tabId: sender.tab?.id })
       .then(sendResponse);
