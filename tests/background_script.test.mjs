@@ -1477,6 +1477,22 @@ test('a single screenshot says when it came from a private window', async () => 
   assert.equal(result.privateWindow, true);
 });
 
+test('a string tab id reaches the same logging state as the number', async () => {
+  // The per-tab logging state is kept in Maps keyed by the tabId Firefox
+  // reports, which is a number. Starting logging with "7" would have written
+  // to a string key, so the capture listeners - which look up the number -
+  // would never have found the session, and getNetworkLogs would have
+  // reported nothing while claiming logging was on.
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, '7');
+
+  fireRequest(ctx.webRequest, { tabId: 7 });
+
+  const result = await ctx.command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs.length, 1,
+    'the session started as "7" must be the session tab 7 logs into');
+});
+
 test('a tab argument of 0 is not mistaken for "no tab"', async () => {
   // `tabId ? await browser.tabs.get(tabId) : activeTab` was falsy for tab id
   // 0 at thirteen call sites, so a request naming that tab silently acted on
