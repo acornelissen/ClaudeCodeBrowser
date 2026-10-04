@@ -55,6 +55,34 @@ them is part of releasing, and that is being held for approval.
   whole hostname. **Breaking:** an unanchored mid-URL permit pattern such as
   `stripe\.com/dashboard` no longer grants anything and fails closed; write
   `^https://stripe\.com/` instead. `.*` still means everything.
+- **An allowlist that cannot compile now permits nothing.** Wrapping each
+  pattern in `(?:…)(?=…)` moves a leading `(?i)`/`(?s)`/`(?m)` off position 0,
+  which Python rejects — so the pattern was logged and skipped, and because
+  `allowed_url_patterns` is only consulted when non-empty, one such pattern
+  **switched allowlist mode off entirely**. The strictest confinement on offer
+  became none at all, recorded only in a log line the native host sends to a
+  discarded stderr. A granting list with nothing usable left in it now keeps
+  the restriction on and permits nothing, and `browser_safety_status` reports
+  every failure in `pattern_errors`.
+- **Userinfo no longer walks through a permit pattern.** `:` is both the
+  allowlist's delimiter and the userinfo password separator, so
+  `^https://localhost` granted `https://localhost:3000@evil.com/steal`, which
+  loads evil.com — and the same URL counted as trusted, so a click on it
+  needed no confirmation.
+- **A percent-encoded host or a trailing dot no longer bypasses the
+  protected-domain check or the blocklist.** The browser percent-decodes the
+  host and keeps no trailing dot, so `https://%63hase.com/transfer`,
+  `https://www.irs.%67ov/payments` and `https://www.irs.gov./payments` all
+  reached protected sites with no confirmation, and `https://chase%2Ecom/x`
+  walked past `blocked_url_patterns: ["chase\.com"]`.
+- **Breaking:** a permit pattern that names a host must match the whole host —
+  `example\.com` no longer covers `www.example.com`; write
+  `(.+\.)?example\.com`. It fails closed and the denial says so. A permit
+  pattern can also no longer be satisfied by the query string or fragment,
+  which closes `https://evil.com/?x=a.stripe.com` against a
+  `.*\.stripe\.com` pattern. Do not start a permit pattern with `.*` — the
+  README used to recommend exactly that, and it is satisfied by a path segment
+  on any host.
 - **A backslash no longer walks past the protected-domain check.** Firefox
   loads `https://www.irs.gov\payments` as `https://www.irs.gov/payments`
   under WHATWG parsing, but the delimiter class did not match the raw string
