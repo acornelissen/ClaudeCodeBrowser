@@ -4,6 +4,78 @@ All notable changes to ClaudeCodeBrowser are documented here. Versions follow
 [semantic versioning](https://semver.org/). The MCP server, extension, and
 docs are versioned together.
 
+## [1.5.0]
+
+First release of this fork (`acornelissen/ClaudeCodeBrowser`). The extension is
+renamed **ClaudeCodeBrowserX** and carries a fork-owned extension ID, so it is a
+separate add-on from upstream's: remove the old one before installing this.
+
+### Security
+- **Credential reads are guarded.** `browser_type` and `browser_set_value`
+  already refused password fields, but `browser_get_value` and
+  `browser_get_elements` returned the plaintext — and both are observation
+  tools, so they worked even in read-only mode. Reads are now masked as
+  `***`, as `browser_get_page_info` already did. Same gap closed in the
+  headless backend.
+- **Page interception is opt-in.** The content script used to wrap
+  `window.fetch`, the XHR prototype and all five `console` methods on every
+  page in every frame at load, whether or not logging was on. Capture now
+  starts with `browser_start_logging` and stops with
+  `browser_stop_logging`.
+- **Credential-bearing headers are redacted** in captured network logs
+  (`Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key` and similar), so
+  enabling logging no longer puts bearer tokens into the agent's context.
+- **The native host only kills its own server.** It ran `lsof` on port 8765
+  and `SIGTERM`/`SIGKILL`'d whatever answered, with a `fuser -k` fallback that
+  killed unconditionally — and Firefox launches the host automatically, so an
+  unrelated service on that port died unprompted. It now terminates only
+  processes running our own server script, and reports failure rather than
+  starting a server that cannot bind.
+- **Screenshots moved out of shared `/tmp`** to
+  `~/.claudecodebrowser/screenshots` at `0700`.
+  `CLAUDE_BROWSER_SCREENSHOTS_DIR` is still honoured.
+
+### Changed
+- **Network logging uses `webRequest`** instead of wrapping page globals.
+  Firefox's content-script sandbox refuses a `window.fetch` override, so the
+  old implementation silently captured XHR but never `fetch` — which is what
+  modern apps use. Capture now happens in the background script and sees
+  `fetch`, XHR, WebSocket handshakes and beacons, is unaffected by a page's
+  CSP, and touches nothing in the page. Response bodies use a read-only
+  stream filter for textual content types; `capture_bodies: false` turns them
+  off and `include_all_types: true` opts into assets.
+  - Adds the `webRequest` and `webRequestBlocking` permissions
+    (`filterResponseData` requires the latter).
+  - The experimental Chrome build captures metadata and headers only:
+    `filterResponseData` is Firefox-only and MV3 withholds
+    `webRequestBlocking`.
+- **`browser_wait_for_network_idle`** counts at the network layer too. It was
+  the last place that hooked the page's `fetch`, and it had the same blind
+  spot. It now also counts subresources, so a page still loading images is
+  correctly not idle.
+- Auto-update points at this fork's releases.
+- Both installers read the extension ID from `extension/manifest.json`
+  instead of repeating it, since Firefox fails silently when the native
+  host's `allowed_extensions` does not match exactly.
+
+### Fixed
+- `native-host/claudecodebrowser.json` shipped the original author's absolute
+  path. The README tells you to copy that file into place, so it was a live
+  bug on the manual install route.
+- `scripts/install.sh` suggested `xpinstall.signatures.required=false`, which
+  does nothing on release Firefox.
+- The unsigned packaging path refuses to overwrite a signed `.xpi`. Both land
+  on the same filename and `publish-release.sh` uploads it, so a stray
+  unsigned rebuild could have shipped a build nobody can install.
+
+### Added
+- Test suites with no external dependencies: `unittest` for the Python
+  components, and Node harnesses that evaluate `content.js` and
+  `background.js` against stubs and drive them through their real message
+  entry points. `mise run test` runs all of them.
+- `mise` manages `web-ext` and the task list (`test`, `package`, `sign`,
+  `release`); AMO credentials live in a gitignored `mise.local.toml`.
+
 ## [1.4.0]
 
 ### Added

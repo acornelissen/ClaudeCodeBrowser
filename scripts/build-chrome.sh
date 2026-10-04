@@ -49,7 +49,7 @@ VERSION=$(python3 -c "import json; print(json.load(open('$SRC/manifest.json'))['
 cat > "$OUT/manifest.json" << EOF
 {
   "manifest_version": 3,
-  "name": "ClaudeCodeBrowser (Experimental Chrome Build)",
+  "name": "ClaudeCodeBrowserX (Experimental Chrome Build)",
   "version": "$VERSION",
   "description": "Browser automation extension for Claude Code - EXPERIMENTAL Chrome build; Firefox is the primary target",
   "author": "Ligandal",

@@ -70,6 +70,29 @@ class ExtensionIdTests(unittest.TestCase):
         self.assertIn("['browser_specific_settings']['gecko']['id']", packager)
 
 
+class ReleaseVersionTests(unittest.TestCase):
+    """The CHANGELOG states the MCP server, extension and docs are versioned
+    together, and AMO refuses a repeat upload of a version that already
+    exists — so a release where these disagree is a release that fails."""
+
+    def version(self):
+        manifest = json.loads((ROOT / 'extension' / 'manifest.json').read_text())
+        return manifest['version']
+
+    def test_server_reports_the_manifest_version(self):
+        server = (ROOT / 'mcp-server' / 'server.py').read_text()
+        self.assertIn(f"'version': '{self.version()}'", server,
+                      "the /health endpoint must report the manifest version")
+
+    def test_changelog_has_an_entry_for_this_version(self):
+        changelog = (ROOT / 'CHANGELOG.md').read_text()
+        self.assertIn(f'## [{self.version()}]', changelog)
+
+    def test_readme_badge_matches(self):
+        readme = (ROOT / 'README.md').read_text()
+        self.assertIn(f'version-{self.version()}-blue', readme)
+
+
 class PermissionTests(unittest.TestCase):
 
     def test_webrequest_permissions_are_declared(self):
