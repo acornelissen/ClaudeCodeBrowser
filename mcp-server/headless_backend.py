@@ -17,13 +17,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from safety import resolve_screenshots_dir
+
 logger = logging.getLogger('ClaudeCodeBrowser.Headless')
 
-SCREENSHOTS_DIR = Path(os.environ.get(
-    'CLAUDE_BROWSER_SCREENSHOTS_DIR',
-    '/tmp/claudecodebrowser/screenshots'
-))
-SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+SCREENSHOTS_DIR = resolve_screenshots_dir()
 
 # Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
 BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
@@ -113,19 +111,24 @@ class HeadlessBrowser:
             raise RuntimeError("Headless browser not started")
         return self._page
 
+    _IS_PASSWORD_JS = (
+        "el => el.tagName === 'INPUT' && (el.type === 'password' || "
+        "['current-password','new-password'].includes(el.getAttribute('autocomplete')))"
+    )
+
+    async def _is_password_field(self, page, selector: str) -> bool:
+        """True when the selector resolves to a credential input."""
+        try:
+            return bool(await page.eval_on_selector(selector, self._IS_PASSWORD_JS))
+        except Exception:
+            # Selector didn't resolve; the caller reports its own error.
+            return False
+
     async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
         """Refuse to fill password fields unless the safety config allows it."""
         if args.get('allow_password') is True:
             return
-        try:
-            is_password = await page.eval_on_selector(
-                selector,
-                "el => el.tagName === 'INPUT' && (el.type === 'password' || "
-                "['current-password','new-password'].includes(el.getAttribute('autocomplete')))"
-            )
-        except Exception:
-            return  # selector didn't resolve; the fill will report its own error
-        if is_password:
+        if await self._is_password_field(page, selector):
             raise RuntimeError(
                 'Refused: target is a password field. Credentials belong in a '
                 'password manager, not automated typing. Set '
@@ -268,6 +271,20 @@ class HeadlessBrowser:
 
         elif action == 'getValue':
             selector = args.get('selector', '')
+            # Reading a password field hands the credential to the AI just as
+            # typing one would, so the same guard applies. Masked, not refused,
+            # so the caller can still tell whether the field is filled.
+            if await self._is_password_field(page, selector) and \
+                    args.get('allow_password') is not True:
+                return {
+                    'success': True,
+                    'value': '***',
+                    'masked': True,
+                    'note': 'Password field value withheld. Set '
+                            '"allow_password_typing": true in '
+                            '~/.claudecodebrowser/safety.json to read '
+                            'credentials through the agent.'
+                }
             value = await page.eval_on_selector(selector, 'el => el.value')
             return {'success': True, 'value': value}
 

@@ -1,0 +1,18 @@
+[tools]
+python = "3.12"
+node = "22"
+
+[tasks.test]
+description = "Run the Python and content-script test suites"
+run = [
+  "python3 -m unittest discover -s tests -t . -v",
+  "node tests/content_script.test.mjs",
+]
+
+[tasks.test-python]
+description = "Run the Python test suite"
+run = "python3 -m unittest discover -s tests -t . -v"
+
+[tasks.test-extension]
+description = "Run the content-script test suite"
+run = "node tests/content_script.test.mjs"

@@ -27,13 +27,14 @@
   let networkLogs = [];
   const MAX_LOG_ENTRIES = 500;
 
-  // Original console methods (saved for restoration)
+  // Original console methods, saved unbound so restoreConsole() puts the
+  // page's own functions back by identity. Calls go through .apply(console).
   const originalConsole = {
-    log: console.log.bind(console),
-    warn: console.warn.bind(console),
-    error: console.error.bind(console),
-    info: console.info.bind(console),
-    debug: console.debug.bind(console)
+    log: console.log,
+    warn: console.warn,
+    error: console.error,
+    info: console.info,
+    debug: console.debug
   };
 
   // Console interceptor
@@ -80,8 +81,48 @@
   // DOM tool fails with "Receiving end does not exist".
   const interception = { fetch: false, xhr: false, console: false };
 
+  // Page originals, captured when interception is installed and put back when
+  // it is removed. Interception is opt-in (startLogging) rather than installed
+  // on load: this script runs on every page in every frame, and wrapping a
+  // page's fetch, XHR and console when nobody asked for logs is a cost no
+  // page should pay.
+  let savedFetch = null;
+  let savedXHROpen = null;
+  let savedXHRSend = null;
+
+  // Request/response headers that carry credentials. Logs are read by the
+  // agent, so these never reach it — the header's presence is still visible,
+  // only the value is withheld.
+  const REDACTED_HEADERS = new Set([
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+    'x-api-key', 'x-auth-token', 'x-csrf-token', 'x-xsrf-token',
+    'api-key', 'auth-token', 'x-session-token', 'x-access-token'
+  ]);
+
+  // Headers arrive as a plain object, a Headers instance or an array of
+  // pairs depending on how the caller built the request.
+  function redactHeaders(headers) {
+    if (!headers) return {};
+    let pairs;
+    try {
+      if (typeof headers.entries === 'function') {
+        pairs = Array.from(headers.entries());
+      } else if (Array.isArray(headers)) {
+        pairs = headers;
+      } else {
+        pairs = Object.entries(headers);
+      }
+    } catch (e) {
+      return {};
+    }
+    const out = {};
+    for (const [name, value] of pairs) {
+      out[name] = REDACTED_HEADERS.has(String(name).toLowerCase()) ? '***' : value;
+    }
+    return out;
+  }
+
   // Network request interceptor (fetch)
-  const originalFetch = window.fetch;
   const fetchInterceptor = async function(...args) {
     const startTime = Date.now();
     const [resource, init] = args;
@@ -92,21 +133,21 @@
       type: 'fetch',
       method: method,
       url: url,
-      requestHeaders: init?.headers || {},
+      requestHeaders: redactHeaders(init?.headers),
       requestBody: init?.body ? String(init.body).substring(0, 1000) : null,
       startTime: new Date().toISOString(),
       pageUrl: window.location.href
     };
 
     try {
-      const response = await originalFetch.apply(this, args);
+      const response = await savedFetch.apply(this, args);
       const endTime = Date.now();
 
       if (loggingEnabled) {
         logEntry.status = response.status;
         logEntry.statusText = response.statusText;
         logEntry.duration = endTime - startTime;
-        logEntry.responseHeaders = Object.fromEntries(response.headers.entries());
+        logEntry.responseHeaders = redactHeaders(response.headers);
 
         // Clone response to read body without consuming it
         const clone = response.clone();
@@ -144,18 +185,7 @@
     }
   };
 
-  try {
-    window.fetch = fetchInterceptor;
-    interception.fetch = true;
-  } catch (e) {
-    // "fetch" is read-only in Firefox's sandbox — network logging for fetch
-    // is unavailable, everything else keeps working
-  }
-
   // XHR interceptor
-  const originalXHROpen = XMLHttpRequest.prototype.open;
-  const originalXHRSend = XMLHttpRequest.prototype.send;
-
   const xhrOpenInterceptor = function(method, url, ...rest) {
     this._logData = {
       type: 'xhr',
@@ -163,7 +193,7 @@
       url: url,
       pageUrl: window.location.href
     };
-    return originalXHROpen.apply(this, [method, url, ...rest]);
+    return savedXHROpen.apply(this, [method, url, ...rest]);
   };
 
   const xhrSendInterceptor = function(body) {
@@ -192,27 +222,85 @@
         }
       });
     }
-    return originalXHRSend.apply(this, [body]);
+    return savedXHRSend.apply(this, [body]);
   };
 
-  try {
-    XMLHttpRequest.prototype.open = xhrOpenInterceptor;
-    XMLHttpRequest.prototype.send = xhrSendInterceptor;
-    interception.xhr = true;
-  } catch (e) {
-    // XHR prototype not writable in this sandbox — skip XHR logging
+  // Install the interceptors. Each capability is installed independently so a
+  // sandbox that refuses one (fetch is read-only in some Firefox versions)
+  // still gets the others.
+  function installInterception() {
+    if (!interception.fetch) {
+      try {
+        savedFetch = window.fetch;
+        window.fetch = fetchInterceptor;
+        interception.fetch = true;
+      } catch (e) {
+        // "fetch" is read-only in Firefox's sandbox — network logging for
+        // fetch is unavailable, everything else keeps working
+        savedFetch = null;
+      }
+    }
+    if (!interception.xhr) {
+      try {
+        savedXHROpen = XMLHttpRequest.prototype.open;
+        savedXHRSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = xhrOpenInterceptor;
+        XMLHttpRequest.prototype.send = xhrSendInterceptor;
+        interception.xhr = true;
+      } catch (e) {
+        // XHR prototype not writable in this sandbox — skip XHR logging
+        savedXHROpen = null;
+        savedXHRSend = null;
+      }
+    }
+    if (!interception.console) {
+      try {
+        interceptConsole();
+        interception.console = true;
+      } catch (e) {
+        // console not writable in this sandbox — skip console logging
+      }
+    }
   }
 
-  // Initialize console interception (always intercepts, but only logs when enabled)
-  try {
-    interceptConsole();
-    interception.console = true;
-  } catch (e) {
-    // console not writable in this sandbox — skip console logging
+  // Hand the page back its own globals. If a restore is refused the wrapper
+  // stays in place, so the saved original is kept: the wrapper delegates to it
+  // on every call and would break the page's networking without it. Logging
+  // has already stopped by then, so the wrapper only passes calls through.
+  function removeInterception() {
+    if (interception.fetch) {
+      try {
+        window.fetch = savedFetch;
+        savedFetch = null;
+        interception.fetch = false;
+      } catch (e) {
+        // keep savedFetch: fetchInterceptor still delegates to it
+      }
+    }
+    if (interception.xhr) {
+      try {
+        XMLHttpRequest.prototype.open = savedXHROpen;
+        XMLHttpRequest.prototype.send = savedXHRSend;
+        savedXHROpen = null;
+        savedXHRSend = null;
+        interception.xhr = false;
+      } catch (e) {
+        // keep the saved originals: the interceptors still delegate to them
+      }
+    }
+    if (interception.console) {
+      try {
+        restoreConsole();
+        interception.console = false;
+      } catch (e) {
+        // console keeps the wrapper, which forwards to originalConsole
+      }
+    }
   }
 
   // Logging control functions
   function startLogging(options = {}) {
+    installInterception();
     loggingEnabled = true;
     if (options.clearExisting) {
       consoleLogs = [];
@@ -228,6 +316,7 @@
 
   function stopLogging() {
     loggingEnabled = false;
+    removeInterception();
     return {
       success: true,
       message: 'Logging stopped',
@@ -400,15 +489,23 @@
     }
   }
 
-  // Credential guard: typing into password fields is refused unless the
-  // safety config explicitly allows it. Credentials belong in the browser's
-  // own password manager (autofill), so they never pass through the AI.
-  function assertNotPasswordField(element, options) {
-    const isPassword = element.tagName === 'INPUT' &&
+  // Credential guard: credentials never pass through the AI — neither written
+  // into a password field nor read back out of one — unless the safety config
+  // explicitly allows it. They belong in the browser's own password manager.
+  function isPasswordField(element) {
+    return element.tagName === 'INPUT' &&
       (element.type === 'password' ||
        element.getAttribute('autocomplete') === 'current-password' ||
        element.getAttribute('autocomplete') === 'new-password');
-    if (isPassword && options.allowPassword !== true) {
+  }
+
+  // The server sends allow_password; older callers used allowPassword.
+  function passwordAllowed(options) {
+    return options?.allow_password === true || options?.allowPassword === true;
+  }
+
+  function assertNotPasswordField(element, options) {
+    if (isPasswordField(element) && !passwordAllowed(options)) {
       throw new Error(
         'Refused: target is a password field. Use the browser’s own ' +
         'password manager (autofill) for credentials, or set ' +
@@ -1468,6 +1565,20 @@
     const element = findElement(options);
     if (!element) throw new Error('Element not found');
 
+    // Reading a password field would hand the credential to the AI just as
+    // surely as typing one would, so the same guard applies. Masking rather
+    // than refusing keeps the tool useful: you can still see whether the
+    // field is filled.
+    if (isPasswordField(element) && !passwordAllowed(options)) {
+      return {
+        value: '***',
+        masked: true,
+        note: 'Password field value withheld. Set "allow_password_typing": true in ' +
+              '~/.claudecodebrowser/safety.json to read credentials through the agent.',
+        element: getElementInfo(element)
+      };
+    }
+
     let value;
     if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA') {
       value = element.value;
@@ -1685,6 +1796,13 @@
 
   function getElementInfo(element) {
     const rect = element.getBoundingClientRect();
+    // Element metadata is incidental to every tool that returns it, so a
+    // password value is always masked here — as getPageInfo already does.
+    // browser_get_value is the one deliberate way to read a credential, and
+    // only with the safety config's permission.
+    const value = isPasswordField(element)
+      ? (element.value ? '***' : null)
+      : (element.value?.substring(0, 200) || null);
     return {
       tag: element.tagName.toLowerCase(),
       id: element.id || null,
@@ -1692,7 +1810,7 @@
       name: element.name || null,
       type: element.type || null,
       text: element.textContent?.trim().substring(0, 200) || null,
-      value: element.value?.substring(0, 200) || null,
+      value: value,
       href: element.href || null,
       src: element.src || null,
       placeholder: element.placeholder || null,

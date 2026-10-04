@@ -139,6 +139,32 @@ _TOKEN_TTL_SECONDS = 120
 _MAX_PENDING_TOKENS = 32
 
 
+def resolve_screenshots_dir() -> Path:
+    """Return the directory screenshots are written to, creating it if needed.
+
+    A screenshot can contain anything that was on screen — open mail, a
+    logged-in dashboard — so the default lives in the user's own directory with
+    0700 permissions rather than a world-readable shared /tmp. An explicit
+    CLAUDE_BROWSER_SCREENSHOTS_DIR is honoured as given: the location is then
+    the user's choice and its permissions are left alone.
+    """
+    override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+    if override:
+        path = Path(override).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    path = Path.home() / '.claudecodebrowser' / 'screenshots'
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        # mkdir's mode only applies on creation; tighten an existing directory
+        # left behind by an earlier version.
+        path.chmod(0o700)
+    except OSError as e:
+        logger.warning(f"Could not restrict permissions on {path}: {e}")
+    return path
+
+
 def _load_config() -> Dict[str, Any]:
     """Load safety.json, writing defaults on first run. Unknown keys are kept."""
     config = dict(DEFAULT_CONFIG)

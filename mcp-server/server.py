@@ -76,7 +76,7 @@ MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 # giving up. Launching takes ~15s while the HTTP port binds immediately.
 HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
 
-from safety import get_safety_guard
+from safety import get_safety_guard, resolve_screenshots_dir
 
 # API token for localhost HTTP authentication
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
@@ -103,12 +103,9 @@ HOST = os.environ.get('CLAUDE_BROWSER_HOST', '127.0.0.1')
 HTTP_PORT = int(os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765'))
 WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 
-# Screenshots directory - configurable via environment variable
-# Default to /tmp/claudecodebrowser/screenshots (accessible from any mount point)
-# Can be overridden by setting CLAUDE_BROWSER_SCREENSHOTS_DIR
-DEFAULT_SCREENSHOTS_DIR = Path('/tmp/claudecodebrowser/screenshots')
-SCREENSHOTS_DIR = Path(os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR', str(DEFAULT_SCREENSHOTS_DIR)))
-SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+# Screenshots directory: ~/.claudecodebrowser/screenshots (0700), or wherever
+# CLAUDE_BROWSER_SCREENSHOTS_DIR points.
+SCREENSHOTS_DIR = resolve_screenshots_dir()
 
 
 def camelize_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -1110,11 +1107,13 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         action = tool_action_map[tool_name]
         tab_id = arguments.pop('tab_id', None)
 
-        # Password guard: typing into <input type="password"> is refused by the
-        # browser side unless the safety config explicitly allows it. The flag
-        # travels with the command so the enforcement happens where the element
-        # type is visible.
-        if tool_name in ('browser_type', 'browser_set_value'):
+        # Password guard: <input type="password"> is neither written nor read
+        # back unless the safety config explicitly allows it. The flag travels
+        # with the command so the enforcement happens where the element type is
+        # visible. Reads are masked rather than refused, so inspection tools
+        # still report whether a field is filled.
+        if tool_name in ('browser_type', 'browser_set_value',
+                         'browser_get_value', 'browser_get_elements'):
             arguments['allow_password'] = bool(
                 get_safety_guard().config.get('allow_password_typing', False))
 

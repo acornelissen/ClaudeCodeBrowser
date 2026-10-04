@@ -173,58 +173,103 @@ def check_mcp_server():
         return False
 
 
-def kill_existing_server():
-    """Kill any existing MCP server process on the port."""
-    import subprocess
+# Our own server is the only process this host may ever kill. Anything else
+# listening on the port belongs to the user — a dev server, a database, a
+# container proxy — and Firefox launches this host automatically, so a
+# mistaken kill would be an unprompted termination of someone's work.
+_SERVER_SCRIPT_MARKERS = ('mcp-server/server.py', r'mcp-server\server.py')
 
+
+def _pids_on_port(port):
+    """PIDs listening on a TCP port, or [] when they cannot be determined."""
     try:
-        # Find process using the port
         result = subprocess.run(
-            ['lsof', '-ti', f':{MCP_SERVER_PORT}'],
+            ['lsof', '-ti', f':{port}'],
             capture_output=True,
             text=True
         )
-
-        if result.stdout.strip():
-            pids = result.stdout.strip().split('\n')
-            for pid in pids:
-                try:
-                    pid = int(pid.strip())
-                    logger.info(f"Sending SIGTERM to process on port {MCP_SERVER_PORT}: PID {pid}")
-                    os.kill(pid, signal.SIGTERM)
-                except (ValueError, ProcessLookupError):
-                    pass
-
-            time.sleep(2.0)
-
-            for pid in pids:
-                try:
-                    pid = int(pid.strip())
-                    os.kill(pid, 0)  # check if still alive
-                    logger.warning(f"Process {pid} still alive after SIGTERM, sending SIGKILL")
-                    os.kill(pid, signal.SIGKILL)
-                except (ValueError, ProcessLookupError):
-                    pass
-
-            time.sleep(0.5)
-            return True
-
     except FileNotFoundError:
-        # lsof not available, try fuser
-        try:
-            result = subprocess.run(
-                ['fuser', '-k', f'{MCP_SERVER_PORT}/tcp'],
-                capture_output=True
-            )
-            time.sleep(0.5)
-            return True
-        except FileNotFoundError:
-            logger.warning("Neither lsof nor fuser available to kill existing server")
-
+        logger.warning("lsof not available: cannot identify what holds the port, "
+                       "so nothing will be killed")
+        return []
     except Exception as e:
-        logger.warning(f"Failed to kill existing server: {e}")
+        logger.warning(f"Could not list processes on port {port}: {e}")
+        return []
 
-    return False
+    pids = []
+    for line in result.stdout.split():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            pass
+    return pids
+
+
+def _process_command(pid):
+    """The full command line of a PID, or None when it cannot be read."""
+    try:
+        result = subprocess.run(
+            ['ps', '-p', str(pid), '-o', 'command='],
+            capture_output=True,
+            text=True
+        )
+    except Exception as e:
+        logger.warning(f"Could not read the command line of PID {pid}: {e}")
+        return None
+    command = result.stdout.strip()
+    return command or None
+
+
+def _is_our_server(pid):
+    """True only when the PID is running our own MCP server script."""
+    command = _process_command(pid)
+    if not command:
+        return False
+    return any(marker in command for marker in _SERVER_SCRIPT_MARKERS)
+
+
+def _terminate(pid):
+    """SIGTERM, then SIGKILL if it is still alive."""
+    try:
+        logger.info(f"Sending SIGTERM to our MCP server: PID {pid}")
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        logger.warning(f"Not permitted to signal PID {pid}")
+        return
+
+    time.sleep(2.0)
+    try:
+        os.kill(pid, 0)  # still alive?
+        logger.warning(f"PID {pid} still alive after SIGTERM, sending SIGKILL")
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_existing_server():
+    """Clear a stale MCP server off the port.
+
+    Only processes running our own server script are terminated. If something
+    else holds the port, it is left alone and this returns False — the port is
+    not ours to take, and the caller reports a startup failure instead.
+    """
+    killed = False
+    for pid in _pids_on_port(MCP_SERVER_PORT):
+        if _is_our_server(pid):
+            _terminate(pid)
+            killed = True
+        else:
+            logger.error(
+                f"Port {MCP_SERVER_PORT} is held by PID {pid}, which is not our MCP "
+                f"server ({_process_command(pid)!r}). Leaving it alone. Set "
+                f"CLAUDE_MCP_PORT to use a different port."
+            )
+
+    if killed:
+        time.sleep(0.5)
+    return killed
 
 
 def start_mcp_server():
@@ -323,8 +368,13 @@ def ensure_mcp_server():
 
     # Check if port is in use but server not responding (stale process)
     if is_port_in_use():
-        logger.warning("Port in use but server not responding - killing stale process")
-        kill_existing_server()
+        logger.warning("Port in use but server not responding - clearing stale process")
+        if not kill_existing_server():
+            logger.error(
+                f"Port {MCP_SERVER_PORT} is in use by something that is not our MCP "
+                f"server. Not starting a server that cannot bind. Free the port or "
+                f"set CLAUDE_MCP_PORT.")
+            return False
 
     logger.info("MCP server not running, attempting to start...")
     return start_mcp_server()
@@ -358,11 +408,17 @@ def handle_local_command(message):
             # Strip directory components to prevent path traversal
             filename = Path(message.get('filename', f'screenshot_{int(time.time())}.png')).name
 
-            # Use configurable screenshots directory (default: /tmp/claudecodebrowser/screenshots)
-            # This ensures screenshots are accessible from any mount point (e.g., /mnt/backup/)
-            default_dir = Path('/tmp/claudecodebrowser/screenshots')
-            screenshots_dir = Path(os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR', str(default_dir)))
-            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            # A screenshot can contain anything that was on screen, so the
+            # default is the user's own directory at 0700, not a shared /tmp.
+            # Mirrors resolve_screenshots_dir() in mcp-server/safety.py; this
+            # host is installed on its own and cannot import it.
+            override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+            if override:
+                screenshots_dir = Path(override).expanduser()
+                screenshots_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                screenshots_dir = Path.home() / '.claudecodebrowser' / 'screenshots'
+                screenshots_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
             filepath = screenshots_dir / filename
 
@@ -531,11 +587,14 @@ def health_monitor_thread():
                 if consecutive_failures >= 2:
                     logger.info("Attempting to restart MCP server...")
 
-                    # Kill stale process if port is in use
-                    if is_port_in_use():
-                        logger.info("Killing stale process on port")
-                        kill_existing_server()
-                        time.sleep(0.5)
+                    # Clear a stale server off the port. If the port belongs to
+                    # something else, leave it and stop trying to restart.
+                    if is_port_in_use() and not kill_existing_server():
+                        logger.error(
+                            f"Port {MCP_SERVER_PORT} is held by another program; "
+                            f"not restarting.")
+                        continue
+                    time.sleep(0.5)
 
                     if start_mcp_server():
                         logger.info("MCP server restart initiated")
