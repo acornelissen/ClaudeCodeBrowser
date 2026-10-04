@@ -336,10 +336,21 @@ function redactStructure(value, depth = 0) {
   if (value && typeof value === "object") {
     const out = {};
     for (const key of Object.keys(value)) {
+      const child = value[key];
+      // A boolean or null is never a credential, whatever the key is called,
+      // so it is kept even under a credential-shaped name. Without this,
+      // `authenticated: true` and `verified: false` were replaced with ***,
+      // which destroys the one field that tells you whether the login you are
+      // debugging actually worked. A NUMBER is not exempt: an OTP or PIN is a
+      // number and is exactly what has to be hidden.
+      if (typeof child === 'boolean' || child === null) {
+        out[key] = child;
+        continue;
+      }
       // A secret key hides its whole subtree, whatever shape it is.
       out[key] = looksLikeCredentialName(key)
         ? "***"
-        : redactStructure(value[key], depth + 1);
+        : redactStructure(child, depth + 1);
     }
     return out;
   }
@@ -365,9 +376,11 @@ function redactTextPasses(text) {
     /([A-Za-z0-9_\-\[\]."]+)(\s*[:=]\s*)(["'])(?:(?!\3)[^\\]|\\.)*\3/g,
     (match, key, sep, quote) =>
       (looksLikeCredentialName(key) ? `${key}${sep}${quote}***${quote}` : match));
-  // Unquoted JSON values: "otp": 654321, "verified": true.
+  // Unquoted JSON numbers: "otp": 654321. true/false/null are deliberately
+  // not in here - a boolean is never a credential, and masking
+  // `authenticated: true` hides the result you were looking for.
   out = out.replace(
-    /("(?:[^"\\]|\\.)*"\s*:\s*)(-?\d[\d.eE+-]*|true|false|null)/g,
+    /("(?:[^"\\]|\\.)*"\s*:\s*)(-?\d[\d.eE+-]*)/g,
     (match, keyPart) => (looksLikeCredentialName(keyPart) ? `${keyPart}"***"` : match));
   out = redactMultipartFields(out);
   out = redactHtmlInputValues(out);

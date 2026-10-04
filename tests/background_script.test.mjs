@@ -879,6 +879,32 @@ test('a credential nested deeper than the walk limit is not logged', async () =>
   }
 });
 
+test('a boolean under a credential name is kept, a number is not', async () => {
+  // `authenticated: true` was replaced with ***, which destroys the one field
+  // that tells you whether the login you are debugging actually worked. A
+  // boolean is never a credential whatever the key is called. A NUMBER is not
+  // exempt: an OTP or a PIN is a number and is exactly what must be hidden.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  const body = JSON.stringify({
+    authenticated: true, isAuthenticated: false, passwordSet: true,
+    sessionValid: null, otp: 483920, password: 'hunter2'
+  });
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestBody: { raw: [{ bytes: new TextEncoder().encode(body) }] }
+  });
+
+  const logged = (await command('getNetworkLogs', {}, 7)).logs[0].requestBody;
+  const parsed = JSON.parse(logged);
+  assert.equal(parsed.authenticated, true, 'a boolean must survive');
+  assert.equal(parsed.isAuthenticated, false);
+  assert.equal(parsed.passwordSet, true);
+  assert.equal(parsed.sessionValid, null);
+  assert.equal(parsed.otp, '***', 'a numeric OTP is a credential');
+  assert.equal(parsed.password, '***');
+});
+
 test('a captured body keeps its numbers exactly when nothing is redacted', async () => {
   // Redaction re-serialised every JSON body, and JSON.stringify(JSON.parse(x))
   // turns 12345678901234567890 into 12345678901234567000, 1e400 into null and
