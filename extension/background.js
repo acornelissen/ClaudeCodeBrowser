@@ -2262,13 +2262,23 @@ browser.contextMenus.create({
 browser.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === "claude-screenshot") {
     takeScreenshot(tab.id).then(result => {
-      if (result.success && nativePort) {
-        nativePort.postMessage({
-          action: "screenshotTaken",
-          data: result.data,
-          tab: { id: tab.id, url: tab.url, title: tab.title }
-        });
+      if (!result.success || !nativePort) return;
+      // Not from a private window. The native host writes the file itself,
+      // so the server's refusal to persist a private-window screenshot does
+      // not cover this path.
+      if (result.privateWindow === true) {
+        console.warn("[ClaudeCodeBrowser] not saving a screenshot of a " +
+                     "private window");
+        return;
       }
+      // "saveScreenshot", not "screenshotTaken": the native host has no
+      // handler for the latter, so the message fell through to the dead
+      // /browser/command endpoint and this menu item did nothing at all.
+      nativePort.postMessage({
+        action: "saveScreenshot",
+        data: result.data,
+        tab: { id: tab.id, url: tab.url, title: tab.title }
+      });
     });
   } else if (info.menuItemId === "claude-inspect") {
     browser.tabs.sendMessage(tab.id, {

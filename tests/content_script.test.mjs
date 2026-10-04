@@ -762,16 +762,36 @@ test('observeElement expires on its own and says when', async () => {
 });
 
 test('an expired observer still returns the changes it collected', async () => {
+  // This used to call stopObserving with observerId: undefined and assert
+  // found === false, which has always been true for an unknown id - so it
+  // proved nothing about its own title and passed with the whole expiry
+  // feature reverted. Drive a real change through the observer, let it
+  // expire, then ask for the changes by their real id.
   const target = makeElement('div', { id: 'watch' });
   const ctx = loadContentScript({ '#watch': target });
 
-  await ctx.send({ action: 'observeElement', selector: '#watch',
-                   maxLifetimeMs: 30 });
-  await new Promise(resolve => setTimeout(resolve, 60));
+  const started = await ctx.send({ action: 'observeElement',
+                                   selector: '#watch', maxLifetimeMs: 40 });
+  const observer = ctx.observers.at(-1);
+  observer.cb([{ type: 'childList', target,
+                 addedNodes: [makeElement('span', {})], removedNodes: [] }]);
+
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(observer.disconnected, true,
+               'the lifetime elapsed, so the observer must be disconnected');
 
   const stopped = await ctx.send({ action: 'stopObserving',
-                                   observerId: undefined });
-  // Without the id it reports not-found rather than throwing.
+                                   observerId: started.observerId });
+  assert.equal(stopped.found !== false, true,
+               'the record must survive expiry so its changes can be read');
+  assert.equal(stopped.changes.length, 1,
+               'a change collected before expiry must still be returned');
+});
+
+test('an unknown observer id reports not-found rather than throwing', async () => {
+  const ctx = loadContentScript({});
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: 'never-existed' });
   assert.equal(stopped.found, false);
 });
 
