@@ -672,6 +672,174 @@ test('credential-shaped values inside bodies are scrubbed', async () => {
   assert.ok(entry.responseBody.includes('expires_in'), 'the rest of the body stays');
 });
 
+test('an HTML form login does not log the password', async () => {
+  // webRequest hands an ordinary <form method=POST> over as requestBody
+  // .formData, whose values are ARRAYS. Every fixture here used raw bytes, so
+  // the one request that matters most - a login - was never exercised, and
+  // the scrubber's string passes cannot see "password":["hunter2"].
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestBody: { formData: {
+      username: ['albert'], password: ['hunter2'], csrf_token: ['tok-123'] } }
+  });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  const body = result.logs[0].requestBody;
+  assert.ok(!body.includes('hunter2'), `password leaked: ${body}`);
+  assert.ok(!body.includes('tok-123'), `csrf token leaked: ${body}`);
+  assert.ok(body.includes('albert'), 'the username stays readable');
+});
+
+test('credential values that are not quoted strings are scrubbed too', async () => {
+  // The old pass matched only "key":"string", so a numeric OTP, an array of
+  // tokens and a nested credential object all went through verbatim.
+  const cases = [
+    ['{"password":1234,"otp":654321}', ['1234', '654321']],
+    ['{"access_tokens":["tok-aaa","tok-bbb"]}', ['tok-aaa', 'tok-bbb']],
+    ['{"auth":{"value":"tok-zzz"}}', ['tok-zzz']],
+    ['{"user":{"profile":{"api_key":"deep-secret"}}}', ['deep-secret']],
+    ['pwd=hunter2&next=/home', ['hunter2']],
+    ['<login password="hunter2"/>', ['hunter2']],
+    ['pin=4321', ['4321']]
+  ];
+  for (const [raw, secrets] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      method: 'POST',
+      requestBody: { raw: [{ bytes: new TextEncoder().encode(raw) }] }
+    });
+    const result = await command('getNetworkLogs', {}, 7);
+    const body = result.logs[0].requestBody;
+    for (const secret of secrets) {
+      assert.ok(!body.includes(secret),
+                `${secret} leaked from ${raw}: got ${body}`);
+    }
+  }
+});
+
+test('a prefilled password inside a JSON string is scrubbed', async () => {
+  // The structural path short-circuits the markup pass, so a JSON-wrapped
+  // server-rendered form had to keep going through it.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+  filters[0].ondata({ data: new TextEncoder().encode(
+    '{"html":"<input type=\\"password\\" value=\\"hunter2\\">","ok":true}') });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(!entry.responseBody.includes('hunter2'),
+            `password leaked inside a JSON string: ${entry.responseBody}`);
+  assert.ok(entry.responseBody.includes('input'),
+            'the rest of the markup stays readable');
+});
+
+test('a multipart login frame does not log the password', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  const raw = [
+    '--X', 'Content-Disposition: form-data; name="username"', '', 'albert',
+    '--X', 'Content-Disposition: form-data; name="password"', '', 'hunter2',
+    '--X--', ''
+  ].join('\r\n');
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestBody: { raw: [{ bytes: new TextEncoder().encode(raw) }] }
+  });
+  const result = await command('getNetworkLogs', {}, 7);
+  const body = result.logs[0].requestBody;
+  assert.ok(!body.includes('hunter2'), `password leaked: ${body}`);
+  assert.ok(body.includes('albert'), 'the username stays readable');
+});
+
+test('scrubbing a captured script does not destroy the source around it', async () => {
+  // The form-encoded pass was unanchored with a loose value class, so it ate
+  // whatever followed an assignment: this body came back as
+  // `const apiKey=*** sessionId=***`, eleven characters of source gone, and
+  // `a.password==="x"` became `a.password=***"x"` - mangled and still leaking.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'application/javascript' }],
+    complete: false
+  });
+  filters[0].ondata({ data: new TextEncoder().encode(
+    'const apiKey=process.env.KEY;let count=1;if(a.password==="x"){}') });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(entry.responseBody.includes('let count=1;'),
+            `the following statement was destroyed: ${entry.responseBody}`);
+  assert.ok(!entry.responseBody.includes('a.password=***"x"'),
+            `a comparison was mangled: ${entry.responseBody}`);
+});
+
+test('a credential straddling the body cap is still scrubbed', async () => {
+  // The response path truncated and then scrubbed, so a secret cut in half
+  // survived as a fragment: the unterminated string matched nothing.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+  const padding = 'x'.repeat(4960);
+  filters[0].ondata({ data: new TextEncoder().encode(
+    `{"pad":"${padding}","access_token":"SECRET-JWT-VALUE-abcdefgh"}`) });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(!entry.responseBody.includes('SECRET-JWT-'),
+            `a fragment of the token survived: ${entry.responseBody.slice(-80)}`);
+});
+
+test('a body truncated across several chunks says so, with its real size', async () => {
+  // Collection stops at the cap, so collected.length never exceeded it by
+  // more than one chunk - and landed exactly on it when the chunks divided
+  // evenly, which left truncation entirely unflagged.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+  const chunk = new TextEncoder().encode('y'.repeat(2500));
+  filters[0].ondata({ data: chunk });
+  filters[0].ondata({ data: chunk });
+  filters[0].ondata({ data: chunk });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.responseBodyTruncated, true,
+               'a 7500-character body cut to 5000 must be flagged');
+  assert.equal(entry.responseBodyBytes, 7500,
+               'the reported size must be the real one, not the cap');
+});
+
+test('a JSON body is decoded as utf-8 whatever charset it claims', async () => {
+  // RFC 8259 requires UTF-8 for application/json and says the charset
+  // parameter must be ignored. Older stacks send charset=ISO-8859-1 while
+  // emitting UTF-8, and trusting the label turned café into cafÃ© with no
+  // note, because iso-8859-1 is a charset TextDecoder knows.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type',
+                        value: 'application/json;charset=ISO-8859-1' }],
+    complete: false
+  });
+  filters[0].ondata({ data: new TextEncoder().encode('{"city":"café"}') });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(entry.responseBody.includes('café'),
+            `mojibake in the log: ${entry.responseBody}`);
+  assert.equal(entry.responseCharset, 'utf-8');
+});
+
 test('capture_bodies: false suppresses request bodies too, not just responses', async () => {
   const { command, webRequest } = loadBackground();
   await command('startLogging', { captureBodies: false }, 7);
@@ -1304,7 +1472,7 @@ test('a truncated body is flagged with its real length', async () => {
   assert.equal(entry.responseBody.length, 5000);
   assert.equal(entry.responseBodyTruncated, true,
     'the cap applied silently, so a short body and a cut one looked alike');
-  assert.equal(entry.responseBodyLength, 6000);
+  assert.equal(entry.responseBodyBytes, 6000);
 });
 
 // --------------------------------------------------------------------------

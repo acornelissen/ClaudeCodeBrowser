@@ -84,6 +84,17 @@ function charsetFromContentType(value) {
   return match ? match[1].toLowerCase() : null;
 }
 
+// JSON is UTF-8 by definition. RFC 8259 section 8.1 requires it and says the
+// charset parameter must be ignored, and plenty of older stacks send
+// `application/json;charset=ISO-8859-1` while emitting UTF-8 anyway. Trusting
+// that label turned `café` into `cafÃ©` in the log with no note attached,
+// because iso-8859-1 is a charset TextDecoder knows, so nothing looked wrong.
+function charsetForBody(contentType) {
+  const type = (contentType || "").split(";")[0].trim().toLowerCase();
+  if (type === "application/json" || type.endsWith("+json")) return "utf-8";
+  return charsetFromContentType(contentType) || "utf-8";
+}
+
 // TextDecoder throws on a label it does not know; fall back rather than
 // losing the body entirely.
 function decoderFor(charset) {
@@ -220,8 +231,11 @@ function redactHeaderList(headers) {
 // verbatim one request earlier. This cannot be complete - a body is arbitrary
 // data - so bodies stay off by default for anything but textual responses and
 // can be disabled entirely with capture_bodies: false.
+// "pin" is the only one anchored: unanchored it matches shipping, mapping and
+// spinner. The rest are deliberately loose, because over-redacting a log
+// entry costs nothing and under-redacting one costs a credential.
 const SECRET_KEY_RE =
-  /(pass(word|wd)?|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number)/i;
+  /(pass(word|wd|phrase)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
 
 // Markup carries credentials in attributes, not just in JSON keys: a
 // server-rendered form with a prefilled password puts it in value="...",
@@ -245,20 +259,91 @@ function redactHtmlInputValues(text) {
   });
 }
 
+// Walk a parsed structure, replacing any value under a credential-shaped key.
+// Structural, because a regex over the serialised form can only ever match the
+// value shapes somebody thought of: {"otp":654321}, {"tokens":["a","b"]} and
+// {"auth":{"value":"x"}} all went through the old string pass untouched, and
+// webRequest's requestBody.formData is ALWAYS array-valued
+// ({"password":["hunter2"]}), so the single most privacy-relevant request the
+// extension sees - an HTML form login - logged the password verbatim.
+const MAX_REDACT_DEPTH = 12;
+
+function redactStructure(value, depth = 0) {
+  if (depth > MAX_REDACT_DEPTH) return value;
+  if (typeof value === "string") {
+    // A JSON string can itself hold a rendered form with a prefilled
+    // password, so the text passes still have to run over it. Without this,
+    // taking the structural path would have been a regression for
+    // {"html":"<input type=password value=secret>"}.
+    return redactTextPasses(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(item => redactStructure(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value)) {
+      // A secret key hides its whole subtree, whatever shape it is.
+      out[key] = SECRET_KEY_RE.test(key)
+        ? "***"
+        : redactStructure(value[key], depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+// name="password" in a multipart frame, whose value is the lines that follow
+// it up to the next boundary. This is what a form POST with a file input
+// looks like, so it is an ordinary login shape, not an exotic one.
+function redactMultipartFields(text) {
+  return text.replace(
+    /(name\s*=\s*"([^"]*)"[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*\r?\n)([\s\S]*?)(?=\r?\n--|$)/g,
+    (match, head, name, body) =>
+      (SECRET_KEY_RE.test(name) ? `${head}***` : match));
+}
+
+// The text passes, for a body that is not wholly JSON and for the strings
+// inside one that is.
+function redactTextPasses(text) {
+  // key="value" and key: 'value' - XML and HTML attributes, JS object
+  // literals, and JSON that did not parse because it was cut at the cap.
+  let out = text.replace(
+    /([A-Za-z0-9_\-\[\]."]+)(\s*[:=]\s*)(["'])(?:(?!\3)[^\\]|\\.)*\3/g,
+    (match, key, sep, quote) =>
+      (SECRET_KEY_RE.test(key) ? `${key}${sep}${quote}***${quote}` : match));
+  // Unquoted JSON values: "otp": 654321, "verified": true.
+  out = out.replace(
+    /("(?:[^"\\]|\\.)*"\s*:\s*)(-?\d[\d.eE+-]*|true|false|null)/g,
+    (match, keyPart) => (SECRET_KEY_RE.test(keyPart) ? `${keyPart}"***"` : match));
+  out = redactMultipartFields(out);
+  out = redactHtmlInputValues(out);
+  // Form-encoded: key=value, anchored to a real pair separator and stopping
+  // at one. Unanchored with a loose value class this ate the rest of the
+  // line: `const apiKey=process.env.KEY;let sessionId=1;` came out as
+  // `const apiKey=*** sessionId=***`, destroying the following statement,
+  // and `a.password==="x"` became `a.password=***"x"` - mangled and still
+  // leaking. The (?!=) guard keeps it off JS comparisons.
+  out = out.replace(
+    /(^|[&?;\s])([A-Za-z0-9_\-\[\].]+)=(?!=)([^&\s<>"';]*)/g,
+    (match, lead, key) => (SECRET_KEY_RE.test(key) ? `${lead}${key}=***` : match));
+  return out;
+}
+
 function redactSecretsInBody(text) {
   if (!text) return text;
   try {
-    // JSON-ish: "key": "value"
-    let out = text.replace(
-      /("(?:[^"\\]|\\.)*"\s*:\s*)"(?:[^"\\]|\\.)*"/g,
-      (match, keyPart) => (SECRET_KEY_RE.test(keyPart) ? `${keyPart}"***"` : match));
-    // HTML input attributes.
-    out = redactHtmlInputValues(out);
-    // Form-encoded: key=value. Runs last and skips anything inside a tag, so
-    // it cannot mangle markup the step above already handled.
-    out = out.replace(/([^&=?\s<>"']+)=([^&\s<>"']*)/g,
-      (match, key) => (SECRET_KEY_RE.test(key) ? `${key}=***` : match));
-    return out;
+    // A body that is wholly JSON is redacted structurally and re-serialised,
+    // which covers every value shape exactly.
+    const trimmed = text.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return JSON.stringify(redactStructure(JSON.parse(trimmed)));
+      } catch (e) {
+        // Not valid JSON (or truncated); fall through to the text passes.
+      }
+    }
+    return redactTextPasses(text);
   } catch (e) {
     return "[redaction failed; body withheld]";
   }
@@ -269,8 +354,10 @@ function describeRequestBody(requestBody) {
   if (!requestBody) return null;
   try {
     if (requestBody.formData) {
-      return redactSecretsInBody(
-        JSON.stringify(requestBody.formData)).substring(0, 1000);
+      // Structural, not a scrub of the serialised form: formData values are
+      // arrays ({"password":["hunter2"]}), which the string passes cannot see.
+      return JSON.stringify(
+        redactStructure(requestBody.formData)).substring(0, 1000);
     }
     if (requestBody.raw && requestBody.raw.length) {
       // fatal: false so an undecodable request body yields replacement
@@ -279,8 +366,12 @@ function describeRequestBody(requestBody) {
       const text = requestBody.raw
         .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes, { stream: true }) : ""))
         .join("") + decoder.decode();
-      const scrubbed = redactSecretsInBody(text);
-      return scrubbed.length > 1000
+      // Scrub a bounded window rather than the whole body: only the first
+      // 1000 characters are kept, and a multi-megabyte upload would otherwise
+      // run every regex pass over all of it. The window is wide enough that a
+      // credential straddling the 1000-character cut is still scrubbed first.
+      const scrubbed = redactSecretsInBody(text.substring(0, 4000));
+      return text.length > 1000
         ? scrubbed.substring(0, 1000) + "…[truncated]"
         : scrubbed;
     }
@@ -395,7 +486,7 @@ function captureResponseHeaders(details) {
   const encoding = (headerValue("content-encoding") || "").trim();
   if (encoding) entry.responseEncoding = encoding;
 
-  entry.responseCharset = charsetFromContentType(contentType) || "utf-8";
+  entry.responseCharset = charsetForBody(contentType);
 
   // onBeforeRequest fires again for a redirect target under the same
   // requestId, so without this guard a 30x could attach a second filter to
@@ -434,6 +525,13 @@ function attachResponseBodyReader(requestId, entry) {
     entry.charsetNote = `unsupported charset "${charset}"; decoded as utf-8`;
   }
   let collected = "";
+  // Counted on every chunk, including the ones past the cap, so a truncated
+  // body can say how big it really was. collected.length cannot: collection
+  // stops at the cap, so it never exceeded MAX_BODY_CHARS by more than one
+  // chunk and landed exactly on it whenever the chunks divided evenly - which
+  // is the case where truncation went unflagged entirely.
+  let totalBytes = 0;
+  let capped = false;
   let released = false;
 
   // Hand the stream back exactly once, whichever way we got here.
@@ -464,9 +562,12 @@ function attachResponseBodyReader(requestId, entry) {
 
   filter.ondata = (event) => {
     // Collect first, but never let collection stop the pass-through.
+    totalBytes += (event.data && event.data.byteLength) || 0;
     try {
       if (collected.length < MAX_BODY_CHARS) {
         collected += decoder.decode(event.data, { stream: true });
+      } else {
+        capped = true;
       }
     } catch (e) {
       // Undecodable chunk (wrong charset, still-compressed bytes): skip it.
@@ -499,13 +600,20 @@ function attachResponseBodyReader(requestId, entry) {
       release("close");
       return;
     }
-    const truncated = collected.length > MAX_BODY_CHARS;
-    entry.responseBody = redactSecretsInBody(collected.substring(0, MAX_BODY_CHARS));
-    if (truncated) {
+    // Scrub first, cut second. The other way round, a credential straddling
+    // the cut survived as a fragment: a 5000-character JSON body ended
+    // `…","access_token":"SECRET-JWT-` in the log, because the unterminated
+    // string no longer matched anything the scrubber looks for. The request
+    // path has always done it in this order.
+    const scrubbed = redactSecretsInBody(collected);
+    entry.responseBody = scrubbed.length > MAX_BODY_CHARS
+      ? scrubbed.substring(0, MAX_BODY_CHARS)
+      : scrubbed;
+    if (capped || collected.length > MAX_BODY_CHARS) {
       // Previously the cap applied with no indication, so the agent could not
       // tell a short body from a truncated one.
       entry.responseBodyTruncated = true;
-      entry.responseBodyLength = collected.length;
+      entry.responseBodyBytes = totalBytes;
     }
     release("close");
   };
