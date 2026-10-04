@@ -949,16 +949,25 @@ class SafetyGuard:
         for found in (url.find('?'), url.find('#')):
             if found != -1:
                 granting_end = min(granting_end, found)
+        # The prefixes a pattern is allowed to cover: the text up to each
+        # delimiter, and the whole granting part. Asking whether the pattern
+        # covers one of these, rather than testing where its own match
+        # happened to land, is what makes the rule mean what it says. A
+        # single pattern.match() returns the engine's first greedy match, so
+        # with "^https://example\.com(/foo)?" that match ran into "foobar"
+        # and ended at no delimiter at all: https://example.com/foobar was
+        # refused while https://example.com/bar was permitted, even though
+        # the pattern covers "https://example.com" in both.
+        prefix_ends = [i for i, char in enumerate(url[:granting_end])
+                       if char in _URL_DELIMITERS]
+        prefix_ends.append(granting_end)
         for pattern in patterns:
             # Anchored at the start of the URL and required to stop where the
             # authority or a path segment stops: "^https://localhost" covers
-            # https://localhost:3000/app because its match ends at the ':',
-            # and cannot cover https://localhost.evil.com/x because that
-            # match would end at a '.'.
-            match = pattern.match(url)
-            if (match is not None and match.end() <= granting_end
-                    and (match.end() == len(url)
-                         or url[match.end()] in _URL_DELIMITERS)):
+            # https://localhost:3000/app because it covers the prefix ending
+            # at the ':', and cannot cover https://localhost.evil.com/x
+            # because no prefix there ends after "localhost".
+            if any(pattern.fullmatch(url, 0, end) for end in prefix_ends):
                 return True
             # A bare host pattern ("localhost", r".*\.example\.com") names a
             # host, so it has to match all of one. It covers that host only:

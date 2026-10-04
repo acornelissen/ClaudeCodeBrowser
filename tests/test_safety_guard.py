@@ -291,6 +291,26 @@ class UrlPolicyTests(unittest.TestCase):
         self.assertIsNone(g.check('browser_screenshot', {}),
                           'the pattern still names stripe.com subdomains')
 
+    def test_a_pattern_whose_greedy_match_overshoots_still_permits(self):
+        """The delimiter test is applied to a prefix that ends at a delimiter,
+        not to whichever match the engine returns first. With
+        "^https://example\.com(/foo)?" the engine's first match of
+        https://example.com/foobar ends inside "foobar", so the URL was
+        refused while https://example.com/bar was permitted - the prefix the
+        rule describes exists, it just was not the match handed back."""
+        g = guard(allowed_url_patterns=[r'^https://example\.com(/foo)?'])
+        for url in ('https://example.com/bar', 'https://example.com/foobar',
+                    'https://example.com/foo/deep', 'https://example.com/foo'):
+            with self.subTest(url=url):
+                self.assertIsNone(g.check('browser_navigate', {'url': url}),
+                                  'every one of these is under example.com')
+        for hostile in ('https://example.com.evil.test/x',
+                        'https://example.community/x'):
+            with self.subTest(url=hostile):
+                denial = g.check('browser_navigate', {'url': hostile})
+                self.assertIsNotNone(denial, 'another host entirely')
+                self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
     def test_a_bare_host_pattern_covers_that_host_and_no_other(self):
         r"""A permit pattern naming a host matches the whole of one host.
         r"example\.com" does not cover www.example.com - write
