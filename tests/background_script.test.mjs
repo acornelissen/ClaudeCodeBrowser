@@ -42,6 +42,11 @@ function makeEvent() {
   };
 }
 
+// A destructuring default cannot express "the content script resolved with
+// undefined", which is the real Firefox behaviour for a receiver that exists
+// but returns neither true nor a Promise. SILENT is that case.
+const SILENT = Symbol('content script answered nothing');
+
 function loadBackground({ contentScriptReply = { success: true } } = {}) {
   const webRequest = {
     onBeforeRequest: makeEvent(),
@@ -99,7 +104,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
       },
       sendMessage: async (tabId, message) => {
         contentMessages.push({ tabId, message });
-        return contentScriptReply;
+        return contentScriptReply === SILENT ? undefined : contentScriptReply;
       },
       update: async () => ({}),
       reload: async () => ({}),
@@ -1321,6 +1326,116 @@ test('an ordinary tab is still loggable', async () => {
   assert.equal(result.success, true);
 });
 
+test('a private tab is refused when we cannot tell whether it is private', async () => {
+  // isPrivateTab returned false on any exception, so a check that could not
+  // answer was the reason a private window's traffic reached the buffer.
+  const ctx = loadBackground();
+  ctx.context.browser.tabs.get = async () => { throw new Error('no such tab'); };
+
+  const result = await ctx.command('startLogging', {}, 7);
+
+  assert.equal(result.success, false,
+    'a privacy gate that cannot answer must refuse');
+});
+
+test('a bulk screenshot sweep skips private windows', async () => {
+  const ctx = loadBackground();
+  ctx.context.browser.tabs.query = async () => ([
+    { id: 1, url: 'http://ordinary.test/', title: 'a', windowId: 1, active: true },
+    { id: 2, url: 'http://secret.test/', title: 'b', windowId: 2, incognito: true }
+  ]);
+
+  const result = await ctx.command('screenshotAllTabs', {}, undefined);
+
+  const urls = (result.screenshots || result.tabs || []).map(s => s.url);
+  assert.ok(!urls.includes('http://secret.test/'),
+            `a private window was captured: ${JSON.stringify(urls)}`);
+});
+
+test('a single screenshot says when it came from a private window', async () => {
+  // The image still goes to the agent, but the server needs to know not to
+  // write it to disk for a week.
+  const ctx = loadBackground();
+  ctx.context.browser.tabs.query = async () => ([
+    { id: 2, url: 'http://secret.test/', title: 'b', windowId: 2,
+      active: true, incognito: true }
+  ]);
+
+  const result = await ctx.command('screenshot', {}, undefined);
+
+  assert.equal(result.privateWindow, true);
+});
+
+test('a content script that answers nothing is not reported as success', async () => {
+  // A receiver that exists but returns neither true nor a Promise resolves
+  // the sender's promise with undefined, and `{success: true, ...undefined}`
+  // claimed the work was done: getText returned {success:true} with no text
+  // and click reported a click nobody made.
+  const ctx = loadBackground({ contentScriptReply: SILENT });
+
+  for (const action of ['getText', 'click', 'type', 'getElements']) {
+    const result = await ctx.command(action, { selector: '#x' }, 7);
+    assert.equal(result.success, false,
+      `${action} claimed success for work that never happened`);
+    assert.match(result.error, /did not answer/i);
+  }
+});
+
+test('wait_for_load: "false" returns at once instead of blocking', async () => {
+  // `!== false` was true for the string, so declining to wait made
+  // browser_refresh block for the full 30-second timeout.
+  const ctx = loadBackground();
+  const result = await ctx.command('refresh', { waitForLoad: 'false' }, 7);
+  assert.equal(result.success, true);
+  assert.equal(result.refreshed, true);
+});
+
+test('refresh reports the bypass_cache it actually used', async () => {
+  // The reload took `|| false` while the result reported
+  // parseFlag(..., true), so the reported field was a lie.
+  const ctx = loadBackground();
+  const used = [];
+  ctx.context.browser.tabs.reload = async (id, opts) => { used.push(opts); };
+
+  const result = await ctx.command('refresh', { waitForLoad: 'false' }, 7);
+
+  assert.equal(used[0].bypassCache, false,
+               'the schema default for browser_refresh is false');
+  assert.equal(result.bypassCache, used[0].bypassCache,
+               'the reported value must be the one that was used');
+});
+
+test('duplicate response headers are both represented', async () => {
+  // out[header.name] = ... collapsed them, so two Set-Cookie headers became
+  // one and the count was lost. Real responses almost always carry several.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  fireRequest(webRequest, {
+    responseHeaders: [
+      { name: 'content-type', value: 'application/json' },
+      { name: 'x-dup', value: 'one' },
+      { name: 'x-dup', value: 'two' }
+    ]
+  });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  const dup = String(entry.responseHeaders['x-dup']);
+  assert.ok(dup.includes('one') && dup.includes('two'),
+            `one of the duplicate headers was lost: ${dup}`);
+});
+
+test('get_network_logs finds a status given as a string', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { statusCode: 404 });
+
+  const result = await command('getNetworkLogs', { status: '404' }, 7);
+
+  assert.equal(result.logs.length, 1,
+    'a strict comparison against the numeric status returned nothing');
+});
+
 test('find_tabs requires a filter rather than dumping every tab', async () => {
   const ctx = loadBackground();
 
@@ -1328,7 +1443,43 @@ test('find_tabs requires a filter rather than dumping every tab', async () => {
 
   assert.equal(result.success, false,
     'with no filter this returned the entire browsing surface');
-  assert.match(result.error, /at least one filter/i);
+  assert.match(result.error, /needs a filter/i);
+});
+
+test('a filter that narrows nothing does not satisfy find_tabs', async () => {
+  // active: false and audible: false pass an `!== undefined` check and match
+  // essentially every tab, so one boolean defeated the filter requirement
+  // and handed over the whole browsing surface anyway.
+  for (const filter of [{ active: false }, { audible: false },
+                        { active: 'false' }, { url: '' }]) {
+    const ctx = loadBackground();
+    const result = await ctx.command('findTabs', filter, undefined);
+    assert.equal(result.success, false,
+      `${JSON.stringify(filter)} is not a filter that narrows anything`);
+  }
+});
+
+test('find_tabs honours a string limit and clamps an outsized one', async () => {
+  // Number.isInteger refused the string "1" a JSON client sends and fell
+  // back to 50, so a caller asking for one tab got all of them; and nothing
+  // stopped limit: 100000, which removed the cap altogether.
+  const many = Array.from({ length: 120 }, (_, i) => ({
+    id: i, url: `http://stub.test/${i}`, title: `t${i}`, active: false,
+    windowId: 1, status: 'complete'
+  }));
+
+  let ctx = loadBackground();
+  ctx.context.browser.tabs.query = async () => many;
+  let result = await ctx.command('findTabs', { urlPattern: 'stub', limit: '1' },
+                                 undefined);
+  assert.equal(result.tabs.length, 1, 'a string limit must be honoured');
+
+  ctx = loadBackground();
+  ctx.context.browser.tabs.query = async () => many;
+  result = await ctx.command('findTabs', { urlPattern: 'stub', limit: 100000 },
+                             undefined);
+  assert.equal(result.tabs.length, 50, 'the cap must survive a huge limit');
+  assert.equal(result.truncated, true);
 });
 
 test('find_tabs caps its results and says when it did', async () => {

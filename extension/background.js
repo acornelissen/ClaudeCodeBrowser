@@ -167,12 +167,16 @@ function isWatchedTab(tabId) {
 // has been allowed to run in them, a logging session there would still put
 // request and response bodies into a buffer the agent reads, which is the one
 // place that expectation must not be quietly broken.
+// Fails CLOSED. This returned false when tabs.get threw, so a check that
+// could not tell was the reason a private window's traffic reached the
+// agent's buffer: with the tab marked private and tabs.get failing,
+// startLogging succeeded. A privacy gate that cannot answer must refuse.
 async function isPrivateTab(tabId) {
   try {
     const tab = await browser.tabs.get(tabId);
     return tab.incognito === true;
   } catch (e) {
-    return false;
+    return true;
   }
 }
 
@@ -219,9 +223,21 @@ function noteRequestFinished(details) {
 function redactHeaderList(headers) {
   const out = {};
   for (const header of headers || []) {
-    out[header.name] = REDACTED_HEADERS.has(header.name.toLowerCase())
+    const value = REDACTED_HEADERS.has(header.name.toLowerCase())
       ? "***"
-      : header.value;
+      // A header with only a binaryValue gave undefined for its name.
+      : (header.value !== undefined ? header.value : "[binary]");
+    // A plain assignment collapsed repeats onto one key, and almost every
+    // real response carries several Set-Cookie headers - so the log said
+    // there was one, with the last value. An array keeps the count.
+    if (Object.prototype.hasOwnProperty.call(out, header.name)) {
+      const existing = out[header.name];
+      out[header.name] = Array.isArray(existing)
+        ? existing.concat(value)
+        : [existing, value];
+    } else {
+      out[header.name] = value;
+    }
   }
   return out;
 }
@@ -783,7 +799,10 @@ function getNetworkLogsFor(tabId, options = {}) {
     logs = logs.filter(log => log.method?.toUpperCase() === options.method.toUpperCase());
   }
   if (options.status) {
-    logs = logs.filter(log => log.status === options.status);
+    // Number(), because a JSON client sends status: "404" and a strict
+    // comparison against the numeric status silently returned no logs.
+    const wanted = Number(options.status);
+    logs = logs.filter(log => log.status === wanted);
   }
   if (parseFlag(options.errorsOnly, false) || parseFlag(options.errors_only, false)) {
     logs = logs.filter(log => log.error || (log.status && log.status >= 400));
@@ -1166,7 +1185,7 @@ async function takeScreenshot(tabId, options = {}) {
     const needsFocus = tabId && tabId !== currentTab?.id;
     let originalActiveTab = null;
 
-    if (needsFocus && options.allowFocus !== false) {
+    if (needsFocus && parseFlag(options.allowFocus, true)) {
       // Store original active tab to restore later
       originalActiveTab = currentTab;
 
@@ -1204,6 +1223,7 @@ async function takeScreenshot(tabId, options = {}) {
                 "the page, or the headless backend, which captures full pages.",
           pageMetrics: metrics,
           tab: { id: targetTab.id, url: targetTab.url, title: targetTab.title },
+          privateWindow: targetTab.incognito === true,
           wasFocused: needsFocus
         };
       }
@@ -1213,11 +1233,16 @@ async function takeScreenshot(tabId, options = {}) {
         data: dataUrl,
         type: "visible",
         tab: { id: targetTab.id, url: targetTab.url, title: targetTab.title },
+        // The image still goes to the agent, which is what the caller asked
+        // for, but saying where it came from lets the server decline to write
+        // it to disk for a week. Private windows exist so that a record of
+        // them is not left behind.
+        privateWindow: targetTab.incognito === true,
         wasFocused: needsFocus
       };
     } finally {
       // Restore original tab if we changed focus
-      if (originalActiveTab && options.restoreFocus !== false) {
+      if (originalActiveTab && parseFlag(options.restoreFocus, true)) {
         await browser.tabs.update(originalActiveTab.id, { active: true });
       }
     }
@@ -1233,8 +1258,14 @@ async function screenshotAllTabs(options = {}) {
     const currentTab = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
     const results = [];
 
-    // Filter tabs by URL pattern if provided
-    let targetTabs = tabs.filter(t => !t.url.startsWith('about:') && !t.url.startsWith('moz-extension:'));
+    // Filter tabs by URL pattern if provided. Private windows are skipped:
+    // this is a bulk sweep the caller did not aim at any particular tab, and
+    // the screenshot is written to disk and kept, so it would be a
+    // longer-lived record of a private window than the network buffer that
+    // startLogging already refuses.
+    let targetTabs = tabs.filter(t => !t.url.startsWith('about:') &&
+                                      !t.url.startsWith('moz-extension:') &&
+                                      t.incognito !== true);
 
     if (options.urlPattern) {
       const regex = new RegExp(options.urlPattern);
@@ -1258,7 +1289,7 @@ async function screenshotAllTabs(options = {}) {
           tabId: tab.id,
           url: tab.url,
           title: tab.title,
-          data: options.includeData ? dataUrl : undefined,
+          data: parseFlag(options.includeData, false) ? dataUrl : undefined,
           timestamp: Date.now()
         });
       } catch (e) {
@@ -1424,7 +1455,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Captcha handoff: notify the human (unless it's a detect-only probe), then
 // let the content script show the solve banner and wait for completion
 async function solveCaptcha(tabId, data = {}) {
-  if (!data.detectOnly) {
+  if (!parseFlag(data.detectOnly, false)) {
     try {
       if (browser.notifications) {
         await browser.notifications.create({
@@ -1578,10 +1609,29 @@ async function sendToContentScript(tabId, message, { allFrames = false } = {}) {
     const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
     const options = allFrames ? undefined : { frameId: 0 };
     const result = await browser.tabs.sendMessage(tab.id, message, options);
-    return { success: true, ...result };
+    return contentScriptResult(result, message.action);
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+// A content script that exists but returns neither true nor a Promise
+// resolves the sender's promise with undefined, and `{ success: true,
+// ...undefined }` reported success for work that never happened - getText
+// returned {success:true} with no text, click reported a click nobody made,
+// and startLogging reported console.capturing: true. A missing receiver
+// rejects instead, which is already handled; this is the receiver that is
+// there but silent, which includes every action the content script's handler
+// map does not cover.
+function contentScriptResult(result, action) {
+  if (result === undefined || result === null) {
+    return {
+      success: false,
+      error: `The content script did not answer "${action}". It may not ` +
+             `handle that action, or the page may have navigated away.`
+    };
+  }
+  return { success: true, ...result };
 }
 
 // Click functionality
@@ -1594,7 +1644,7 @@ async function performClick(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "click");
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1610,7 +1660,7 @@ async function performType(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "type");
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1626,7 +1676,7 @@ async function performScroll(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "scroll");
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1700,7 +1750,7 @@ async function getElements(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "getElements");
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1731,7 +1781,7 @@ async function highlightElement(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "highlight");
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -1747,13 +1797,25 @@ async function waitForElement(tabId, data) {
       ...data
     }, { frameId: 0 });
 
-    return { success: true, ...result };
+    return contentScriptResult(result, "waitForElement");
   } catch (error) {
     return { success: false, error: error.message };
   }
 }
 
 // Tab management
+// A caller-supplied result cap, clamped. Number.isInteger refused the string
+// "1" that a JSON client sends and silently fell back to 50 - so a caller
+// asking for one tab got all of them - and nothing stopped limit: 100000,
+// which defeated the cap these tools exist to enforce.
+const MAX_TAB_RESULTS = 50;
+
+function tabResultLimit(raw, fallback = MAX_TAB_RESULTS) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(Math.floor(parsed), MAX_TAB_RESULTS);
+}
+
 async function getAllTabs(options = {}) {
   try {
     // Default scope: the window Claude is actually driving, not every
@@ -1769,7 +1831,7 @@ async function getAllTabs(options = {}) {
       || parseFlag(options.include_favicon, false);
     const rawPattern = options.urlPattern || options.url_pattern;
     const urlPattern = rawPattern ? new RegExp(rawPattern) : null;
-    const limit = Number.isInteger(options.limit) ? options.limit : 50;
+    const limit = tabResultLimit(options.limit);
 
     const queryOpts = currentWindowOnly ? { currentWindow: true } : {};
     let tabs = await browser.tabs.query(queryOpts);
@@ -1870,18 +1932,25 @@ async function getTabInfo(tabId) {
 // Find tabs by URL pattern
 async function findTabs(options = {}) {
   try {
-    const hasFilter = ['url', 'urlPattern', 'url_pattern', 'title',
-                       'active', 'audible']
-      .some(key => options[key] !== undefined);
-    if (!hasFilter) {
+    // active: false and audible: false matched essentially every tab, so one
+    // boolean defeated the filter requirement entirely and returned the
+    // user's whole browsing surface. Only a filter that actually narrows
+    // counts: a URL, a title, or one of the booleans set to true.
+    const hasNarrowingFilter =
+      ['url', 'urlPattern', 'url_pattern', 'title']
+        .some(key => options[key]) ||
+      ['active', 'audible']
+        .some(key => options[key] !== undefined && parseFlag(options[key], false));
+    if (!hasNarrowingFilter) {
       // With no filter this returned every tab in every window, which is the
       // user's whole browsing surface handed over by a tool that reads like
       // a search. Make that an explicit request.
       return {
         success: false,
-        error: "browser_find_tabs needs at least one filter (url, " +
-               "url_pattern, title, active or audible). To list tabs " +
-               "deliberately, use browser_get_tabs."
+        error: "browser_find_tabs needs a filter that narrows the result: " +
+               "url, url_pattern, title, or active/audible set to true. " +
+               "active: false matches almost every tab, so it is not a " +
+               "filter. To list tabs deliberately, use browser_get_tabs."
       };
     }
 
@@ -1899,15 +1968,19 @@ async function findTabs(options = {}) {
       const titleLower = options.title.toLowerCase();
       filtered = filtered.filter(t => t.title?.toLowerCase().includes(titleLower));
     }
+    // parseFlag, because active: "true" from a JSON client matched no tab at
+    // all under a strict comparison.
     if (options.active !== undefined) {
-      filtered = filtered.filter(t => t.active === options.active);
+      const want = parseFlag(options.active, true);
+      filtered = filtered.filter(t => (t.active === true) === want);
     }
     if (options.audible !== undefined) {
-      filtered = filtered.filter(t => t.audible === options.audible);
+      const want = parseFlag(options.audible, true);
+      filtered = filtered.filter(t => (t.audible === true) === want);
     }
 
     // Cap it, like browser_get_tabs already does, and say when it bit.
-    const limit = Number.isInteger(options.limit) ? options.limit : 50;
+    const limit = tabResultLimit(options.limit);
     const matched = filtered.length;
     const page = filtered.slice(0, limit);
 
@@ -1934,7 +2007,7 @@ async function createNewTab(data) {
   try {
     const tab = await browser.tabs.create({
       url: data.url || "about:blank",
-      active: data.active !== false
+      active: parseFlag(data.active, true)
     });
     return {
       success: true,
@@ -1969,11 +2042,19 @@ async function refreshTab(tabId, options = {}) {
   try {
     const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
 
-    // bypassCache: true = hard refresh (Ctrl+Shift+R), false = normal refresh (F5)
-    await browser.tabs.reload(tab.id, { bypassCache: options.bypassCache || false });
+    // bypassCache: true = hard refresh (Ctrl+Shift+R), false = normal refresh
+    // (F5). Parsed once and used for both the reload and the report: the
+    // reload took `|| false` while the result reported parseFlag(..., true),
+    // so the two disagreed and the reported field was a lie. The schema's
+    // default for browser_refresh is false.
+    const bypassCache = parseFlag(options.bypassCache, false);
+    await browser.tabs.reload(tab.id, { bypassCache });
 
-    // Wait for page to load if requested
-    if (options.waitForLoad !== false) {
+    // Wait for page to load if requested. parseFlag, because wait_for_load
+    // arrives as the string "false" from a JSON client: `!== false` was true
+    // for it, so declining to wait made browser_refresh block for the full
+    // 30-second timeout instead of returning at once.
+    if (parseFlag(options.waitForLoad, true)) {
       return new Promise((resolve) => {
         const listener = (updatedTabId, changeInfo) => {
           if (updatedTabId === tab.id && changeInfo.status === "complete") {
@@ -1982,7 +2063,7 @@ async function refreshTab(tabId, options = {}) {
               success: true,
               refreshed: true,
               tab: { id: tab.id, url: tab.url, title: tab.title },
-              bypassCache: parseFlag(options.bypassCache, true)
+              bypassCache
             });
           }
         };
@@ -1996,7 +2077,8 @@ async function refreshTab(tabId, options = {}) {
       });
     }
 
-    return { success: true, refreshed: true, tab: { id: tab.id, url: tab.url } };
+    return { success: true, refreshed: true, bypassCache,
+             tab: { id: tab.id, url: tab.url } };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -2038,7 +2120,7 @@ async function reloadAllTabs(options = {}) {
       success: true,
       reloadedCount: results.length,
       tabs: results,
-      bypassCache: options.bypassCache || false
+      bypassCache: parseFlag(options.bypassCache, true)
     };
   } catch (error) {
     return { success: false, error: error.message };
@@ -2068,7 +2150,7 @@ async function reloadTabsByUrl(options) {
       }
 
       if (matches) {
-        await browser.tabs.reload(tab.id, { bypassCache: options.bypassCache !== false });
+        await browser.tabs.reload(tab.id, { bypassCache: parseFlag(options.bypassCache, true) });
         results.push({ id: tab.id, url: tab.url, reloaded: true });
       }
     }
@@ -2077,7 +2159,7 @@ async function reloadTabsByUrl(options) {
       success: true,
       reloadedCount: results.length,
       tabs: results,
-      bypassCache: options.bypassCache !== false
+      bypassCache: parseFlag(options.bypassCache, true)
     };
   } catch (error) {
     return { success: false, error: error.message };
