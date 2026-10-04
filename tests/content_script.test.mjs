@@ -234,7 +234,9 @@ test('typing into a password field is refused by default', async () => {
   assert.match(result.error, /password field/i);
 });
 
-test('allow_password (snake_case, as the server sends it) permits typing', async () => {
+// The server's camelize_args() turns allow_password into allowPassword before
+// dispatch, so allowPassword is the key that really arrives. Both are accepted.
+test('either spelling of the allow_password override permits typing', async () => {
   const pw = makeElement('input', { id: 'pw', type: 'password', value: '' });
   const { send } = loadContentScript({ '#pw': pw });
 
@@ -244,6 +246,15 @@ test('allow_password (snake_case, as the server sends it) permits typing', async
 
   assert.notEqual(result.success, false);
   assert.equal(pw.value, 'ok');
+
+  const camel = makeElement('input', { id: 'pw2', type: 'password', value: '' });
+  const ctx = loadContentScript({ '#pw2': camel });
+  const camelResult = await ctx.send({
+    action: 'type', selector: '#pw2', text: 'ok', instant: true, allowPassword: true
+  });
+
+  assert.notEqual(camelResult.success, false);
+  assert.equal(camel.value, 'ok');
 });
 
 // --------------------------------------------------------------------------

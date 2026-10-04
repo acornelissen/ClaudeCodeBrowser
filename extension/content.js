@@ -499,7 +499,10 @@
        element.getAttribute('autocomplete') === 'new-password');
   }
 
-  // The server sends allow_password; older callers used allowPassword.
+  // The server sets allow_password, but camelize_args() in server.py rewrites
+  // it to allowPassword before dispatch, so that is what actually arrives here.
+  // Both are accepted so a caller that reaches the extension without passing
+  // through that conversion still gets the guard honoured.
   function passwordAllowed(options) {
     return options?.allow_password === true || options?.allowPassword === true;
   }
