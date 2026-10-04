@@ -97,11 +97,34 @@ function decoderFor(charset) {
   }
 }
 
-// A response whose bytes are still compressed cannot be decoded to text.
-// Firefox hands the filter decoded bytes for the encodings it understands,
-// but an unknown content-encoding passes through as-is and would otherwise be
-// logged as binary noise dressed up as a string.
-const DECODABLE_ENCODING = /^(identity|)$/i;
+// Whether a decoded body actually looks like text.
+//
+// An earlier version of this refused any response carrying a content-encoding
+// header, reasoning that compressed bytes cannot be decoded. That was wrong
+// and would have been a bad regression: MDN's StreamFilter examples feed
+// ondata straight to TextDecoder, so Firefox hands the filter DECOMPRESSED
+// bytes - while the content-encoding header still appears in
+// onHeadersReceived. Refusing on the header would therefore have dropped
+// bodies on essentially every real site, since almost everything serves gzip
+// or br.
+//
+// Judging the decoded result instead is correct either way: genuinely
+// undecodable bytes produce a mass of U+FFFD replacement characters and
+// control bytes, which is detectable without having to know what Firefox did
+// upstream.
+function looksUndecodable(text) {
+  if (!text) return false;
+  const sample = text.slice(0, 2000);
+  let suspicious = 0;
+  for (const character of sample) {
+    const code = character.codePointAt(0);
+    // Replacement character, or a control byte that is not tab/LF/CR.
+    if (code === 0xFFFD || code < 0x09 || (code > 0x0D && code < 0x20)) {
+      suspicious++;
+    }
+  }
+  return sample.length > 0 && suspicious / sample.length > 0.1;
+}
 
 // tabId -> { captureBodies, includeAllTypes }
 const loggedTabs = new Map();
@@ -366,13 +389,11 @@ function captureResponseHeaders(details) {
     return;
   }
 
+  // Recorded for diagnostics only. Deliberately NOT used to refuse the body:
+  // the header is present even when Firefox has already decompressed the
+  // bytes, so refusing on it would drop almost every real response.
   const encoding = (headerValue("content-encoding") || "").trim();
-  if (encoding && !DECODABLE_ENCODING.test(encoding)) {
-    // Firefox decodes gzip/br/deflate before the filter sees them, so an
-    // encoding still present here is one it did not handle.
-    entry.responseBody = `[not captured: content-encoding ${encoding}]`;
-    return;
-  }
+  if (encoding) entry.responseEncoding = encoding;
 
   entry.responseCharset = charsetFromContentType(contentType) || "utf-8";
 
@@ -468,6 +489,15 @@ function attachResponseBodyReader(requestId, entry) {
       collected += decoder.decode();
     } catch (e) {
       // Nothing buffered.
+    }
+    if (looksUndecodable(collected)) {
+      // Binary noise dressed up as a string is worse than saying nothing: an
+      // agent would reason over it as if it were the page's content.
+      entry.responseBody = "[not captured: body did not decode as text" +
+        (entry.responseEncoding ? ` (content-encoding: ${entry.responseEncoding})` : "") +
+        "]";
+      release("close");
+      return;
     }
     const truncated = collected.length > MAX_BODY_CHARS;
     entry.responseBody = redactSecretsInBody(collected.substring(0, MAX_BODY_CHARS));

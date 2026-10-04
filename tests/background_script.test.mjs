@@ -1203,7 +1203,10 @@ test('a declared charset is honoured rather than assumed to be utf-8', async () 
   assert.ok(entry.responseBody.includes('hi'));
 });
 
-test('a still-compressed body is not logged as text', async () => {
+test('a gzip/br response is still captured, because Firefox decompresses it', async () => {
+  // Refusing on the content-encoding header would drop bodies on essentially
+  // every real site: the header is present even though Firefox hands the
+  // filter decompressed bytes.
   const ctx = loadBackground();
   await ctx.command('startLogging', {}, 7);
 
@@ -1211,13 +1214,61 @@ test('a still-compressed body is not logged as text', async () => {
     responseHeaders: [
       { name: 'content-type', value: 'application/json' },
       { name: 'content-encoding', value: 'br' }
-    ]
+    ],
+    complete: false
   });
+  assert.equal(ctx.filters.length, 1, 'a filter must still be attached');
+
+  ctx.filters[0].ondata({ data: new TextEncoder().encode('{"ok":true}') });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
 
   const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
-  assert.match(entry.responseBody, /content-encoding br/,
-    'binary noise dressed up as a string is worse than saying nothing');
-  assert.equal(ctx.filters.length, 0);
+  assert.equal(entry.responseBody, '{"ok":true}',
+    'the body decoded fine; the header alone must not refuse it');
+  assert.equal(entry.responseEncoding, 'br',
+    'the encoding is still recorded for diagnostics');
+});
+
+test('bytes that do not decode as text are refused, not logged as noise', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+    complete: false
+  });
+
+  // Actual compressed/binary bytes: mostly control and invalid sequences.
+  const binary = new Uint8Array(400);
+  for (let i = 0; i < binary.length; i++) binary[i] = (i * 7) % 32;
+  ctx.filters[0].ondata({ data: binary });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.match(entry.responseBody, /did not decode as text/,
+    'judge the decoded result, not the header');
+});
+
+test('ordinary text with a stray control byte is still captured', async () => {
+  // The heuristic must not reject real content over one odd character.
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  fireRequest(ctx.webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'text/plain' }],
+    complete: false
+  });
+  ctx.filters[0].ondata({
+    data: new TextEncoder().encode('a'.repeat(300) + '\u0001' + 'b'.repeat(300))
+  });
+  ctx.filters[0].onstop();
+  ctx.webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(entry.responseBody.includes('aaa'),
+    'one control byte in 600 is not binary');
 });
 
 test('an unsupported charset falls back and says so', async () => {
