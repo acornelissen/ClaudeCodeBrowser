@@ -1,0 +1,16 @@
+# AMO signing credentials. Copy to mise.local.toml (gitignored) and fill in.
+#
+# Generate a key pair at:
+#   https://addons.mozilla.org/en-US/developers/addon/api/key/
+# "JWT issuer" is the issuer string, "JWT secret" is the secret. The secret is
+# shown once, so store it here when you create it.
+#
+# mise loads these as environment variables for scripts/package-extension.sh.
+
+[env]
+AMO_JWT_ISSUER = "user:12345678:123"
+AMO_JWT_SECRET = "put-your-amo-jwt-secret-here"
+
+# Optional: a GitHub token for scripts/publish-release.sh when the gh CLI
+# isn't authenticated. Needs 'repo' scope.
+# GITHUB_TOKEN = "ghp_..."

@@ -30,3 +30,6 @@ Thumbs.db
 
 # Screenshots (user data)
 screenshots/
+
+# Local mise config (AMO signing credentials, tokens)
+mise.local.toml

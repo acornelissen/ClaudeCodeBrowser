@@ -133,15 +133,25 @@ The install script handles these automatically, but if you are installing manual
    ```
 
 2. **Install native messaging manifest for Firefox:**
+
+   `native-host/claudecodebrowser.json` ships with a placeholder `path`.
+   Firefox needs a real absolute path there and does **not** expand `~` or
+   `$HOME`, so substitute it while copying:
+
    ```bash
    # Linux
    mkdir -p ~/.mozilla/native-messaging-hosts
-   cp native-host/claudecodebrowser.json ~/.mozilla/native-messaging-hosts/
+   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowser.json \
+     > ~/.mozilla/native-messaging-hosts/claudecodebrowser.json
    # macOS
    mkdir -p ~/Library/Application\ Support/Mozilla/NativeMessagingHosts
-   cp native-host/claudecodebrowser.json ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/
-   # Update the path in the JSON file to point to your installation
+   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowser.json \
+     > ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claudecodebrowser.json
    ```
+
+   (`scripts/install.sh` writes this file for you, with the path already
+   resolved — on macOS it points at a small launcher that pins the absolute
+   `python3`, because Firefox starts native hosts with a minimal `PATH`.)
 
 3. **Install the Firefox extension:**
    - Open Firefox and go to `about:debugging`
@@ -248,18 +258,36 @@ permission (v1.3.0 added `notifications`), a reload picks it up.
 extension installs permanently and can **auto-update**. Sign it through
 Mozilla without a public listing:
 
-1. Create an AMO API key at
-   <https://addons.mozilla.org/developers/addon/api/key/> and export it:
+1. Get the tooling. `web-ext` is pinned in `mise.toml`, so:
    ```bash
-   export AMO_JWT_ISSUER=user:xxxx
-   export AMO_JWT_SECRET=yyyy
-   npm install -g web-ext        # one-time
+   mise install
    ```
-2. Sign: `./scripts/package-extension.sh --sign`
-   (this uploads to AMO's signer with `--channel=unlisted` and writes a
-   signed `.xpi` to `dist/`).
-3. Install the signed `.xpi` by opening it in Firefox (drag it onto the
-   window, or `about:addons` → gear → *Install Add-on From File*).
+2. Create an AMO API key at
+   <https://addons.mozilla.org/en-US/developers/addon/api/key/> — "JWT
+   issuer" and "JWT secret". **The secret is shown once.** Put both in
+   `mise.local.toml`, which is gitignored:
+   ```bash
+   cp mise.local.toml.example mise.local.toml
+   $EDITOR mise.local.toml
+   ```
+   mise exports them as `AMO_JWT_ISSUER` / `AMO_JWT_SECRET` for the signing
+   script. Keep them out of `mise.toml` and out of your shell history.
+3. Sign:
+   ```bash
+   mise run sign      # = ./scripts/package-extension.sh --sign
+   ```
+   This uploads to AMO's signer with `--channel=unlisted` (no public
+   listing) and writes a signed `.xpi` plus `updates.json` to `dist/`.
+4. Install the signed `.xpi` in Firefox: `about:addons` → gear →
+   *Install Add-on From File*.
+
+> **Extension ID.** The manifest uses `claudecodebrowser@ligandal.com`, the
+> upstream author's ID. AMO will reject a submission under an ID registered
+> to a different account, so if you are signing from a fork you may need your
+> own — change `browser_specific_settings.gecko.id`, and update
+> `allowed_extensions` in `native-host/claudecodebrowser.json` **and** the
+> generator in `scripts/install.sh` to match, or native messaging will stop
+> working.
 
 **Auto-update is already wired** to GitHub Releases. The manifest carries:
 

@@ -1,6 +1,8 @@
 [tools]
 python = "3.12"
 node = "22"
+# Mozilla's extension packaging/signing tool, used by scripts/package-extension.sh --sign
+"npm:web-ext" = "latest"
 
 [tasks.test]
 description = "Run the Python and content-script test suites"
@@ -16,3 +18,15 @@ run = "python3 -m unittest discover -s tests -t . -v"
 [tasks.test-extension]
 description = "Run the content-script test suite"
 run = "node tests/content_script.test.mjs"
+
+[tasks.package]
+description = "Build an unsigned .xpi into dist/ (temporary-load only)"
+run = "./scripts/package-extension.sh"
+
+[tasks.sign]
+description = "Build and AMO-sign an .xpi into dist/ (needs AMO_JWT_* in mise.local.toml)"
+run = "./scripts/package-extension.sh --sign"
+
+[tasks.release]
+description = "Publish the signed .xpi + updates.json as a GitHub release"
+run = "./scripts/publish-release.sh"
