@@ -18,13 +18,14 @@
   let inspectorMode = false;
 
   // ============================================
-  // Console and Network Logging Infrastructure
+  // Console Logging Infrastructure
+  //
+  // Network traffic is captured by background.js via webRequest.
   // ============================================
 
   // Logging state
   let loggingEnabled = false;
   let consoleLogs = [];
-  let networkLogs = [];
   const MAX_LOG_ENTRIES = 500;
 
   // Original console methods, saved unbound so restoreConsole() puts the
@@ -74,227 +75,31 @@
     });
   }
 
-  // Interception availability: Firefox's content-script sandbox makes some
-  // page globals (notably window.fetch) read-only. A refused override must
-  // cost only that one capability, never abort this whole script — an
-  // aborted init means the message listener below never registers and every
-  // DOM tool fails with "Receiving end does not exist".
-  const interception = { fetch: false, xhr: false, console: false };
+  // Console capture is opt-in: this script runs on every page in every frame,
+  // and wrapping a page's console when nobody asked for logs is a cost no page
+  // should pay. Network traffic is captured in the background script via
+  // webRequest instead of by replacing page globals — Firefox's sandbox
+  // refuses a window.fetch override anyway, so a content script could only
+  // ever have seen XHR.
+  const interception = { console: false };
 
-  // Page originals, captured when interception is installed and put back when
-  // it is removed. Interception is opt-in (startLogging) rather than installed
-  // on load: this script runs on every page in every frame, and wrapping a
-  // page's fetch, XHR and console when nobody asked for logs is a cost no
-  // page should pay.
-  let savedFetch = null;
-  let savedXHROpen = null;
-  let savedXHRSend = null;
-
-  // Request/response headers that carry credentials. Logs are read by the
-  // agent, so these never reach it — the header's presence is still visible,
-  // only the value is withheld.
-  const REDACTED_HEADERS = new Set([
-    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
-    'x-api-key', 'x-auth-token', 'x-csrf-token', 'x-xsrf-token',
-    'api-key', 'auth-token', 'x-session-token', 'x-access-token'
-  ]);
-
-  // Headers arrive as a plain object, a Headers instance or an array of
-  // pairs depending on how the caller built the request.
-  function redactHeaders(headers) {
-    if (!headers) return {};
-    let pairs;
-    try {
-      if (typeof headers.entries === 'function') {
-        pairs = Array.from(headers.entries());
-      } else if (Array.isArray(headers)) {
-        pairs = headers;
-      } else {
-        pairs = Object.entries(headers);
-      }
-    } catch (e) {
-      return {};
-    }
-    const out = {};
-    for (const [name, value] of pairs) {
-      out[name] = REDACTED_HEADERS.has(String(name).toLowerCase()) ? '***' : value;
-    }
-    return out;
-  }
-
-  // Network request interceptor (fetch)
-  const fetchInterceptor = async function(...args) {
-    const startTime = Date.now();
-    const [resource, init] = args;
-    const url = typeof resource === 'string' ? resource : resource.url;
-    const method = init?.method || 'GET';
-
-    const logEntry = {
-      type: 'fetch',
-      method: method,
-      url: url,
-      requestHeaders: redactHeaders(init?.headers),
-      requestBody: init?.body ? String(init.body).substring(0, 1000) : null,
-      startTime: new Date().toISOString(),
-      pageUrl: window.location.href
-    };
-
-    try {
-      const response = await savedFetch.apply(this, args);
-      const endTime = Date.now();
-
-      if (loggingEnabled) {
-        logEntry.status = response.status;
-        logEntry.statusText = response.statusText;
-        logEntry.duration = endTime - startTime;
-        logEntry.responseHeaders = redactHeaders(response.headers);
-
-        // Clone response to read body without consuming it
-        const clone = response.clone();
-        try {
-          const contentType = response.headers.get('content-type') || '';
-          if (contentType.includes('application/json')) {
-            const body = await clone.json();
-            logEntry.responseBody = JSON.stringify(body, null, 2).substring(0, 5000);
-          } else if (contentType.includes('text/')) {
-            logEntry.responseBody = (await clone.text()).substring(0, 5000);
-          } else {
-            logEntry.responseBody = '[Binary data]';
-          }
-        } catch (e) {
-          logEntry.responseBody = '[Could not read response]';
-        }
-
-        networkLogs.push(logEntry);
-        if (networkLogs.length > MAX_LOG_ENTRIES) {
-          networkLogs.shift();
-        }
-      }
-
-      return response;
-    } catch (error) {
-      if (loggingEnabled) {
-        logEntry.error = error.message;
-        logEntry.duration = Date.now() - startTime;
-        networkLogs.push(logEntry);
-        if (networkLogs.length > MAX_LOG_ENTRIES) {
-          networkLogs.shift();
-        }
-      }
-      throw error;
-    }
-  };
-
-  // XHR interceptor
-  const xhrOpenInterceptor = function(method, url, ...rest) {
-    this._logData = {
-      type: 'xhr',
-      method: method,
-      url: url,
-      pageUrl: window.location.href
-    };
-    return savedXHROpen.apply(this, [method, url, ...rest]);
-  };
-
-  const xhrSendInterceptor = function(body) {
-    if (loggingEnabled && this._logData) {
-      const startTime = Date.now();
-      this._logData.startTime = new Date().toISOString();
-      this._logData.requestBody = body ? String(body).substring(0, 1000) : null;
-
-      this.addEventListener('load', () => {
-        this._logData.status = this.status;
-        this._logData.statusText = this.statusText;
-        this._logData.duration = Date.now() - startTime;
-        this._logData.responseBody = this.responseText?.substring(0, 5000);
-        networkLogs.push({ ...this._logData });
-        if (networkLogs.length > MAX_LOG_ENTRIES) {
-          networkLogs.shift();
-        }
-      });
-
-      this.addEventListener('error', () => {
-        this._logData.error = 'Network error';
-        this._logData.duration = Date.now() - startTime;
-        networkLogs.push({ ...this._logData });
-        if (networkLogs.length > MAX_LOG_ENTRIES) {
-          networkLogs.shift();
-        }
-      });
-    }
-    return savedXHRSend.apply(this, [body]);
-  };
-
-  // Install the interceptors. Each capability is installed independently so a
-  // sandbox that refuses one (fetch is read-only in some Firefox versions)
-  // still gets the others.
   function installInterception() {
-    if (!interception.fetch) {
-      try {
-        savedFetch = window.fetch;
-        window.fetch = fetchInterceptor;
-        interception.fetch = true;
-      } catch (e) {
-        // "fetch" is read-only in Firefox's sandbox — network logging for
-        // fetch is unavailable, everything else keeps working
-        savedFetch = null;
-      }
-    }
-    if (!interception.xhr) {
-      try {
-        savedXHROpen = XMLHttpRequest.prototype.open;
-        savedXHRSend = XMLHttpRequest.prototype.send;
-        XMLHttpRequest.prototype.open = xhrOpenInterceptor;
-        XMLHttpRequest.prototype.send = xhrSendInterceptor;
-        interception.xhr = true;
-      } catch (e) {
-        // XHR prototype not writable in this sandbox — skip XHR logging
-        savedXHROpen = null;
-        savedXHRSend = null;
-      }
-    }
-    if (!interception.console) {
-      try {
-        interceptConsole();
-        interception.console = true;
-      } catch (e) {
-        // console not writable in this sandbox — skip console logging
-      }
+    if (interception.console) return;
+    try {
+      interceptConsole();
+      interception.console = true;
+    } catch (e) {
+      // console not writable in this sandbox — skip console logging
     }
   }
 
-  // Hand the page back its own globals. If a restore is refused the wrapper
-  // stays in place, so the saved original is kept: the wrapper delegates to it
-  // on every call and would break the page's networking without it. Logging
-  // has already stopped by then, so the wrapper only passes calls through.
   function removeInterception() {
-    if (interception.fetch) {
-      try {
-        window.fetch = savedFetch;
-        savedFetch = null;
-        interception.fetch = false;
-      } catch (e) {
-        // keep savedFetch: fetchInterceptor still delegates to it
-      }
-    }
-    if (interception.xhr) {
-      try {
-        XMLHttpRequest.prototype.open = savedXHROpen;
-        XMLHttpRequest.prototype.send = savedXHRSend;
-        savedXHROpen = null;
-        savedXHRSend = null;
-        interception.xhr = false;
-      } catch (e) {
-        // keep the saved originals: the interceptors still delegate to them
-      }
-    }
-    if (interception.console) {
-      try {
-        restoreConsole();
-        interception.console = false;
-      } catch (e) {
-        // console keeps the wrapper, which forwards to originalConsole
-      }
+    if (!interception.console) return;
+    try {
+      restoreConsole();
+      interception.console = false;
+    } catch (e) {
+      // the wrapper stays, forwarding to originalConsole; logging has stopped
     }
   }
 
@@ -304,13 +109,11 @@
     loggingEnabled = true;
     if (options.clearExisting) {
       consoleLogs = [];
-      networkLogs = [];
     }
     return {
       success: true,
-      message: 'Logging started',
-      consoleLogsCount: consoleLogs.length,
-      networkLogsCount: networkLogs.length
+      message: 'Console logging started',
+      consoleLogsCount: consoleLogs.length
     };
   }
 
@@ -319,9 +122,8 @@
     removeInterception();
     return {
       success: true,
-      message: 'Logging stopped',
-      consoleLogsCount: consoleLogs.length,
-      networkLogsCount: networkLogs.length
+      message: 'Console logging stopped',
+      consoleLogsCount: consoleLogs.length
     };
   }
 
@@ -355,57 +157,13 @@
     };
   }
 
-  function getNetworkLogs(options = {}) {
-    let logs = [...networkLogs];
-
-    // Filter by URL pattern
-    if (options.urlPattern) {
-      const pattern = new RegExp(options.urlPattern, 'i');
-      logs = logs.filter(log => pattern.test(log.url));
-    }
-
-    // Filter by method
-    if (options.method) {
-      logs = logs.filter(log => log.method.toUpperCase() === options.method.toUpperCase());
-    }
-
-    // Filter by status
-    if (options.status) {
-      logs = logs.filter(log => log.status === options.status);
-    }
-
-    // Filter errors only
-    if (options.errorsOnly) {
-      logs = logs.filter(log => log.error || (log.status && log.status >= 400));
-    }
-
-    // Limit results
-    const limit = options.limit || 100;
-    if (logs.length > limit) {
-      logs = logs.slice(-limit);
-    }
-
-    return {
-      success: true,
-      logs: logs,
-      totalCount: networkLogs.length,
-      returnedCount: logs.length,
-      loggingEnabled: loggingEnabled,
-      interceptionAvailable: interception.fetch || interception.xhr,
-      interception: { fetch: interception.fetch, xhr: interception.xhr }
-    };
-  }
-
   function clearLogs(options = {}) {
     if (options.console !== false) {
       consoleLogs = [];
     }
-    if (options.network !== false) {
-      networkLogs = [];
-    }
     return {
       success: true,
-      message: 'Logs cleared'
+      message: 'Console logs cleared'
     };
   }
 
@@ -435,8 +193,6 @@
         return waitForElement(message);
       case "waitForChange":
         return waitForChange(message);
-      case "waitForNetworkIdle":
-        return waitForNetworkIdle(message);
       case "observeElement":
         return observeElement(message);
       case "stopObserving":
@@ -480,8 +236,6 @@
         return stopLogging();
       case "getConsoleLogs":
         return getConsoleLogs(message);
-      case "getNetworkLogs":
-        return getNetworkLogs(message);
       case "clearLogs":
         return clearLogs(message);
       default:
@@ -1225,77 +979,6 @@
         }
       }, timeout);
     });
-  }
-
-  // Wait for network requests to settle (useful after AJAX calls)
-  async function waitForNetworkIdle(options) {
-    const timeout = options.timeout || 10000;
-    const idleTime = options.idleTime || 500;
-    const startTime = Date.now();
-
-    let lastActivityTime = Date.now();
-    let pendingRequests = 0;
-
-    // Hook into fetch
-    const originalFetch = window.fetch;
-    window.fetch = async (...args) => {
-      pendingRequests++;
-      lastActivityTime = Date.now();
-      try {
-        const result = await originalFetch(...args);
-        return result;
-      } finally {
-        pendingRequests--;
-        lastActivityTime = Date.now();
-      }
-    };
-
-    // Hook into XMLHttpRequest
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalSend = XMLHttpRequest.prototype.send;
-
-    XMLHttpRequest.prototype.open = function(...args) {
-      this._ccb_tracked = true;
-      return originalOpen.apply(this, args);
-    };
-
-    XMLHttpRequest.prototype.send = function(...args) {
-      if (this._ccb_tracked) {
-        pendingRequests++;
-        lastActivityTime = Date.now();
-        this.addEventListener('loadend', () => {
-          pendingRequests--;
-          lastActivityTime = Date.now();
-        });
-      }
-      return originalSend.apply(this, args);
-    };
-
-    try {
-      while (Date.now() - startTime < timeout) {
-        const idleDuration = Date.now() - lastActivityTime;
-        if (pendingRequests === 0 && idleDuration >= idleTime) {
-          return {
-            idle: true,
-            waitedMs: Date.now() - startTime,
-            pendingRequests: 0
-          };
-        }
-        await sleep(100);
-      }
-
-      return {
-        idle: false,
-        timedOut: true,
-        waitedMs: timeout,
-        pendingRequests
-      };
-    } finally {
-      // Restore original functions
-      window.fetch = originalFetch;
-      XMLHttpRequest.prototype.open = originalOpen;
-      XMLHttpRequest.prototype.send = originalSend;
-    }
   }
 
   // Set up continuous observation of an element for changes

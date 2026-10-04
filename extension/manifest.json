@@ -12,6 +12,8 @@
     "nativeMessaging",
     "notifications",
     "storage",
+    "webRequest",
+    "webRequestBlocking",
     "<all_urls>",
     "webNavigation",
     "contextMenus"

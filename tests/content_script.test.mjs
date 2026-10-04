@@ -260,37 +260,48 @@ test('either spelling of the allow_password override permits typing', async () =
 // --------------------------------------------------------------------------
 // Interception is opt-in: no hooks on pages until logging is started.
 
-test('fetch, XHR and console are untouched until logging starts', async () => {
+test('the page keeps its own fetch, XHR and console at load', async () => {
   const { window, consoleStub, XMLHttpRequestStub, pristine } = loadContentScript({});
 
-  assert.equal(window.fetch, pristine.fetch, 'window.fetch must not be replaced at load');
-  assert.equal(consoleStub.log, pristine.consoleLog,
-    'console.log must not be replaced at load');
+  assert.equal(window.fetch, pristine.fetch, 'window.fetch must not be replaced');
+  assert.equal(consoleStub.log, pristine.consoleLog, 'console.log must not be replaced');
   assert.equal(XMLHttpRequestStub.prototype.open, pristine.xhrOpen,
-    'XHR.prototype.open must not be replaced at load');
+    'XHR.prototype.open must not be replaced');
 });
 
-test('startLogging installs hooks and stopLogging removes them', async () => {
+test('network globals are never touched, even while logging', async () => {
+  // Network capture moved to background.js/webRequest. The content script has
+  // no business reaching into the page's networking any more.
+  const ctx = loadContentScript({});
+
+  await ctx.send({ action: 'startLogging' });
+
+  assert.equal(ctx.window.fetch, ctx.pristine.fetch,
+    'startLogging must not hook fetch');
+  assert.equal(ctx.XMLHttpRequestStub.prototype.open, ctx.pristine.xhrOpen,
+    'startLogging must not hook XHR');
+
+  assert.ok(!SOURCE.includes('window.fetch ='),
+    'content.js must not assign to window.fetch');
+  assert.ok(!SOURCE.includes('XMLHttpRequest.prototype.open ='),
+    'content.js must not assign to XMLHttpRequest.prototype.open');
+});
+
+test('startLogging hooks console and stopLogging restores it', async () => {
   const ctx = loadContentScript({});
 
   const started = await ctx.send({ action: 'startLogging' });
   assert.equal(started.success, true);
-  assert.notEqual(ctx.window.fetch, ctx.pristine.fetch, 'startLogging must hook fetch');
   assert.notEqual(ctx.consoleStub.log, ctx.pristine.consoleLog,
     'startLogging must hook console');
-  assert.notEqual(ctx.XMLHttpRequestStub.prototype.open, ctx.pristine.xhrOpen,
-    'startLogging must hook XHR');
 
   const stopped = await ctx.send({ action: 'stopLogging' });
   assert.equal(stopped.success, true);
-  assert.equal(ctx.window.fetch, ctx.pristine.fetch, 'stopLogging must restore fetch');
   assert.equal(ctx.consoleStub.log, ctx.pristine.consoleLog,
     'stopLogging must restore console');
-  assert.equal(ctx.XMLHttpRequestStub.prototype.open, ctx.pristine.xhrOpen,
-    'stopLogging must restore XHR');
 });
 
-test('repeated start/stop cycles leave the page globals as they were', async () => {
+test('repeated start/stop cycles leave console as it was', async () => {
   const ctx = loadContentScript({});
 
   for (let i = 0; i < 3; i++) {
@@ -298,53 +309,43 @@ test('repeated start/stop cycles leave the page globals as they were', async () 
     await ctx.send({ action: 'stopLogging' });
   }
 
-  assert.equal(ctx.window.fetch, ctx.pristine.fetch);
   assert.equal(ctx.consoleStub.log, ctx.pristine.consoleLog);
-  assert.equal(ctx.XMLHttpRequestStub.prototype.open, ctx.pristine.xhrOpen);
 });
 
-test('a sandbox that refuses the fetch override keeps the page working', async () => {
-  // Firefox makes window.fetch read-only in some sandboxes. Losing that one
-  // capability must not break the page or the other interceptors.
+test('console output is captured only while logging is on', async () => {
   const ctx = loadContentScript({});
-  const pageFetch = ctx.window.fetch;
-  Object.defineProperty(ctx.window, 'fetch', {
-    get: () => pageFetch,
-    set: () => { throw new TypeError('fetch is read-only'); },
-    configurable: true
-  });
 
-  const started = await ctx.send({ action: 'startLogging' });
-  assert.equal(started.success, true, 'logging must still start');
-
-  const logs = await ctx.send({ action: 'getNetworkLogs' });
-  assert.equal(logs.interception.fetch, false, 'fetch interception must report unavailable');
-  assert.equal(ctx.window.fetch, pageFetch, "the page's own fetch must be intact");
-
-  // The page's fetch must still work, and stopping must not throw.
-  const response = await ctx.window.fetch('http://api.stub.test/ping');
-  assert.equal(response.status, 200);
-  const stopped = await ctx.send({ action: 'stopLogging' });
-  assert.equal(stopped.success, true);
-  assert.equal(ctx.window.fetch, pageFetch);
-});
-
-test('captured request headers redact credentials', async () => {
-  const ctx = loadContentScript({});
+  ctx.consoleStub.log('before');
   await ctx.send({ action: 'startLogging' });
+  ctx.consoleStub.log('during');
+  await ctx.send({ action: 'stopLogging' });
+  ctx.consoleStub.log('after');
 
-  await ctx.window.fetch('http://api.stub.test/me', {
-    method: 'GET',
-    headers: { Authorization: 'Bearer sk-secret-value', 'X-Trace': 'keep-me' }
-  });
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  // Array.from re-homes the cross-realm array so deepEqual can compare it.
+  const messages = Array.from(logs.logs, l => l.message);
+  assert.deepEqual(messages, ['during']);
+});
 
-  const logs = await ctx.send({ action: 'getNetworkLogs' });
-  const entry = logs.logs.find(l => l.url === 'http://api.stub.test/me');
-  assert.ok(entry, 'the request should have been logged');
-  assert.equal(entry.requestHeaders.Authorization, '***');
-  assert.equal(entry.requestHeaders['X-Trace'], 'keep-me');
-  assert.ok(!JSON.stringify(logs).includes('sk-secret-value'),
-    'the bearer token must not appear anywhere in the logs');
+test('the content script no longer answers waitForNetworkIdle', async () => {
+  // It used to wrap the page's fetch and XHR to count in-flight requests;
+  // background.js counts them at the network layer instead.
+  const ctx = loadContentScript({});
+
+  const result = await ctx.send({ action: 'waitForNetworkIdle' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /Unknown action/);
+});
+
+test('the content script no longer answers getNetworkLogs', async () => {
+  // background.js owns network logs now; a stale route here would shadow it.
+  const ctx = loadContentScript({});
+
+  const result = await ctx.send({ action: 'getNetworkLogs' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /Unknown action/);
 });
 
 // --------------------------------------------------------------------------

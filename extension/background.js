@@ -19,6 +19,402 @@ const MAX_RECONNECT_ATTEMPTS = 20;
 const INITIAL_RECONNECT_DELAY = 1000;  // 1 second
 const MAX_RECONNECT_DELAY = 30000;     // 30 seconds
 
+// ============================================================
+// Network logging (webRequest)
+//
+// Capture happens here, at the network layer, not by wrapping page globals.
+// Firefox's content-script sandbox refuses a window.fetch override, so a
+// content script can only ever see XHR — and fetch is what modern apps use.
+// webRequest sees everything, needs no page mutation, and is unaffected by a
+// page's CSP.
+//
+// Listeners are attached only while at least one tab is being logged, so a
+// browser that nobody asked to log pays nothing.
+// ============================================================
+
+const MAX_LOG_ENTRIES = 500;
+const MAX_BODY_CHARS = 5000;
+const MAX_PENDING_REQUESTS = 300;
+
+// fetch() and XHR both surface as "xmlhttprequest" here, which is the traffic
+// worth logging when debugging an app. Assets are excluded unless asked for.
+const DEFAULT_REQUEST_TYPES = [
+  "xmlhttprequest", "websocket", "beacon", "ping", "csp_report", "other"
+];
+
+// Headers whose values carry credentials. The name stays visible, the value
+// does not — these logs are read by the agent.
+const REDACTED_HEADERS = new Set([
+  "authorization", "proxy-authorization", "cookie", "set-cookie",
+  "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token",
+  "api-key", "auth-token", "x-session-token", "x-access-token"
+]);
+
+// Response bodies are only collected for types that are text to begin with.
+const TEXTUAL_CONTENT_TYPE = /^(text\/|application\/(json|javascript|xml|x-www-form-urlencoded)|application\/[^;]*\+json)/i;
+
+// tabId -> { captureBodies, includeAllTypes }
+const loggedTabs = new Map();
+// tabId -> finished entries
+const networkLogsByTab = new Map();
+// webRequest requestId -> in-flight entry
+const pendingNetworkRequests = new Map();
+// tabId -> how many callers are waiting for the tab to go quiet. Counting
+// in-flight requests needs the same listeners logging does, so the two share
+// them and whoever leaves last takes them down.
+const idleWatchers = new Map();
+// tabId -> { requests: Set<requestId>, lastActivity: timestamp }
+const inFlightByTab = new Map();
+let webRequestListenersAttached = false;
+
+// A tab is watched when anything needs its traffic observed.
+function isWatchedTab(tabId) {
+  return tabId !== undefined && tabId >= 0 &&
+    (loggedTabs.has(tabId) || idleWatchers.has(tabId));
+}
+
+function shouldLogRequest(details) {
+  const options = loggedTabs.get(details.tabId);
+  if (!options) return false;
+  if (options.includeAllTypes) return true;
+  return DEFAULT_REQUEST_TYPES.includes(details.type);
+}
+
+function inFlightFor(tabId) {
+  if (!inFlightByTab.has(tabId)) {
+    inFlightByTab.set(tabId, { requests: new Set(), lastActivity: Date.now() });
+  }
+  return inFlightByTab.get(tabId);
+}
+
+// Idle counting deliberately covers every request type, not just the ones
+// worth logging: a page is not quiet while it is still pulling images.
+function noteRequestStarted(details) {
+  const state = inFlightFor(details.tabId);
+  state.requests.add(details.requestId);
+  state.lastActivity = Date.now();
+}
+
+function noteRequestFinished(details) {
+  const state = inFlightByTab.get(details.tabId);
+  if (!state) return;
+  state.requests.delete(details.requestId);
+  state.lastActivity = Date.now();
+}
+
+function redactHeaderList(headers) {
+  const out = {};
+  for (const header of headers || []) {
+    out[header.name] = REDACTED_HEADERS.has(header.name.toLowerCase())
+      ? "***"
+      : header.value;
+  }
+  return out;
+}
+
+// webRequest hands request bodies over as form fields or raw byte buffers.
+function describeRequestBody(requestBody) {
+  if (!requestBody) return null;
+  try {
+    if (requestBody.formData) {
+      return JSON.stringify(requestBody.formData).substring(0, 1000);
+    }
+    if (requestBody.raw && requestBody.raw.length) {
+      const decoder = new TextDecoder("utf-8");
+      const text = requestBody.raw
+        .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes) : ""))
+        .join("");
+      return text.substring(0, 1000);
+    }
+  } catch (e) {
+    return "[could not decode request body]";
+  }
+  return null;
+}
+
+function storeNetworkEntry(tabId, entry) {
+  if (!networkLogsByTab.has(tabId)) {
+    networkLogsByTab.set(tabId, []);
+  }
+  const logs = networkLogsByTab.get(tabId);
+  logs.push(entry);
+  if (logs.length > MAX_LOG_ENTRIES) {
+    logs.shift();
+  }
+}
+
+function finalizeNetworkRequest(requestId, extra) {
+  const entry = pendingNetworkRequests.get(requestId);
+  if (!entry) return;
+  pendingNetworkRequests.delete(requestId);
+  Object.assign(entry, extra);
+  if (entry.startedAt) {
+    entry.duration = Date.now() - entry.startedAt;
+    delete entry.startedAt;
+  }
+  storeNetworkEntry(entry.tabId, entry);
+}
+
+const onBeforeRequestListener = (details) => {
+  if (!isWatchedTab(details.tabId)) return;
+  noteRequestStarted(details);
+
+  if (!shouldLogRequest(details)) return;
+
+  // A runaway page must not grow this map without bound.
+  if (pendingNetworkRequests.size >= MAX_PENDING_REQUESTS) {
+    const oldest = pendingNetworkRequests.keys().next().value;
+    pendingNetworkRequests.delete(oldest);
+  }
+
+  pendingNetworkRequests.set(details.requestId, {
+    type: details.type,
+    method: details.method,
+    url: details.url,
+    tabId: details.tabId,
+    requestBody: describeRequestBody(details.requestBody),
+    startTime: new Date().toISOString(),
+    startedAt: Date.now()
+  });
+};
+
+const onBeforeSendHeadersListener = (details) => {
+  const entry = pendingNetworkRequests.get(details.requestId);
+  if (entry) {
+    entry.requestHeaders = redactHeaderList(details.requestHeaders);
+  }
+};
+
+const onHeadersReceivedListener = (details) => {
+  const entry = pendingNetworkRequests.get(details.requestId);
+  if (!entry) return;
+
+  entry.status = details.statusCode;
+  entry.statusText = details.statusLine;
+  entry.responseHeaders = redactHeaderList(details.responseHeaders);
+
+  const options = loggedTabs.get(details.tabId);
+  if (!options || !options.captureBodies) return;
+
+  const contentType = (details.responseHeaders || [])
+    .find(h => h.name.toLowerCase() === "content-type");
+  if (!contentType || !TEXTUAL_CONTENT_TYPE.test(contentType.value)) {
+    entry.responseBody = "[not captured: non-textual content type]";
+    return;
+  }
+
+  attachResponseBodyReader(details.requestId, entry);
+};
+
+// Read-only stream filter. Every chunk is written back byte for byte and the
+// stream is always closed, so the page receives exactly what it would have
+// without us. Anything unexpected disconnects the filter, which hands the
+// remainder of the response straight through untouched.
+function attachResponseBodyReader(requestId, entry) {
+  let filter;
+  try {
+    filter = browser.webRequest.filterResponseData(requestId);
+  } catch (e) {
+    entry.responseBody = "[not captured: response filtering unavailable]";
+    return;
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  let collected = "";
+
+  filter.ondata = (event) => {
+    try {
+      if (collected.length < MAX_BODY_CHARS) {
+        collected += decoder.decode(event.data, { stream: true });
+      }
+    } catch (e) {
+      // Undecodable chunk: keep passing data through regardless.
+    }
+    filter.write(event.data);
+  };
+
+  filter.onstop = () => {
+    entry.responseBody = collected.substring(0, MAX_BODY_CHARS);
+    try {
+      filter.close();
+    } catch (e) {
+      // Already closed.
+    }
+  };
+
+  filter.onerror = () => {
+    entry.responseBody = `[not captured: ${filter.error || "stream error"}]`;
+  };
+}
+
+const onCompletedListener = (details) => {
+  noteRequestFinished(details);
+  finalizeNetworkRequest(details.requestId, {
+    status: details.statusCode,
+    fromCache: details.fromCache
+  });
+};
+
+const onErrorOccurredListener = (details) => {
+  noteRequestFinished(details);
+  finalizeNetworkRequest(details.requestId, { error: details.error });
+};
+
+function attachWebRequestListeners() {
+  if (webRequestListenersAttached) return { attached: true };
+  const filter = { urls: ["<all_urls>"] };
+  try {
+    browser.webRequest.onBeforeRequest.addListener(
+      onBeforeRequestListener, filter, ["requestBody"]);
+    browser.webRequest.onBeforeSendHeaders.addListener(
+      onBeforeSendHeadersListener, filter, ["requestHeaders"]);
+    browser.webRequest.onHeadersReceived.addListener(
+      onHeadersReceivedListener, filter, ["responseHeaders"]);
+    browser.webRequest.onCompleted.addListener(onCompletedListener, filter);
+    browser.webRequest.onErrorOccurred.addListener(onErrorOccurredListener, filter);
+    webRequestListenersAttached = true;
+    return { attached: true };
+  } catch (e) {
+    console.error("[ClaudeCodeBrowser] Could not attach webRequest listeners:", e);
+    return { attached: false, error: e.message };
+  }
+}
+
+function detachWebRequestListeners() {
+  if (!webRequestListenersAttached) return;
+  try {
+    browser.webRequest.onBeforeRequest.removeListener(onBeforeRequestListener);
+    browser.webRequest.onBeforeSendHeaders.removeListener(onBeforeSendHeadersListener);
+    browser.webRequest.onHeadersReceived.removeListener(onHeadersReceivedListener);
+    browser.webRequest.onCompleted.removeListener(onCompletedListener);
+    browser.webRequest.onErrorOccurred.removeListener(onErrorOccurredListener);
+  } catch (e) {
+    console.error("[ClaudeCodeBrowser] Could not detach webRequest listeners:", e);
+  }
+  webRequestListenersAttached = false;
+  pendingNetworkRequests.clear();
+}
+
+function startNetworkLogging(tabId, options = {}) {
+  if (options.clearExisting) {
+    networkLogsByTab.delete(tabId);
+  }
+  loggedTabs.set(tabId, {
+    captureBodies: options.captureBodies !== false,
+    includeAllTypes: options.includeAllTypes === true
+  });
+  return attachWebRequestListeners();
+}
+
+// Listeners come down only when nothing needs them any more.
+function releaseWebRequestListenersIfIdle() {
+  if (loggedTabs.size === 0 && idleWatchers.size === 0) {
+    detachWebRequestListeners();
+  }
+}
+
+function stopNetworkLogging(tabId) {
+  loggedTabs.delete(tabId);
+  releaseWebRequestListenersIfIdle();
+}
+
+// Wait for a tab's network to go quiet, counted at the network layer. The
+// previous implementation wrapped the page's own fetch and XHR to do this;
+// webRequest sees more (it catches fetch, which the sandbox hid) and touches
+// nothing in the page.
+async function waitForNetworkIdleOnTab(tabId, options = {}) {
+  const timeout = options.timeout || 10000;
+  const idleTime = options.idleTime || 500;
+  const startedAt = Date.now();
+
+  idleWatchers.set(tabId, (idleWatchers.get(tabId) || 0) + 1);
+  const attached = attachWebRequestListeners();
+  if (!attached.attached) {
+    idleWatchers.delete(tabId);
+    return { success: false, error: `Cannot observe network: ${attached.error}` };
+  }
+
+  // Nothing in flight yet still counts as activity, so a request that starts
+  // a moment from now is not mistaken for silence.
+  inFlightFor(tabId).lastActivity = Date.now();
+
+  try {
+    while (Date.now() - startedAt < timeout) {
+      const state = inFlightFor(tabId);
+      const pending = state.requests.size;
+      if (pending === 0 && Date.now() - state.lastActivity >= idleTime) {
+        return { success: true, idle: true, waitedMs: Date.now() - startedAt,
+                 pendingRequests: 0 };
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    return {
+      success: true,
+      idle: false,
+      timedOut: true,
+      waitedMs: Date.now() - startedAt,
+      pendingRequests: inFlightFor(tabId).requests.size
+    };
+  } finally {
+    const remaining = (idleWatchers.get(tabId) || 1) - 1;
+    if (remaining > 0) {
+      idleWatchers.set(tabId, remaining);
+    } else {
+      idleWatchers.delete(tabId);
+    }
+    releaseWebRequestListenersIfIdle();
+  }
+}
+
+function getNetworkLogsFor(tabId, options = {}) {
+  let logs = [...(networkLogsByTab.get(tabId) || [])];
+
+  const urlPattern = options.urlPattern || options.url_pattern;
+  if (urlPattern) {
+    const pattern = new RegExp(urlPattern, "i");
+    logs = logs.filter(log => pattern.test(log.url));
+  }
+  if (options.method) {
+    logs = logs.filter(log => log.method?.toUpperCase() === options.method.toUpperCase());
+  }
+  if (options.status) {
+    logs = logs.filter(log => log.status === options.status);
+  }
+  if (options.errorsOnly || options.errors_only) {
+    logs = logs.filter(log => log.error || (log.status && log.status >= 400));
+  }
+
+  const total = (networkLogsByTab.get(tabId) || []).length;
+  const limit = options.limit || 100;
+  if (logs.length > limit) {
+    logs = logs.slice(-limit);
+  }
+
+  return {
+    success: true,
+    logs: logs,
+    totalCount: total,
+    returnedCount: logs.length,
+    loggingEnabled: loggedTabs.has(tabId),
+    source: "webRequest",
+    capturesFetch: true
+  };
+}
+
+function clearNetworkLogs(tabId) {
+  networkLogsByTab.delete(tabId);
+}
+
+// Don't keep logs for tabs that no longer exist.
+browser.tabs.onRemoved.addListener((tabId) => {
+  loggedTabs.delete(tabId);
+  networkLogsByTab.delete(tabId);
+  idleWatchers.delete(tabId);
+  inFlightByTab.delete(tabId);
+  releaseWebRequestListenersIfIdle();
+});
+
 // Calculate exponential backoff delay
 function getReconnectDelay() {
   const delay = Math.min(
@@ -263,6 +659,11 @@ async function handleCommand(message) {
         break;
       // Element interaction and dynamic-content commands implemented by the
       // content script — forwarded as-is
+      case "waitForNetworkIdle":
+        result = await waitForNetworkIdle(tabId, data);
+        break;
+      // Element interaction and dynamic-content commands implemented by the
+      // content script — forwarded as-is
       case "getValue":
       case "setValue":
       case "selectOption":
@@ -272,7 +673,6 @@ async function handleCommand(message) {
       case "getComputedStyles":
       case "getBoundingRect":
       case "waitForChange":
-      case "waitForNetworkIdle":
       case "observeElement":
       case "stopObserving":
       case "scrollAndCapture":
@@ -281,21 +681,22 @@ async function handleCommand(message) {
       case "getText":
         result = await sendToContentScript(tabId, { action, ...data });
         break;
-      // Console and network logging commands
+      // Logging. Console output only exists inside the page, so the content
+      // script still handles it; network traffic is captured here.
       case "startLogging":
-        result = await sendToContentScript(tabId, { action: "startLogging", ...data });
+        result = await startLogging(tabId, data);
         break;
       case "stopLogging":
-        result = await sendToContentScript(tabId, { action: "stopLogging" });
+        result = await stopLogging(tabId);
         break;
       case "getConsoleLogs":
         result = await sendToContentScript(tabId, { action: "getConsoleLogs", ...data });
         break;
       case "getNetworkLogs":
-        result = await sendToContentScript(tabId, { action: "getNetworkLogs", ...data });
+        result = await getNetworkLogs(tabId, data);
         break;
       case "clearLogs":
-        result = await sendToContentScript(tabId, { action: "clearLogs", ...data });
+        result = await clearLogs(tabId, data);
         break;
       default:
         result = { success: false, error: `Unknown action: ${action}` };
@@ -484,6 +885,90 @@ async function navigateHistory(tabId, direction) {
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+// Resolve an optional tab id to a concrete one (the active tab when omitted).
+async function resolveTabId(tabId) {
+  if (tabId !== undefined && tabId !== null) return tabId;
+  const active = (await browser.tabs.query({ active: true, currentWindow: true }))[0];
+  return active?.id;
+}
+
+// Logging spans both halves of the extension: network capture lives here,
+// console capture in the content script. Both are started and stopped
+// together so the tools keep behaving as one switch.
+async function startLogging(tabId, data = {}) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    return { success: false, error: "No tab to log" };
+  }
+
+  const network = startNetworkLogging(resolved, data);
+  const console_ = await sendToContentScript(resolved, { action: "startLogging", ...data });
+
+  return {
+    success: true,
+    message: "Logging started",
+    tabId: resolved,
+    network: {
+      capturing: network.attached,
+      capturesFetch: network.attached,
+      captureBodies: data.captureBodies !== false,
+      error: network.error
+    },
+    console: {
+      capturing: console_.success === true,
+      error: console_.success === true ? undefined : console_.error
+    }
+  };
+}
+
+async function stopLogging(tabId) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    return { success: false, error: "No tab to stop logging for" };
+  }
+
+  stopNetworkLogging(resolved);
+  const console_ = await sendToContentScript(resolved, { action: "stopLogging" });
+
+  return {
+    success: true,
+    message: "Logging stopped",
+    tabId: resolved,
+    networkLogsCount: (networkLogsByTab.get(resolved) || []).length,
+    consoleLogsCount: console_.consoleLogsCount
+  };
+}
+
+async function waitForNetworkIdle(tabId, data = {}) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    return { success: false, error: "No tab to wait on" };
+  }
+  return waitForNetworkIdleOnTab(resolved, data);
+}
+
+async function getNetworkLogs(tabId, data = {}) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    return { success: false, error: "No tab to read logs for" };
+  }
+  return getNetworkLogsFor(resolved, data);
+}
+
+async function clearLogs(tabId, data = {}) {
+  const resolved = await resolveTabId(tabId);
+  if (resolved === undefined) {
+    return { success: false, error: "No tab to clear logs for" };
+  }
+  if (data.network !== false) {
+    clearNetworkLogs(resolved);
+  }
+  if (data.console !== false) {
+    await sendToContentScript(resolved, { action: "clearLogs", ...data });
+  }
+  return { success: true, message: "Logs cleared", tabId: resolved };
 }
 
 // Generic helper to send message to content script

@@ -5,10 +5,11 @@ node = "22"
 "npm:web-ext" = "latest"
 
 [tasks.test]
-description = "Run the Python and content-script test suites"
+description = "Run the Python and extension test suites"
 run = [
   "python3 -m unittest discover -s tests -t . -v",
   "node tests/content_script.test.mjs",
+  "node tests/background_script.test.mjs",
 ]
 
 [tasks.test-python]
@@ -16,8 +17,11 @@ description = "Run the Python test suite"
 run = "python3 -m unittest discover -s tests -t . -v"
 
 [tasks.test-extension]
-description = "Run the content-script test suite"
-run = "node tests/content_script.test.mjs"
+description = "Run the extension test suites"
+run = [
+  "node tests/content_script.test.mjs",
+  "node tests/background_script.test.mjs",
+]
 
 [tasks.package]
 description = "Build an unsigned .xpi into dist/ (temporary-load only)"

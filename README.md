@@ -23,7 +23,7 @@ A browser automation system for Claude Code that enables AI-powered interaction 
 - **Page Refresh** - Force refresh tabs after server restarts (bypass cache)
 - **Element Inspection** - Find elements, get page info, highlight elements
 - **JavaScript Execution** - Run arbitrary JS in browser context
-- **Console & Network Logging** - Capture console output and fetch/XHR traffic for debugging
+- **Console & Network Logging** - Capture console output and network traffic (fetch, XHR, WebSocket, beacons) for debugging
 - **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, audit log ([details](#safety-guards))
 - **Headless Mode** - Unattended automation via Playwright: Firefox, Chromium, or WebKit
 - **MCP Integration** - Model Context Protocol server for Claude Code
@@ -91,7 +91,7 @@ flowchart TB
 
 The native messaging host (`claudecodebrowser_host.py`) provides an alternative communication path:
 - Used when the browser extension needs to communicate with the local file system
-- Handles screenshot saving directly to disk at `/tmp/claudecodebrowser/screenshots/`
+- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`)
 - Enables clipboard operations and file downloads
 
 ## Installation
@@ -505,7 +505,7 @@ agent.fill_form({
 |------|-------------|
 | `browser_wait_for_element` | Wait for element to appear on page |
 | `browser_wait_for_change` | Wait for DOM changes (useful after clicks) |
-| `browser_wait_for_network_idle` | Wait for fetch/XHR requests to settle |
+| `browser_wait_for_network_idle` | Wait for network requests to settle (counts subresources too) |
 | `browser_click_and_wait` | Click element and wait for DOM changes |
 
 #### Advanced Observation
@@ -521,7 +521,7 @@ agent.fill_form({
 | `browser_start_logging` | Start capturing console logs and network requests |
 | `browser_stop_logging` | Stop capturing logs (logs are preserved) |
 | `browser_get_console_logs` | Retrieve captured console.log/error/warn/info/debug |
-| `browser_get_network_logs` | Retrieve captured fetch/XHR requests and responses |
+| `browser_get_network_logs` | Retrieve captured requests and responses (credential headers redacted) |
 | `browser_clear_logs` | Clear all captured logs |
 
 #### Human Approval, Workflows & Auditing
@@ -549,6 +549,21 @@ browser-agent --start-logging
 
 # Get console logs (errors, warnings, debug output)
 browser-agent --get-console-logs
+
+> **How network capture works.** Requests are recorded in the extension's
+> background script through Firefox's `webRequest` API, not by replacing the
+> page's `fetch`/`XHR`. That means `fetch` is captured (Firefox's content-script
+> sandbox makes `window.fetch` read-only, so a content script can only ever see
+> XHR), pages with a strict CSP are captured, and no page global is touched.
+> Capture is off until `browser_start_logging` and stops at
+> `browser_stop_logging`; while nothing is being logged, no listeners are
+> attached at all. Credential-bearing headers (`Authorization`, `Cookie`,
+> `Set-Cookie`, `X-API-Key`, …) are reported as `***`. Response bodies are
+> collected for textual content types up to 5000 characters, and can be
+> switched off with `capture_bodies: false`. By default only API-shaped traffic
+> is logged — pass `include_all_types: true` for images, fonts and stylesheets.
+> Console capture stays in the content script, since console output only exists
+> inside the page.
 
 # Get network logs (API requests and responses)
 browser-agent --get-network-logs
@@ -592,7 +607,7 @@ agent.stop_logging()
 
 #### Use Cases
 - **Debug AI Chat Interfaces**: See console errors and API request/response data
-- **Monitor API Communications**: Track all fetch/XHR requests with full bodies
+- **Monitor API Communications**: Track requests with bodies, captured at the network layer
 - **Troubleshoot Errors**: Filter console logs by error level
 - **Verify Integrations**: Confirm API calls are being made correctly
 

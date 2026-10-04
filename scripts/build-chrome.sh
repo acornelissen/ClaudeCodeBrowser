@@ -10,9 +10,14 @@
 # automation, the headless Playwright backend (CLAUDE_BROWSER_ENGINE=chromium)
 # is the supported path.
 #
-# Known MV3 caveat: the background script runs as a service worker. Chrome
-# 105+ keeps the worker alive while the native messaging port is open, so the
-# native-host connection is what keeps the extension responsive.
+# Known MV3 caveats:
+#   - The background script runs as a service worker. Chrome 105+ keeps the
+#     worker alive while the native messaging port is open, so the native-host
+#     connection is what keeps the extension responsive.
+#   - Network logging captures metadata and headers only. Response bodies use
+#     browser.webRequest.filterResponseData(), which is Firefox-only, and MV3
+#     does not grant webRequestBlocking to ordinary extensions. Use the
+#     headless Playwright backend for full-fidelity Chromium capture.
 
 set -e
 
@@ -56,6 +61,7 @@ cat > "$OUT/manifest.json" << EOF
     "nativeMessaging",
     "storage",
     "scripting",
+    "webRequest",
     "webNavigation",
     "contextMenus"
   ],
@@ -123,5 +129,7 @@ echo "       Linux:  ~/.config/google-chrome/NativeMessagingHosts/claudecodebrow
 echo "       macOS:  ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/claudecodebrowser.json"
 echo "       (create the directory if needed, copy the edited file there)"
 echo ""
-echo "This build is EXPERIMENTAL. For reliable Chromium automation use the"
-echo "headless backend instead: CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1"
+echo "This build is EXPERIMENTAL. Network logging captures metadata and headers"
+echo "but not response bodies (filterResponseData is Firefox-only). For reliable"
+echo "Chromium automation use the headless backend instead:"
+echo "  CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1"

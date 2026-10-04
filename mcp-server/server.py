@@ -476,7 +476,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_wait_for_network_idle",
-        description="Wait for network requests (fetch/XHR) to settle. Perfect for waiting after actions that trigger API calls.",
+        description="Wait for network requests to settle. Perfect for waiting after actions that trigger API calls. Counted at the network layer via webRequest, so it sees fetch, XHR and subresources (a page still loading images is not idle).",
         input_schema={
             "type": "object",
             "properties": {
@@ -544,11 +544,13 @@ MCP_TOOLS: List[MCPTool] = [
     # Console and Network Logging Tools
     MCPTool(
         name="browser_start_logging",
-        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them.",
+        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them. Network capture uses webRequest, so it sees fetch, XHR, WebSocket handshakes and beacons; console capture is per-page. Capture is off until you call this and stops when you call browser_stop_logging.",
         input_schema={
             "type": "object",
             "properties": {
                 "clear_existing": {"type": "boolean", "description": "Clear any existing logs before starting.", "default": False},
+                "capture_bodies": {"type": "boolean", "description": "Capture response bodies for textual responses (JSON, text, XML). Set false for metadata and headers only.", "default": True},
+                "include_all_types": {"type": "boolean", "description": "Log every request type including images, fonts and stylesheets. By default only API-shaped traffic (fetch/XHR, WebSocket, beacon, ping) is logged.", "default": False},
                 "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."}
             }
         }
@@ -578,7 +580,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_network_logs",
-        description="Retrieve captured network requests and responses (fetch/XHR). Perfect for debugging API calls, seeing request/response data, and monitoring AI chat communications.",
+        description="Retrieve captured network requests and responses. Perfect for debugging API calls, seeing request/response data, and monitoring AI chat communications. Captured via webRequest, so fetch and XHR are both covered. Credential-bearing headers (Authorization, Cookie, Set-Cookie, X-API-Key and similar) are reported as '***'. Response bodies are captured for textual content types only, up to 5000 characters.",
         input_schema={
             "type": "object",
             "properties": {
