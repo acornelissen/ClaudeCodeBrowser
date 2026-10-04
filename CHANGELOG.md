@@ -69,8 +69,12 @@ them is part of releasing, and that is being held for approval.
   tokens, nested credential objects, multipart frames and `pwd=` were all
   unchanged too, and a credential straddling the 5000-character response cap
   survived as a fragment because the body was truncated before it was
-  scrubbed. JSON bodies are now walked structurally and re-serialised, so
-  every value shape is covered by construction.
+  scrubbed. JSON bodies are now walked structurally, so every value shape is
+  covered by construction — including below the walk's depth limit, which
+  returned the raw subtree and so logged anything nested deeper than 12 in
+  clear. The rebuilt text is used only when something was actually redacted,
+  because re-serialising turns `12345678901234567890` into `…567000` and
+  `1e400` into `null`.
 - **The DOM credential guard looks at `name` and `id`, and beyond
   `<input>`.** It recognised only `input[type=password]` and the
   `autocomplete` token list, so `<sl-input type="password">` (the
@@ -79,7 +83,11 @@ them is part of releasing, and that is being held for approval.
   field was `***` in the network log and plaintext from
   `browser_get_value` — the scrubber already knew those names.
 - **A screenshot of a private-browsing window is never written to disk**, and
-  `browser_screenshot_all_tabs` skips private windows. The private-tab check
+  `browser_screenshot_all_tabs` skips private windows. `browser_screenshot` of
+  a background tab with `allow_focus: false` is refused rather than returning
+  the *active* tab's image labelled as the requested one — Firefox captures
+  the active tab of a window, so a screenshot of your open mail was being
+  filed as a screenshot of some other page. The private-tab check
   also fails closed: it returned "not private" whenever the tab could not be
   inspected, which is how a private window's traffic reached the buffer.
 - **The agent no longer sends the API token off-machine.** `CLAUDE_BROWSER_URL`
@@ -209,10 +217,14 @@ them is part of releasing, and that is being held for approval.
   object replaced with `***`, and `session`, `pass` and `otp` hid
   `sessionCount`, `bypassCache` and `notPublished`. A log that eats the
   fields you were reading is a log you turn the scrubber off for. The short
-  entries are anchored now, losing no credential name, and the extension's
-  two copies of the list are pinned identical by test — their drift was the
-  reason a field could read `***` in the network log and plaintext from
-  `browser_get_value`.
+  entries are anchored now, and the extension's two copies of the list are
+  pinned identical by test — their drift was the reason a field could read
+  `***` in the network log and plaintext from `browser_get_value`. Anchoring
+  alone *lost* ten credential names (`passkey`, `otpCode`, `oauth_verifier`,
+  `authz`, `sessionValue` …), because a camelCase hump is not a separator;
+  names are matched through a step that normalises camelCase first, and a
+  test asserts no future tightening may drop a name the loose pattern
+  caught.
 - "Take Screenshot for Claude" in the context menu has never done anything.
   It posted an action the native host has no handler for, so the message fell
   through to `/browser/command`.
@@ -223,8 +235,14 @@ them is part of releasing, and that is being held for approval.
   not the submit string. It returned `"on"` whether or not the box was
   ticked, so an agent reading a consent box or a radio group learned nothing;
   the submit string is still reported alongside as `submitValue`.
-- **`browser_set_value` on a checkbox or `<select>` now errors rather than
-  claiming success.** It assigned `.value` blind and reported `{set: true}`
+- **`browser_set_value` now errors rather than claiming success** when it
+  cannot set the element: it fell through to an unconditional `set: true` for
+  anything that was not an input, textarea, select or contenteditable, so it
+  reported success on a `<div>` having changed nothing. It now also sets a
+  value-bearing custom element (`<sl-input>` and friends, which are what an
+  agent has to target on Shoelace/Ionic/Vaadin pages) and reads the value
+  back, refusing when the assignment did not take. On a checkbox or
+  `<select>` It assigned `.value` blind and reported `{set: true}`
   having changed nothing, and `browser_select_option` reported success for an
   option that does not exist — where a real `<select>` resets to `''`, so the
   caller believed a choice had been made and the form was submitted empty.
