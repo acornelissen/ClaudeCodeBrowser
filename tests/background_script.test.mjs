@@ -68,6 +68,11 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
 
   const contentMessages = [];
   const tabsOnRemoved = makeEvent();
+  const messageListeners = [];
+  const externalListeners = [];
+  const createdWindows = [];
+  const removedWindows = [];
+  let windowCreateFails = false;
 
   const browserStub = {
     runtime: {
@@ -76,8 +81,9 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
         onDisconnect: { addListener() {} },
         postMessage() {}
       }),
-      onMessage: { addListener() {} },
-      onMessageExternal: { addListener() {} },
+      onMessage: { addListener: (fn) => messageListeners.push(fn) },
+      onMessageExternal: { addListener: (fn) => externalListeners.push(fn) },
+      id: 'ccb@stub',
       getURL: (p) => `moz-extension://stub/${p}`
     },
     tabs: {
@@ -98,7 +104,14 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     windows: {
       getAll: async () => [{ id: 1, focused: true }],
       get: async (id) => ({ id, focused: true }),
-      update: async () => ({})
+      update: async () => ({}),
+      create: async (options) => {
+        if (windowCreateFails) throw new Error('no window manager');
+        const win = { id: 900 + createdWindows.length, ...options };
+        createdWindows.push(win);
+        return win;
+      },
+      remove: async (id) => { removedWindows.push(id); }
     },
     webRequest,
     notifications: { create: async () => 'id' },
@@ -121,7 +134,23 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   const command = (action, data, tabId) =>
     context.handleCommand({ action, data, tabId });
 
-  return { context, command, webRequest, filters, contentMessages, tabsOnRemoved };
+  // Deliver a message as the extension's own page would (no sender.tab), or
+  // as a content script would (sender.tab set).
+  const deliver = (message, sender) => new Promise((resolve) => {
+    for (const listener of messageListeners) {
+      const returned = listener(message, sender, resolve);
+      if (returned === true) return;
+    }
+    resolve(undefined);
+  });
+
+  return {
+    context, command, webRequest, filters, contentMessages, tabsOnRemoved,
+    createdWindows, removedWindows, deliver, externalListeners,
+    failWindowCreate: () => { windowCreateFails = true; },
+    extensionSender: { id: 'ccb@stub' },
+    contentScriptSender: { id: 'ccb@stub', tab: { id: 7 } },
+  };
 }
 
 /** Drive one complete request through the webRequest lifecycle. */
@@ -754,6 +783,130 @@ test('an evicted in-flight request is logged rather than silently dropped', asyn
   const dropped = result.logs.filter(l => /dropped/.test(l.error || ''));
   assert.ok(dropped.length > 0, 'eviction must leave a marker in the log');
   assert.equal(dropped[0].url, 'http://stub.test/0', 'the oldest is the one evicted');
+});
+
+// --------------------------------------------------------------------------
+// Human approval happens outside the page being automated
+
+test('approval opens an extension window, not an in-page banner', async () => {
+  const ctx = loadBackground();
+
+  const pending = ctx.command('requestApproval',
+    { message: 'run a thing', detail: '{"script":"x"}', timeout: 5000 }, 7);
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  assert.equal(ctx.createdWindows.length, 1, 'a window should have been opened');
+  const win = ctx.createdWindows[0];
+  assert.match(win.url, /^moz-extension:\/\/stub\/approve\/approve\.html\?id=/,
+    'the prompt must be an extension page, not page DOM');
+  assert.equal(win.type, 'popup');
+  assert.ok(!ctx.contentMessages.some(m => m.message.action === 'requestApproval'),
+    'the in-page banner must not be used when a window is available');
+
+  // The page reports the decision.
+  const id = decodeURIComponent(new URL(win.url).searchParams.get('id'));
+  await ctx.deliver({ target: 'approval', action: 'decide', requestId: id,
+                      approved: true }, ctx.extensionSender);
+
+  const result = await pending;
+  assert.equal(result.approved, true);
+  assert.equal(result.promptSurface, 'window');
+  assert.deepEqual(Array.from(ctx.removedWindows), [win.id],
+    'the window should be closed once decided');
+});
+
+test('the approval page can read its own request details', async () => {
+  const ctx = loadBackground();
+  ctx.command('requestApproval',
+    { message: 'delete everything', detail: 'the detail', protectedUrl: 'https://bank.test/',
+      timeout: 4000 }, 7);
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  const id = decodeURIComponent(
+    new URL(ctx.createdWindows[0].url).searchParams.get('id'));
+  const details = await ctx.deliver(
+    { target: 'approval', action: 'details', requestId: id }, ctx.extensionSender);
+
+  assert.equal(details.found, true);
+  assert.equal(details.message, 'delete everything');
+  assert.equal(details.detail, 'the detail',
+    'the person must see what will run, not a redaction');
+  assert.equal(details.protectedUrl, 'https://bank.test/');
+});
+
+test('a content script cannot decide an approval', async () => {
+  const ctx = loadBackground();
+  const pending = ctx.command('requestApproval', { message: 'x', timeout: 300 }, 7);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const id = decodeURIComponent(
+    new URL(ctx.createdWindows[0].url).searchParams.get('id'));
+
+  // sender.tab set: this is a page's content script, not our prompt.
+  const reply = await ctx.deliver(
+    { target: 'approval', action: 'decide', requestId: id, approved: true },
+    ctx.contentScriptSender);
+  assert.equal(reply.found, false, 'a tab must not be able to approve');
+
+  const result = await pending;
+  assert.equal(result.approved, false, 'it must fall through to the timeout');
+  assert.equal(result.timedOut, true);
+});
+
+test('another extension cannot decide an approval', async () => {
+  const ctx = loadBackground();
+  const pending = ctx.command('requestApproval', { message: 'x', timeout: 300 }, 7);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const id = decodeURIComponent(
+    new URL(ctx.createdWindows[0].url).searchParams.get('id'));
+
+  await ctx.deliver({ target: 'approval', action: 'decide', requestId: id,
+                      approved: true }, { id: 'someone-else@evil' });
+
+  const result = await pending;
+  assert.equal(result.approved, false);
+});
+
+test('closing the window without answering is a denial', async () => {
+  const ctx = loadBackground();
+  const pending = ctx.command('requestApproval', { message: 'x', timeout: 5000 }, 7);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const id = decodeURIComponent(
+    new URL(ctx.createdWindows[0].url).searchParams.get('id'));
+
+  await ctx.deliver({ target: 'approval', action: 'decide', requestId: id,
+                      approved: false, closed: true }, ctx.extensionSender);
+
+  const result = await pending;
+  assert.equal(result.approved, false);
+  assert.equal(result.closedWithoutAnswering, true);
+});
+
+test('with no window manager it falls back and says the prompt is degraded', async () => {
+  const ctx = loadBackground();
+  ctx.failWindowCreate();
+
+  const result = await ctx.command('requestApproval', { message: 'x', timeout: 500 }, 7);
+
+  assert.ok(ctx.contentMessages.some(m => m.message.action === 'requestApproval'),
+    'it should fall back to the in-page banner');
+  assert.equal(result.promptSurface, 'page');
+  assert.equal(result.degraded, true,
+    'a prompt sharing the DOM with the page is not equivalent; say so');
+});
+
+test('external messages are still refused outright', async () => {
+  const ctx = loadBackground();
+  assert.equal(ctx.externalListeners.length, 1,
+    'onMessageExternal must have a handler that refuses');
+
+  let replied = null;
+  ctx.externalListeners[0](
+    { action: 'executeScript', data: { script: 'evil' } },
+    { id: 'other@extension' },
+    (response) => { replied = response; });
+
+  assert.equal(replied.success, false,
+    'a co-installed extension must not be able to issue commands');
 });
 
 // --------------------------------------------------------------------------

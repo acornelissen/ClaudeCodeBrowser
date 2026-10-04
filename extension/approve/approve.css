@@ -1,0 +1,126 @@
+/*
+ * ClaudeCodeBrowser - Approval prompt styles
+ *
+ * MIT License
+ * Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+ * Author: dre@ligandal.com
+ */
+
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a2e;
+  --muted: #55556b;
+  --line: #d7d7e0;
+  --detail-bg: #f4f4f8;
+  --approve: #166534;
+  --approve-fg: #ffffff;
+  --deny: #b91c1c;
+  --deny-fg: #ffffff;
+  --focus: #1d4ed8;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15151f;
+    --fg: #f2f2f7;
+    --muted: #a8a8bd;
+    --line: #34344a;
+    --detail-bg: #1f1f2d;
+    --approve: #4ade80;
+    --approve-fg: #06250f;
+    --deny: #f87171;
+    --deny-fg: #2a0707;
+    --focus: #93b4ff;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, sans-serif;
+}
+
+.card { max-width: 46rem; margin: 0 auto; }
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+
+.message { margin: 0 0 16px; }
+
+.detail-heading {
+  margin: 0 0 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.detail {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  max-height: 14rem;
+  overflow: auto;
+  background: var(--detail-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.site {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+button {
+  padding: 10px 22px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.approve { background: var(--approve); color: var(--approve-fg); }
+.deny { background: var(--deny); color: var(--deny-fg); }
+
+button:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.countdown {
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.note {
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

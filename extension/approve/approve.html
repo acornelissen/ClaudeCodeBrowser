@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  ClaudeCodeBrowser - Approval prompt
+
+  MIT License
+  Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+  Author: dre@ligandal.com
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Approve action</title>
+  <link rel="stylesheet" href="approve.css">
+</head>
+<body>
+  <main class="card" role="main">
+    <h1 id="heading">Claude requests approval</h1>
+    <p id="message" class="message">Loading…</p>
+
+    <section aria-labelledby="detail-heading">
+      <h2 id="detail-heading" class="detail-heading">What it will run</h2>
+      <pre id="detail" class="detail" tabindex="0"></pre>
+    </section>
+
+    <p id="site" class="site"></p>
+
+    <div class="actions">
+      <button id="deny" type="button" class="deny" autofocus>Deny</button>
+      <button id="approve" type="button" class="approve">Approve</button>
+    </div>
+
+    <p id="countdown" class="countdown" role="status" aria-live="polite"></p>
+    <p class="note">
+      This window belongs to the extension, not to the web page. The page
+      being automated cannot read it or click these buttons.
+    </p>
+  </main>
+  <script src="approve.js"></script>
+</body>
+</html>

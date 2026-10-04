@@ -597,6 +597,16 @@ browser-agent --start-logging
 # Get console logs (errors, warnings, debug output)
 browser-agent --get-console-logs
 
+> **How much the credential guard actually guarantees.** It constrains the
+> dedicated tools — typing, reading, element metadata — in both attended and
+> headless mode. It does **not** constrain `browser_execute_script`, which can
+> read any field including a password. `browser_safety_status` reports which
+> of three states you are in: `enforced` (scripts off),
+> `enforced_except_scripts` (the default: scripts on, but refused on protected
+> sites), or `advisory` (scripts on everywhere). That is stated in the tool
+> output rather than only here, because it is the kind of thing an agent
+> should be able to find out.
+
 > **Logs on disk.** `~/.claudecodebrowser/logs/` holds `mcp_server.log`,
 > `native_host.log` and the guard's `audit.jsonl`. All three are created `0600`
 > in a `0700` directory and rotate at 5 MB. The server and native host log at
@@ -944,7 +954,9 @@ the `browser_safety_status` tool.
 | **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
 | **Password fields (writing)** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
 | **Credential fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. One function decides this for every read path. "Credential" covers `type=password`, `autocomplete` of `current-password`/`new-password`/`one-time-code`/`cc-*` (matched case-insensitively across the token list), and `type=hidden` — hidden inputs carry CSRF and session tokens. The same `allow_password_typing` setting lifts it. `browser_execute_script` can still read any field — see below. |
-| **Human approval** | The Approve/Deny prompt renders in a **closed shadow root** and only acts on trusted events, so the page cannot hide it, read it, or click Approve on its own behalf. It is sent to the top frame of the tab being acted on. If it cannot be shown or is not answered, the action is **refused** rather than falling back to a token the agent could satisfy itself. |
+| **Human approval** | The Approve/Deny decision is taken in an **extension window** (`moz-extension://`), which the page being automated cannot read, restyle or click. Only trusted events count, and only the extension's own pages may answer — a content script's attempt is refused. Closing the window is a denial. If no window can be opened the in-page banner is used as a fallback, rendered in a closed shadow root, and the result is marked `degraded: true` because a prompt sharing the DOM with the page is not equivalent. If the prompt cannot be completed, the action is **refused** rather than falling back to a token the agent could satisfy itself. Firefox does not support buttons on notifications, so the notification remains an attention-getter. |
+| **Scripts on protected sites** | `browser_execute_script` is **refused outright** on a protected URL, not merely confirmed: a script can read any field on the page, so the credential guard does not constrain it, and a confirmation the agent can satisfy is no control over arbitrary JavaScript. Turn it off with `"deny_scripts_on_protected_urls": false`. |
+| **Unlisted domains** | `protected_url_patterns` is a denylist of ~16 finance, health and government patterns, so everything else — your mail, your cloud console, your admin panels — is unprotected by default. Set `"unlisted_domains": "confirm"` to invert that, and list your normal work in `trusted_url_patterns`. Expect a lot of prompts until that list is right; prompt fatigue is its own hazard, which is why it is opt-in. |
 | **Confirmation tokens** | A `confirm_token` is bound to a hash of the exact call — tool, arguments and URL — so one earned on a harmless call cannot be spent on a dangerous one. Single-use, 120s. |
 | **Blocklist scope** | `blocked_url_patterns` / `allowed_url_patterns` apply to the page a tool acts on, not only to a navigation argument, so blocking a domain also refuses reads on an already-open tab there. |
 | **Low-risk acts** | `browser_scroll`, `browser_hover`, `browser_highlight` and `browser_focus_tab` change state, so read-only mode blocks them, but they do not raise a protected-site prompt — prompting on every scroll teaches people to click Approve without reading. `browser_screenshot_all_tabs` is **not** observation: it activates and photographs every tab in every window. |

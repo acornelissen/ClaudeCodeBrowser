@@ -88,6 +88,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Credentials belong in the browser's own password manager (autofill),
     # so they never pass through the AI or its logs. Set true to override.
     "allow_password_typing": False,
+    # How to treat a domain that is not in protected_url_patterns.
+    #   "allow"   - act freely (the default, and the historical behaviour)
+    #   "confirm" - require confirmation unless it matches
+    #               trusted_url_patterns
+    # protected_url_patterns is a denylist of ~16 finance/health/government
+    # patterns, so everything else - your mail, your cloud console, your
+    # admin panels - is unprotected by default. "confirm" inverts that. It
+    # will prompt a lot until trusted_url_patterns covers your normal work,
+    # and prompt fatigue is its own hazard, so it is opt-in.
+    "unlisted_domains": "allow",
+    "trusted_url_patterns": [],
+    # browser_execute_script can read any field, including a password, so the
+    # credential guard is advisory while scripts are enabled. Refusing scripts
+    # on protected sites closes that where it matters most.
+    "deny_scripts_on_protected_urls": True,
     "max_actions_per_minute": 120,
     "audit_log": True,
     # Regexes matched against target URLs. Empty allowlist = allow everything
@@ -248,6 +263,7 @@ class SafetyGuard:
         self._blocked = compile_list('blocked_url_patterns')
         self._allowed = compile_list('allowed_url_patterns')
         self._protected = compile_list('protected_url_patterns')
+        self._trusted = compile_list('trusted_url_patterns')
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -303,6 +319,24 @@ class SafetyGuard:
             'confirm_protected_actions': self.config.get('confirm_protected_actions', True),
             'protected_approval': self.config.get('protected_approval', 'auto'),
             'allow_password_typing': self.config.get('allow_password_typing', False),
+            # browser_execute_script can read any field regardless of the
+            # credential guard, so say which of the two states we are in.
+            'credential_guard': (
+                'advisory' if self.config.get('allow_script_execution', True)
+                and not self.config.get('deny_scripts_on_protected_urls', True)
+                else 'enforced_except_scripts'
+                if self.config.get('allow_script_execution', True)
+                else 'enforced'),
+            'credential_guard_note': (
+                'browser_execute_script can read any field, including password '
+                'fields, so the credential guard constrains the dedicated tools '
+                'but not arbitrary JavaScript. Set allow_script_execution: false '
+                'to close that, or rely on deny_scripts_on_protected_urls for '
+                'protected sites only.'),
+            'unlisted_domains': self.config.get('unlisted_domains', 'allow'),
+            'trusted_url_patterns': self.config.get('trusted_url_patterns', []),
+            'deny_scripts_on_protected_urls': self.config.get(
+                'deny_scripts_on_protected_urls', True),
             'max_actions_per_minute': self.config.get('max_actions_per_minute', 120),
             'actions_in_last_minute': recent,
             'pending_confirmations': pending,
@@ -371,6 +405,23 @@ class SafetyGuard:
                               f"(allow_script_execution in safety.json or "
                               f"CLAUDE_BROWSER_ALLOW_SCRIPTS=0).")
 
+        # 4b. Arbitrary JavaScript on a protected site is refused outright,
+        #     not merely confirmed. A script can read any field - the
+        #     credential guard does not apply to it - and a confirmation the
+        #     agent itself can satisfy is no control over that.
+        if is_script and self.config.get('deny_scripts_on_protected_urls', True):
+            script_url = target_url if target_url is not None else self._current_url
+            matched = self._matched_protected(script_url)
+            if matched:
+                return self._deny(
+                    'scripts_denied_on_protected_url',
+                    f"{tool_name} refused: {script_url!r} matches protected pattern "
+                    f"{matched!r}, and arbitrary JavaScript is not confirmable on a "
+                    f"protected site - a script can read any field on the page, "
+                    f"including credentials. Use the specific tool for what you "
+                    f"need, or set \"deny_scripts_on_protected_urls\": false in "
+                    f"safety.json if you accept that.")
+
         # 5. Protected-domain confirmation for state-changing actions.
         if (self.config.get('confirm_protected_actions', True)
                 and tool_name not in LOW_RISK_ACT_TOOLS):
@@ -413,6 +464,12 @@ class SafetyGuard:
         for pattern in self._protected:
             if pattern.search(url):
                 return pattern.pattern
+
+        # Inverted mode: anything not explicitly trusted is protected.
+        if self.config.get('unlisted_domains', 'allow') == 'confirm':
+            if any(pattern.search(url) for pattern in self._trusted):
+                return None
+            return 'unlisted_domains: confirm'
         return None
 
     def _within_rate_limit(self) -> bool:

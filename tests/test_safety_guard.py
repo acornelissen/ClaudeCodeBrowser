@@ -218,6 +218,90 @@ class DisabledGuardTests(unittest.TestCase):
         self.assertIsNone(g.check('browser_click', {'selector': '#x'}))
 
 
+class UnlistedDomainPolicyTests(unittest.TestCase):
+    """protected_url_patterns is a denylist of ~16 finance/health patterns, so
+    mail, cloud consoles and admin panels are unprotected by default. The
+    inverted mode closes that, opt-in."""
+
+    def test_default_leaves_unlisted_domains_alone(self):
+        g = guard()
+        g.note_url({'url': 'https://mail.example.com/inbox'})
+        self.assertIsNone(g.check('browser_click', {'selector': '#x'}))
+
+    def test_confirm_mode_protects_an_unlisted_domain(self):
+        g = guard(unlisted_domains='confirm')
+        g.note_url({'url': 'https://mail.example.com/inbox'})
+        denial = g.check('browser_click', {'selector': '#x'})
+        self.assertIsNotNone(denial)
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_confirm_mode_exempts_trusted_patterns(self):
+        g = guard(unlisted_domains='confirm',
+                  trusted_url_patterns=[r'^https?://localhost'])
+        g.note_url({'url': 'http://localhost:3000/app'})
+        self.assertIsNone(g.check('browser_click', {'selector': '#x'}))
+
+    def test_confirm_mode_still_allows_observation(self):
+        """Inverting the policy must not make reading the page a prompt."""
+        g = guard(unlisted_domains='confirm')
+        g.note_url({'url': 'https://mail.example.com/inbox'})
+        self.assertIsNone(g.check('browser_get_text', {}))
+
+    def test_a_built_in_protected_pattern_still_wins(self):
+        g = guard(unlisted_domains='confirm',
+                  trusted_url_patterns=[r'.'])  # trust everything
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_click', {'selector': '#x'})
+        self.assertIsNotNone(denial,
+                             'an explicit protected pattern must not be '
+                             'overridden by a broad trusted pattern')
+
+
+class ScriptsOnProtectedSitesTests(unittest.TestCase):
+    """browser_execute_script can read any field, so the credential guard does
+    not constrain it. A confirmation the agent can satisfy itself is no
+    control over arbitrary JavaScript."""
+
+    def test_scripts_are_refused_on_a_protected_site(self):
+        g = guard()
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_execute_script', {'script': 'document.title'})
+        self.assertIsNotNone(denial)
+        self.assertEqual(denial['safety_decision'],
+                         'scripts_denied_on_protected_url')
+
+    def test_a_confirm_token_cannot_buy_a_script_on_a_protected_site(self):
+        """The refusal must not be a confirmation: there is no token to get."""
+        g = guard()
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_execute_script', {'script': 'x'})
+        self.assertNotIn('confirm_token', denial)
+
+    def test_scripts_still_work_off_protected_sites(self):
+        g = guard()
+        g.note_url({'url': 'https://example.com/page'})
+        self.assertIsNone(g.check('browser_execute_script', {'script': 'x'}))
+
+    def test_the_restriction_can_be_turned_off(self):
+        g = guard(deny_scripts_on_protected_urls=False)
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_execute_script', {'script': 'x'})
+        # Falls back to the ordinary protected-domain confirmation.
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_status_says_whether_the_credential_guard_is_advisory(self):
+        enforced = guard(allow_script_execution=False).status()
+        self.assertEqual(enforced['credential_guard'], 'enforced')
+
+        partial = guard(allow_script_execution=True,
+                        deny_scripts_on_protected_urls=True).status()
+        self.assertEqual(partial['credential_guard'], 'enforced_except_scripts')
+
+        advisory = guard(allow_script_execution=True,
+                         deny_scripts_on_protected_urls=False).status()
+        self.assertEqual(advisory['credential_guard'], 'advisory')
+
+
 class AuditLogTests(unittest.TestCase):
 
     def test_sensitive_values_are_not_written(self):

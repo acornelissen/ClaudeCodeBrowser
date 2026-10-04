@@ -969,8 +969,20 @@ async function screenshotAllTabs(options = {}) {
   }
 }
 
-// Human approval: OS notification to catch the user's attention, plus an
-// in-page Approve/Deny banner (content script) that carries the decision
+// Human approval.
+//
+// The decision is taken in an extension page in its own window, not in the
+// page being automated. A content-script banner lives in the page's own DOM:
+// the page can restyle it away, read it, and dispatch a click on it, so a
+// site could approve its own protected action. An extension page is a
+// moz-extension:// document the page cannot touch at all.
+//
+// Firefox does not support buttons on notifications (only type, title,
+// message and iconUrl), so the notification remains an attention-getter and
+// the window carries the decision.
+const pendingApprovals = new Map();
+let approvalCounter = 0;
+
 async function requestApproval(tabId, data = {}) {
   try {
     if (browser.notifications) {
@@ -982,10 +994,114 @@ async function requestApproval(tabId, data = {}) {
       });
     }
   } catch (e) {
-    // Notifications unavailable — the in-page banner still works
+    // Notifications unavailable — the window is what matters.
   }
-  return sendToContentScript(tabId, { action: "requestApproval", ...data });
+
+  const viaWindow = await requestApprovalInWindow(data);
+  if (viaWindow) return viaWindow;
+
+  // Fallback: no window could be opened (no window manager, kiosk, headless
+  // Firefox). The in-page banner is weaker - the page shares the DOM with it -
+  // so say so in the result rather than letting it pass as equivalent.
+  const inPage = await sendToContentScript(tabId, { action: "requestApproval", ...data });
+  return { ...inPage, promptSurface: "page", degraded: true };
 }
+
+async function requestApprovalInWindow(data) {
+  const requestId = `approval_${++approvalCounter}_${Date.now()}`;
+  const timeout = data.timeout || 60000;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const record = pendingApprovals.get(requestId);
+      pendingApprovals.delete(requestId);
+      if (record && record.windowId !== undefined && !payload.closedWithoutAnswering) {
+        browser.windows.remove(record.windowId).catch(() => {});
+      }
+      resolve(payload);
+    };
+
+    const timer = setTimeout(() => finish({
+      success: true, approved: false, timedOut: true,
+      promptSurface: "window", decidedAt: new Date().toISOString()
+    }), timeout + 2000);
+
+    pendingApprovals.set(requestId, {
+      heading: "Claude requests approval",
+      message: data.message || "Claude wants to perform an action.",
+      detail: data.detail || "",
+      protectedUrl: data.protectedUrl || "",
+      timeout,
+      finish
+    });
+
+    const url = browser.runtime.getURL(
+      `approve/approve.html?id=${encodeURIComponent(requestId)}`);
+
+    browser.windows.create({
+      url,
+      type: "popup",
+      width: 640,
+      height: 520
+    }).then((win) => {
+      const record = pendingApprovals.get(requestId);
+      if (record) record.windowId = win.id;
+    }).catch((error) => {
+      // Could not open a window: let the caller fall back.
+      clearTimeout(timer);
+      pendingApprovals.delete(requestId);
+      settled = true;
+      console.warn("[ClaudeCodeBrowser] approval window unavailable:", error);
+      resolve(null);
+    });
+  });
+}
+
+// The approval page asks for its details and reports the decision.
+browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!message || message.target !== "approval") return;
+
+  // Only our own extension pages may answer an approval, and never a tab: a
+  // content script must not be able to decide one.
+  if (sender.id !== browser.runtime.id || sender.tab) {
+    console.warn("[ClaudeCodeBrowser] refused approval message from", sender.id);
+    sendResponse({ found: false });
+    return;
+  }
+
+  const record = pendingApprovals.get(message.requestId);
+
+  if (message.action === "details") {
+    if (!record) {
+      sendResponse({ found: false });
+      return;
+    }
+    sendResponse({
+      found: true,
+      heading: record.heading,
+      message: record.message,
+      detail: record.detail,
+      protectedUrl: record.protectedUrl,
+      timeout: record.timeout
+    });
+    return;
+  }
+
+  if (message.action === "decide" && record) {
+    record.finish({
+      success: true,
+      approved: message.approved === true,
+      closedWithoutAnswering: message.closed === true,
+      promptSurface: "window",
+      decidedAt: new Date().toISOString()
+    });
+    sendResponse({ ok: true });
+  }
+});
 
 // Captcha handoff: notify the human (unless it's a detect-only probe), then
 // let the content script show the solve banner and wait for completion
