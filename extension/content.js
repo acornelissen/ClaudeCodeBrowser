@@ -1918,9 +1918,16 @@
   // The element named by the caller is checked directly, but a credential can
   // also sit INSIDE it - and <body> is the default, so browser_get_text with
   // no selector returned a <div contenteditable> PIN in the middle of the
-  // page dump. Only contenteditable credentials can reach this: an <input>
-  // contributes nothing to innerText whatever its value, which is why
-  // enumerating them is enough rather than scrubbing prose with a regex.
+  // page dump.
+  //
+  // Scope, stated honestly rather than optimistically: an <input> contributes
+  // nothing to innerText whatever its value, so inputs cannot leak this way.
+  // A <textarea> is less clear-cut - its text is rendered - so it is scanned
+  // too, cheaply, rather than relying on that reasoning. What this cannot do
+  // is find a credential that reached the page as ordinary prose; scrubbing
+  // prose with a regex is not something it could do honestly, and the note on
+  // the result says how many fields were masked so a caller is not left
+  // guessing.
   const MAX_SCRUBBED_FIELDS = 50;
 
   function withoutNestedCredentialText(text, root, options) {
@@ -1934,7 +1941,7 @@
       // page. The cap is on how many credentials we mask, not on how many
       // elements we look at.
       candidates = root.querySelectorAll
-        ? Array.from(root.querySelectorAll('[contenteditable]'))
+        ? Array.from(root.querySelectorAll('[contenteditable], textarea'))
             .filter(el => el !== root && isPasswordField(el))
             .slice(0, MAX_SCRUBBED_FIELDS)
         : [];
@@ -1944,9 +1951,11 @@
 
     const secrets = [];
     for (const field of candidates) {
-      const own = typeof field.innerText === 'string'
-        ? field.innerText
-        : (field.textContent || '');
+      const own = field.tagName === 'TEXTAREA'
+        ? (field.value || '')
+        : (typeof field.innerText === 'string'
+            ? field.innerText
+            : (field.textContent || ''));
       const secret = own.trim();
       // A one- or two-character "secret" is not worth masking every
       // occurrence of across a whole page.

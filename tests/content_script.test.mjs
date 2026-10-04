@@ -130,10 +130,25 @@ function loadContentScript(registry) {
     return Array.isArray(hit) ? hit[0] : hit;
   };
 
-  const lookups = {
-    one: resolveOne,
-    all: (sel) => (all.has(sel) ? all.get(sel) : [])
+  // A comma-separated selector is a union of its parts, as in a real
+  // document. Without this the registry keyed on the exact string, so adding
+  // one selector to a production query silently returned nothing and the test
+  // reported a leak that was only a harness mismatch - or, worse, would have
+  // reported a pass for a query that matched nothing.
+  const resolveAll = (sel) => {
+    if (all.has(sel)) return all.get(sel);
+    const parts = sel.split(',').map(s => s.trim()).filter(Boolean);
+    if (parts.length < 2) return [];
+    const seen = new Set();
+    const out = [];
+    for (const part of parts) {
+      for (const el of (all.get(part) || [])) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+    }
+    return out;
   };
+  const lookups = { one: resolveOne, all: resolveAll };
   const body = makeElement('body');
   body._registry = lookups;
   const consoleStub = {
@@ -159,6 +174,8 @@ function loadContentScript(registry) {
     activeElement: body,
     querySelector: resolveOne,
     querySelectorAll: (sel) => {
+      const union = resolveAll(sel);
+      if (union.length) return union;
       if (all.has(sel)) return all.get(sel);
       // getPageInfo builds one long interactive-element selector; route it to
       // an explicit registry key rather than trying to parse CSS here.
@@ -880,6 +897,22 @@ test('a credential field past the 50th editable element is still masked', async 
 
   assert.ok(!result.text.includes('483920'),
             `the OTP leaked from behind 60 ordinary cells: ${result.text}`);
+  assert.equal(result.maskedFields, 1);
+});
+
+test('a textarea holding a credential is masked in whole-page text', async () => {
+  // The comment claimed "an <input> contributes nothing to innerText", which
+  // is true, and then relied on that for every form control. A <textarea>'s
+  // text IS rendered, so its value can appear in document.body.innerText -
+  // the reasoning did not generalise, and relying on it was an overclaim.
+  const ta = makeElement('textarea', { id: 'otp-field', value: '483920' });
+  const ctx = loadContentScript({ 'textarea': [ta] });
+  ctx.document.body.innerText = 'code 483920 ok';
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.ok(!result.text.includes('483920'),
+            `a textarea credential leaked: ${result.text}`);
   assert.equal(result.maskedFields, 1);
 });
 

@@ -1757,12 +1757,18 @@ async function contentScriptResult(result, action, tabId) {
              `handle that action, or the page may have navigated away.`
     };
   }
-  // Re-read the tab's URL after the action. A click or an Enter keypress can
-  // navigate, and the server's safety guard tracks the current page from tool
-  // results - with no url in a click result it went on judging the next
-  // action against the PREVIOUS page, so a click that landed on a bank left
-  // protected-domain confirmation, the blocklist and the allowlist all
-  // looking at the wrong URL. A result that reports its own url keeps it.
+  // Re-read the tab's URL after the action. The server's safety guard tracks
+  // the current page from tool results, and a click result carried no url at
+  // all, so the guard went on judging the next action against whatever page
+  // it last heard about. A result that reports its own url keeps it.
+  //
+  // What this does NOT do: performClick returns as soon as the click is
+  // dispatched, so a navigation the click started is usually still in flight
+  // and this read returns the pre-navigation URL. It fixes the case where the
+  // URL has already changed - a same-document route change, or a navigation
+  // the guard simply never heard about - and narrows the window in the rest.
+  // browser_click_and_wait is the tool that waits, and the guard is updated
+  // from its result too.
   let url;
   try {
     if (tabId !== undefined) url = (await browser.tabs.get(tabId)).url;
