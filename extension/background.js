@@ -56,6 +56,10 @@ function parseFlag(value, fallback) {
 
 const MAX_LOG_ENTRIES = 500;
 const MAX_BODY_CHARS = 5000;
+// What the scrubber is allowed to see: the kept body plus a margin, so a
+// credential straddling the cut is still redacted before the cut without
+// handing the regex passes an unbounded string. See filter.ondata.
+const SCRUB_LIMIT = MAX_BODY_CHARS + 1000;
 const MAX_PENDING_REQUESTS = 300;
 
 // fetch() and XHR both surface as "xmlhttprequest" here, which is the traffic
@@ -606,8 +610,20 @@ function attachResponseBodyReader(requestId, entry) {
     // Collect first, but never let collection stop the pass-through.
     totalBytes += (event.data && event.data.byteLength) || 0;
     try {
-      if (collected.length < MAX_BODY_CHARS) {
+      if (collected.length < SCRUB_LIMIT) {
         collected += decoder.decode(event.data, { stream: true });
+        if (collected.length > SCRUB_LIMIT) {
+          // Hard-bound what the scrubber will ever see. The length check
+          // above happens BEFORE appending, so a single large chunk - and
+          // Firefox can deliver one response in one chunk - landed in full
+          // and the scrubber then ran over all of it. Its passes are
+          // quadratic on adversarial input: 5000 characters of quote marks
+          // take 30ms, 320,000 take nearly two minutes, and this is the
+          // single-threaded background script, so a page could stall every
+          // tool call by serving a few hundred KB of punctuation.
+          collected = collected.slice(0, SCRUB_LIMIT);
+          capped = true;
+        }
       } else {
         capped = true;
       }

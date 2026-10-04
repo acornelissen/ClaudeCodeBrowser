@@ -899,6 +899,34 @@ test('scrubbing a captured script does not destroy the source around it', async 
             `a comparison was mangled: ${entry.responseBody}`);
 });
 
+test('one oversized chunk cannot stall the background script', async () => {
+  // The length check happens before appending, so a single chunk - and
+  // Firefox can deliver a whole response in one - landed in full and the
+  // scrubber ran over all of it. Its passes are quadratic on adversarial
+  // input, and this is the single-threaded background script: a page serving
+  // a few hundred KB of quote marks could stall every tool call for minutes.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+
+  const hostile = new TextEncoder().encode('"'.repeat(400000));
+  const started = Date.now();
+  filters[0].ondata({ data: hostile });
+  filters[0].onstop();
+  const elapsed = Date.now() - started;
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  assert.ok(elapsed < 2000,
+    `a page-controlled body took ${elapsed}ms of the background script`);
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(entry.responseBody.length <= 5000,
+            'the kept body must still respect the cap');
+  assert.equal(entry.responseBodyTruncated, true);
+  assert.equal(entry.responseBodyBytes, 400000,
+               'the real size is still reported honestly');
+});
+
 test('a credential straddling the body cap is still scrubbed', async () => {
   // The response path truncated and then scrubbed, so a secret cut in half
   // survived as a fragment: the unterminated string matched nothing.
