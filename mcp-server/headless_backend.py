@@ -107,6 +107,33 @@ def parse_int(value: Any, fallback: int) -> int:
     return int(parse_number(value, fallback))
 
 
+def screenshot_filename(requested: Any, generated: str) -> str:
+    """The name a screenshot is written under: no directories, always .png.
+
+    Both rules exist for a bug, and both paths need both of them.
+
+    Path('..').name is '..' and Path('.').name is '', so a filename made of
+    nothing but directory components survived the .name strip and resolved to
+    the screenshots directory itself or its parent, where the write failed
+    with an IsADirectoryError naming a path the caller never asked for.
+
+    And the payload is always a PNG, while prune_screenshots and
+    GET /screenshots both look for *.png - so filename "dashboard.jpg" was
+    written, never listed and never pruned, leaving the longest-lived copy of
+    the user's screen in the project. The suffix is corrected rather than the
+    sweep widened: pruning must never consider a file this project did not
+    write. _save_screenshot in server.py corrected it for the attended path
+    and this branch was missed, so the retention fix the CHANGELOG describes
+    as project-wide did not apply in headless mode at all.
+    """
+    filename = Path(requested or generated).name
+    if filename in ('', '.', '..'):
+        filename = generated
+    if not filename.endswith('.png'):
+        filename = Path(filename).with_suffix('.png').name
+    return filename
+
+
 class CredentialProbeFailed(RuntimeError):
     """The credential check could not be evaluated.
 
@@ -233,6 +260,101 @@ class HeadlessBrowser:
         'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year',
     )
 
+    # Mirrors CREDENTIAL_NAME_RE in extension/content.js, character for
+    # character: it is a JavaScript pattern, interpolated into the probes
+    # below and compiled by the page. Change one, change the other - the
+    # tests lift the extension's copy and compare the two strings, the same
+    # way background.js's SECRET_KEY_RE is pinned to it.
+    #
+    # On real pages the name/id is the signal that matters most, and this
+    # file had none of it: it looked at type and autocomplete only, inside a
+    # tagName === 'INPUT' test. So <input type="text" name="passwd"> was not
+    # a credential here - headless read its value straight back to the agent
+    # and typed into it - while attended mode refused both. Eight shapes
+    # disagreed, every one of them in the leaking direction.
+    CREDENTIAL_NAME_RE = (
+        '(pass(?:word|wd|phrase|code|key)|userpass'
+        '|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential'
+        '|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization'
+        '|authenticat|auth(?:z|n)(?:[^a-z]|$)'
+        '|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)'
+        '|api[-_]?key|private[-_]?key'
+        '|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id'
+        '|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer'
+        '|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))'
+    )
+
+    # How many nested credential fields a single getText will mask. See
+    # _get_text_js for why the cap is on how many are masked, not on how many
+    # are examined.
+    MAX_SCRUBBED_FIELDS = 50
+
+    @classmethod
+    def _credential_defs_js(cls) -> str:
+        """The extension's credential predicates, as JS to run in the page.
+
+        A port of attributeOf / looksLikeCredentialName / holdsEnteredValue /
+        isPasswordField / isConcealedValueField in extension/content.js, kept
+        function for function so the two can be read side by side. The tests
+        run this and the extension's own copy over one fixture table and fail
+        if they disagree about any shape.
+
+        Not restricted to <input>: Shoelace, Ionic and Vaadin wrap a real
+        input in a shadow root, so <sl-input type="password"> is the only
+        element an agent can target, and a contenteditable <div id="otp-code">
+        is a credential with no type at all.
+        """
+        tokens = ', '.join(f"'{t}'" for t in cls.CREDENTIAL_AUTOCOMPLETE_TOKENS)
+        return (
+            f"const CREDENTIAL_AUTOCOMPLETE_TOKENS = [{tokens}];\n"
+            f"const CREDENTIAL_NAME_RE = /{cls.CREDENTIAL_NAME_RE}/i;\n"
+            "const attributeOf = (element, name) =>\n"
+            "  (element && typeof element.getAttribute === 'function')\n"
+            "    ? element.getAttribute(name) : null;\n"
+            # camelCase is normalised first because the anchors in the
+            # pattern only see a non-letter as a boundary: otpCode, apiKey
+            # and privateKey do not match without it.
+            "const looksLikeCredentialName = (name) => CREDENTIAL_NAME_RE.test(\n"
+            "  String(name == null ? '' : name)"
+            ".replace(/([a-z0-9])([A-Z])/g, '$1_$2'));\n"
+            # The name/id rule is only for elements that hold a value
+            # somebody entered. Applied to everything it would mask the text
+            # of any <div id="user-session-banner"> on the page.
+            "const holdsEnteredValue = (element) => {\n"
+            "  const tag = element.tagName || '';\n"
+            "  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')"
+            " return true;\n"
+            "  if (element.isContentEditable === true) return true;\n"
+            "  return tag.includes('-');\n"
+            "};\n"
+            "const isPasswordField = (element) => {\n"
+            "  if (!element) return false;\n"
+            "  if (element.type === 'password') return true;\n"
+            "  if ((attributeOf(element, 'type') || '').toLowerCase()"
+            " === 'password') return true;\n"
+            "  const autocomplete = attributeOf(element, 'autocomplete');\n"
+            "  if (autocomplete && autocomplete.toLowerCase().split(/\\s+/)\n"
+            "        .some(t => CREDENTIAL_AUTOCOMPLETE_TOKENS.includes(t)))"
+            " return true;\n"
+            "  if (!holdsEnteredValue(element)) return false;\n"
+            # name can be a form path like user[password], which still names
+            # a credential, so this is a substring match, not an equality
+            # test.
+            "  const name = element.name || attributeOf(element, 'name') || '';\n"
+            "  const id = element.id || attributeOf(element, 'id') || '';\n"
+            "  return looksLikeCredentialName(name)"
+            " || looksLikeCredentialName(id);\n"
+            "};\n"
+            # Hidden inputs routinely carry CSRF tokens, session ids and
+            # order ids. They are never something the agent needs the value
+            # of - but writing one is how a form carries state, so only the
+            # read mask includes them.
+            "const isConcealedValueField = (element) =>"
+            " isPasswordField(element) ||\n"
+            "  (!!element && element.tagName === 'INPUT'"
+            " && element.type === 'hidden');\n"
+        )
+
     @classmethod
     def _credential_js(cls, include_hidden: bool) -> str:
         """JS predicate for "is this element a credential field".
@@ -242,13 +364,103 @@ class HeadlessBrowser:
         (writing to a plain hidden input is legitimate), matching
         isPasswordField vs isConcealedValueField in the extension.
         """
-        tokens = ','.join(f"'{t}'" for t in cls.CREDENTIAL_AUTOCOMPLETE_TOKENS)
-        hidden = " || el.type === 'hidden'" if include_hidden else ""
+        name = 'isConcealedValueField' if include_hidden else 'isPasswordField'
+        return (f"el => {{\n{cls._credential_defs_js()}"
+                f"return {name}(el);\n}}")
+
+    @classmethod
+    def _get_text_js(cls, allow_password: bool) -> str:
+        """JS for one getText read: mask, scrub, and report what it masked.
+
+        The whole read happens in the page, including the decision, so the
+        unscrubbed text never crosses into this process - the same reason the
+        read mask asks `!!el.value` instead of pulling the value out. This
+        used to be a bare page.inner_text() with no guard of any kind, so
+        browser_get_text on a contenteditable credential returned the code in
+        clear where attended mode returns '***'.
+
+        The element the caller named is checked directly, but a credential
+        can also sit INSIDE it - and 'body' is the default, so a whole-page
+        read returned a <div contenteditable> PIN in the middle of the page
+        dump. A port of withoutNestedCredentialText in content.js, including
+        the two bugs its comment records: filter before capping, or a busy
+        page with 50 ordinary editable cells never reaches the credential
+        after them; and replace longest first, or masking a short secret that
+        prefixes a longer one leaves the longer one's tail behind.
+
+        Stated honestly, as there it is: an <input> contributes nothing to
+        innerText whatever its value, so inputs cannot leak this way, and a
+        credential that reached the page as ordinary prose is not something
+        this can find.
+        """
+        allowed = 'true' if allow_password else 'false'
         return (
-            "el => !!el && el.tagName === 'INPUT' && (el.type === 'password'"
-            f"{hidden} || "
-            "(el.getAttribute('autocomplete') || '').toLowerCase()"
-            f".split(/\\s+/).some(t => [{tokens}].includes(t)))"
+            "root => {\n"
+            f"const ALLOW_PASSWORD = {allowed};\n"
+            f"{cls._credential_defs_js()}"
+            "if (!ALLOW_PASSWORD && isConcealedValueField(root))"
+            " return {self: true};\n"
+            # innerText is the visible text this tool promises; textContent
+            # is the fallback for where innerText does not exist (an SVG
+            # element, a detached node), and the result says which was read.
+            "const visible = typeof root.innerText === 'string';\n"
+            "const raw = (visible ? root.innerText : root.textContent) || '';\n"
+            "const source = visible ? 'innerText' : 'textContent';\n"
+            "if (ALLOW_PASSWORD || !raw) return {text: raw, masked: 0, source};\n"
+            "let candidates = [];\n"
+            "try {\n"
+            "  candidates = root.querySelectorAll\n"
+            "    ? Array.from(root.querySelectorAll('[contenteditable], textarea'))\n"
+            "        .filter(el => el !== root && isPasswordField(el))\n"
+            f"        .slice(0, {cls.MAX_SCRUBBED_FIELDS})\n"
+            "    : [];\n"
+            "} catch (e) { candidates = []; }\n"
+            "const secrets = [];\n"
+            "for (const field of candidates) {\n"
+            "  const own = field.tagName === 'TEXTAREA'\n"
+            "    ? (field.value || '')\n"
+            "    : (typeof field.innerText === 'string'\n"
+            "        ? field.innerText : (field.textContent || ''));\n"
+            "  const secret = own.trim();\n"
+            # A one- or two-character "secret" is not worth masking every
+            # occurrence of across a whole page.
+            "  if (secret.length >= 3) secrets.push(secret);\n"
+            "}\n"
+            "secrets.sort((a, b) => b.length - a.length);\n"
+            "let out = raw;\n"
+            "let masked = 0;\n"
+            "for (const secret of secrets) {\n"
+            "  if (!out.includes(secret)) continue;\n"
+            "  out = out.split(secret).join('***');\n"
+            "  masked++;\n"
+            "}\n"
+            "return {text: out, masked, source};\n"
+            "}"
+        )
+
+    @classmethod
+    def _element_info_js(cls, allow_password: bool) -> str:
+        """JS for one getElements entry: tag plus text, masked if credential.
+
+        getElements used to hand back el.inner_text() raw, so a contenteditable
+        credential inside the match list came back in clear; attended mode
+        routes the same text through safeElementText. textContent decides
+        whether a masked field is empty, as it does there, because a field
+        hidden from innerText still holds its value.
+        """
+        allowed = 'true' if allow_password else 'false'
+        return (
+            "el => {\n"
+            f"const ALLOW_PASSWORD = {allowed};\n"
+            f"{cls._credential_defs_js()}"
+            "const tag = (el.tagName || '').toLowerCase();\n"
+            "if (!ALLOW_PASSWORD && isConcealedValueField(el)) {\n"
+            "  return {tag, text: el.textContent ? '***' : null, masked: true};\n"
+            "}\n"
+            "const visible = typeof el.innerText === 'string';\n"
+            "const raw = (visible ? el.innerText : el.textContent) || '';\n"
+            "return {tag, text: raw.slice(0, 100)};\n"
+            "}"
         )
 
     async def _is_password_field(self, page, selector: str,
@@ -331,6 +543,10 @@ class HeadlessBrowser:
         'arrowleft', 'arrowright', 'arrowup', 'arrowdown',
         'home', 'end', 'pageup', 'pagedown',
         'backspace', 'delete', 'escape', 'esc', 'tab', 'enter', 'insert',
+        # The numpad's own Enter, which submits and moves like Enter does.
+        # Listing Enter and not this one refused a key that cannot put a
+        # character anywhere, which made the tool inconsistent for no gain.
+        'numpadenter',
         'shift', 'control', 'alt', 'meta', 'controlormeta',
         'shiftleft', 'shiftright', 'controlleft', 'controlright',
         'altleft', 'altright', 'metaleft', 'metaright', 'altgraph',
@@ -443,15 +659,9 @@ class HeadlessBrowser:
         elif action == 'screenshot':
             from datetime import datetime
             generated = f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
-            # Taking .name strips directories, but it leaves a filename that
-            # is nothing but directory components: Path('.').name is '' and
-            # Path('..').name is '..', so the target became the screenshots
-            # directory itself or its parent and the write failed with an
-            # IsADirectoryError naming a path the caller never asked for.
-            # Treated as no filename at all instead.
-            filename = Path(args.get('filename') or generated).name
-            if filename in ('', '.', '..'):
-                filename = generated
+            # Strips directories and forces the .png the retention sweep
+            # looks for; see screenshot_filename for what each rule is for.
+            filename = screenshot_filename(args.get('filename'), generated)
             # Captured into memory, not written by Playwright. Handing
             # Playwright a path= made it write the file with a plain
             # open(path, 'wb'): umask permissions (0644) and symlinks
@@ -545,14 +755,21 @@ class HeadlessBrowser:
             if limit <= 0:
                 limit = 50
             elements = await page.query_selector_all(selector)
+            # One page call per element reads the tag and the text together,
+            # so a credential field cannot be classified and then read in two
+            # steps with a navigation in between.
+            reader = self._element_info_js(args.get('allow_password') is True)
             results = []
             skipped = 0
             for el in elements[:limit]:
                 try:
-                    tag = await el.evaluate('e => e.tagName.toLowerCase()')
-                    text = (await el.inner_text())[:100]
+                    info = await el.evaluate(reader)
                     box = await el.bounding_box()
-                    results.append({'tag': tag, 'text': text, 'box': box})
+                    entry = {'tag': info['tag'], 'text': info['text'],
+                             'box': box}
+                    if info.get('masked'):
+                        entry['masked'] = True
+                    results.append(entry)
                 except Exception:
                     # An element that detached between the query and the read
                     # is dropped - but it is counted. A caller reasoning about
@@ -779,15 +996,45 @@ class HeadlessBrowser:
             max_length = parse_int(args.get('max_length'), 20000)
             if max_length <= 0:
                 max_length = 20000
-            text = await page.inner_text(selector, timeout=10000)
-            truncated = len(text) > max_length
-            return {
+            # state='attached', not the default 'visible': inner_text, which
+            # this replaces, read a display:none element without complaint,
+            # and waiting for visibility would turn that into a timeout.
+            await page.wait_for_selector(selector, state='attached',
+                                         timeout=10000)
+            read = await page.eval_on_selector(
+                selector,
+                self._get_text_js(args.get('allow_password') is True))
+            if read.get('self'):
+                # Asking for the text of a credential field is asking for its
+                # value, so this is the same refusal getValue gives.
+                return {
+                    'success': True,
+                    'text': '***',
+                    'masked': True,
+                    'note': 'Credential field text withheld. Set '
+                            '"allow_password_typing": true in '
+                            '~/.claudecodebrowser/safety.json to read '
+                            'credentials through the agent.',
+                    'url': page.url
+                }
+            text = read.get('text') or ''
+            masked_fields = read.get('masked') or 0
+            result = {
                 'success': True,
                 'text': text[:max_length],
-                'truncated': truncated,
+                'truncated': len(text) > max_length,
                 'total_length': len(text),
+                'source': read.get('source'),
                 'url': page.url
             }
+            if masked_fields:
+                # Named as the extension names it, since a caller reads the
+                # same key in both modes.
+                result['maskedFields'] = masked_fields
+                result['note'] = (
+                    f'{masked_fields} credential field(s) inside this element '
+                    'had their text replaced with ***.')
+            return result
 
         elif action == 'refresh':
             await page.reload()
