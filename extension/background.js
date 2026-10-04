@@ -270,13 +270,22 @@ function redactHeaderList(headers) {
 // never directly: it handles camelCase boundaries, which this pattern cannot.
 //
 // Deliberately loose, because over-redacting a log costs less than
-// under-redacting one - but the short and prefix-ambiguous entries are
-// anchored, because unanchored they matched words that cannot name a
-// credential: `auth` hid every `author` object in a captured API response,
-// `ssn` hid `className` (cla-ssn-ame) and `businessName`, `pass` hid `passed`
-// and `bypassCache`, `otp` hid `notPublished`.
+// under-redacting one. The boundaries are the fiddly part and have been got
+// wrong in both directions, so they are spelt out:
+//
+//  - `otp`, `auth` and `session` need only a TRAILING boundary. That excludes
+//    `author`, `authority` and `notPublished`, where a letter follows, while
+//    still allowing `userauth` and `userotp`, where the name ends there.
+//    Requiring a leading boundary too lost exactly those.
+//  - `pass` and `pin` need BOTH, because `bypass`, `compass` and `spin` end
+//    in them. The credential compounds are therefore listed by hand:
+//    `passkey`, `userpass`.
+//  - `ssn` needs NEITHER, because the camelCase step already breaks the words
+//    that made it look dangerous (`className` becomes `class_Name`), while
+//    anchoring it lost `SSNNumber` and `userssn`, which have no boundary.
+//  - `totp`, `hotp` and `sessid` have no boundary at all and are listed.
 const SECRET_KEY_RE =
-  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])ssn(?:[^a-z]|$)|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
 
 // A credential-shaped NAME, from a JSON key, a form field name or an id.
 //

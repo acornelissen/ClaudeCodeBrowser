@@ -374,7 +374,7 @@
   // hands a credential to the agent in clear, which is worse than masking a
   // field that happens to be called "author".
   const CREDENTIAL_NAME_RE =
-    /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])ssn(?:[^a-z]|$)|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+    /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
 
   // Matched through this, never directly: the anchors in the pattern only see
   // a non-letter as a boundary, so without normalising camelCase first,

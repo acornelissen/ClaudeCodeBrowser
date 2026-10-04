@@ -818,21 +818,64 @@ test('the credential-name list matches credentials and not ordinary words', () =
 });
 
 test('anchoring a name rule never loses a name the loose version caught', () => {
-  // The regression guard for what actually went wrong: anchoring `auth` so it
-  // would stop matching `author` also stopped `otpCode` and friends matching
-  // at all, because the anchors only recognise a non-letter as a boundary.
-  // Nothing the original unanchored pattern treated as a credential may be
-  // dropped by a later tightening.
+  // The regression guard for what actually went wrong twice: tightening a
+  // name rule to stop it matching an ordinary word also stopped it matching
+  // credential names, because the anchors only see a non-letter as a
+  // boundary.
+  //
+  // Two faults in the first version of this test, both found by review:
+  //  - It compared against a HAND-WRITTEN approximation of the old pattern,
+  //    which omitted `sessid` - so sessId and phpSessId were invisible to it.
+  //    The pattern below is the real one, copied verbatim from
+  //    `git show 4611e3c~1:extension/background.js`.
+  //  - Its name list was curated, so it only contained names that passed.
+  //    The list is now GENERATED from a corpus of stems and spellings, so a
+  //    name nobody thought of is still covered.
   const matches = loadNameMatcher();
-  const ORIGINAL = /(pass(word|wd)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number|ssn)/i;
-  const names = [
-    'passkey', 'passKey', 'userpass', 'otpCode', 'otpValue', 'oauth_verifier',
-    'authz', 'authn', 'sessionValue', 'authData', 'pinCode', 'cardNumber',
-    'password', 'api_key', 'private_key', 'JSESSIONID'
+
+  const ORIGINAL_AT_4611e3c =
+    /(pass(word|wd)?|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number)/i;
+
+  // Stems the original pattern recognised, crossed with the spellings a real
+  // payload uses. Generated rather than listed, so the gap between "names I
+  // thought of" and "names the old pattern caught" cannot hide a regression.
+  const stems = ['password', 'passwd', 'pass', 'secret', 'token', 'otp',
+                 'auth', 'credential', 'apikey', 'api_key', 'privatekey',
+                 'session', 'cvv', 'cardnumber', 'ssn', 'sessid'];
+  const shapes = [
+    s => s,
+    s => s.toUpperCase(),
+    s => s + 'Code',
+    s => s + 'Value',
+    s => s + '_id',
+    s => s + 'Id',
+    s => 'user' + s,
+    s => 'user_' + s,
+    s => 'x-' + s,
+    s => s + '[0]',
+    s => 'user[' + s + ']'
   ];
-  const lost = names.filter(n => ORIGINAL.test(n) && !matches(n));
+  const generated = [];
+  for (const stem of stems) {
+    for (const shape of shapes) generated.push(shape(stem));
+  }
+
+  const lost = generated.filter(
+    n => ORIGINAL_AT_4611e3c.test(n) && !matches(n));
   assert.deepEqual(lost, [],
-    `tightening dropped credential names the loose pattern caught: ${lost}`);
+    `tightening dropped names the original pattern caught: ${lost.join(', ')}`);
+});
+
+test('the compound credential names with no word boundary are covered', () => {
+  // These have no separator and no camel hump, so every anchored rule misses
+  // them and they have to be listed. totp and hotp are the commonest
+  // compound lowercase credential names on the web and were missed by every
+  // version of this pattern until now.
+  const matches = loadNameMatcher();
+  for (const name of ['passkey', 'userpass', 'authz', 'authn', 'oauth',
+                      'totp', 'hotp', 'sessid', 'ssn']) {
+    assert.ok(matches(name), `${name} has no boundary to find and must be listed`);
+  }
 });
 
 test('the DOM guard and the body scrubber use the same name list', () => {
