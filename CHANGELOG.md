@@ -9,6 +9,22 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.7.1]
+
+### Fixed
+- **Boolean tool options could silently do nothing.** Found by live testing:
+  the MCP client dispatched `include_all_types` as the string `"true"`, and a
+  strict `=== true` comparison rejected it, so the option had no effect. The
+  same shape made `capture_bodies: "false"` fail *open* — bodies captured in
+  full for a caller who asked for none. Feature flags now accept booleans,
+  numbers and the usual string spellings, and fall back to the documented
+  default for anything unparseable rather than treating a non-empty string as
+  true. The credential override is deliberately excluded and remains strictly
+  `=== true`: a fail-closed security switch must not be unlocked by a
+  truthy-looking value.
+
+Every unit test used clean booleans, which is why none of them caught it.
+
 ## [1.7.0]
 
 Closes three gaps that 1.6.0's notes listed as unfixable. They were not.
