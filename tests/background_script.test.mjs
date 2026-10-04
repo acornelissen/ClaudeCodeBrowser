@@ -972,6 +972,64 @@ test('clear_existing works as a string too', async () => {
 });
 
 // --------------------------------------------------------------------------
+// Markup bodies. Found by live testing: the scrubber handled JSON and
+// form-encoded payloads, so a server-rendered form arrived with the password
+// in a value="..." attribute while the DOM-level guard was correctly
+// returning "***" for the very same field.
+
+test('credential values in HTML attributes are scrubbed from captured bodies', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', { includeAllTypes: true }, 7);
+
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    complete: false
+  });
+
+  const html =
+    '<form>' +
+    '<input id="user" type="text" name="username" value="albert">' +
+    '<input id="pw" type="password" name="password" value="SuperSecret123!">' +
+    '<input id="csrf" type="hidden" name="csrf_token" value="csrf-abc-123">' +
+    '<input type=text name=api_token value=bare-unquoted>' +
+    "<input type='password' name='pw2' value='single-quoted'>" +
+    '</form>';
+  filters[0].ondata({ data: new TextEncoder().encode(html) });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  const body = result.logs[0].responseBody;
+
+  for (const secret of ['SuperSecret123!', 'csrf-abc-123', 'bare-unquoted',
+                        'single-quoted']) {
+    assert.ok(!body.includes(secret), `${secret} must not survive in the body`);
+  }
+  assert.ok(body.includes('albert'),
+    'a non-credential field must still be readable');
+  assert.ok(body.includes('<form>'), 'the markup itself must stay intact');
+});
+
+test('ordinary markup is not mangled by the scrubber', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', { includeAllTypes: true }, 7);
+
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    complete: false
+  });
+
+  const html = '<a href="/x?page=2">Next</a><input type="text" name="q" value="search terms">';
+  filters[0].ondata({ data: new TextEncoder().encode(html) });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const body = (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
+  assert.ok(body.includes('search terms'), 'a search box is not a credential');
+  assert.ok(body.includes('href="/x?page=2"'), 'links must survive intact');
+});
+
+// --------------------------------------------------------------------------
 
 let failed = 0;
 for (const [name, fn] of tests) {

@@ -159,6 +159,28 @@ function redactHeaderList(headers) {
 const SECRET_KEY_RE =
   /(pass(word|wd)?|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number)/i;
 
+// Markup carries credentials in attributes, not just in JSON keys: a
+// server-rendered form with a prefilled password puts it in value="...",
+// which is exactly the thing the DOM-level guard masks. Found by live
+// testing - the HTML of a logged page arrived with the password in clear
+// while browser_get_page_info was correctly returning "***" for the same
+// field.
+const SECRET_INPUT_RE =
+  /type\s*=\s*["']?(password|hidden)|autocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc)/i;
+
+function redactHtmlInputValues(text) {
+  // Tag-level: find each <input ...> and blank its value when the tag itself
+  // looks like a credential field. Regex over HTML is crude, but this is
+  // best-effort redaction of a log, not parsing.
+  return text.replace(/<input\b[^>]*>/gi, (tag) => {
+    const looksSecret = SECRET_INPUT_RE.test(tag) || SECRET_KEY_RE.test(
+      (tag.match(/(?:name|id)\s*=\s*["']?([^"'\s>]*)/i) || [])[1] || '');
+    if (!looksSecret) return tag;
+    return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
+              .replace(/(\bvalue\s*=\s*)(?!["'])[^\s>]+/gi, '$1***');
+  });
+}
+
 function redactSecretsInBody(text) {
   if (!text) return text;
   try {
@@ -166,8 +188,11 @@ function redactSecretsInBody(text) {
     let out = text.replace(
       /("(?:[^"\\]|\\.)*"\s*:\s*)"(?:[^"\\]|\\.)*"/g,
       (match, keyPart) => (SECRET_KEY_RE.test(keyPart) ? `${keyPart}"***"` : match));
-    // Form-encoded: key=value
-    out = out.replace(/([^&=?\s]+)=([^&\s]*)/g,
+    // HTML input attributes.
+    out = redactHtmlInputValues(out);
+    // Form-encoded: key=value. Runs last and skips anything inside a tag, so
+    // it cannot mangle markup the step above already handled.
+    out = out.replace(/([^&=?\s<>"']+)=([^&\s<>"']*)/g,
       (match, key) => (SECRET_KEY_RE.test(key) ? `${key}=***` : match));
     return out;
   } catch (e) {
