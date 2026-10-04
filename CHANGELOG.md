@@ -9,6 +9,37 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.8.0]
+
+### Fixed
+- **`browser_get_console_logs` never returned the page's console output**, and
+  said it was working. A content script has its own `console`, separate from
+  the page's, so it only ever captured the extension's own output — including
+  anything `browser_execute_script` printed. Confirmed live. The result now
+  states `capturesPageConsole: false` and warns that an empty result does not
+  mean the page logged nothing.
+- **Page errors and unhandled rejections are now captured**, which is the
+  subset that matters for debugging and is reachable without touching page
+  globals: they arrive as DOM events on `window`. Tagged `source: "page"`;
+  extension output is tagged `source: "extension"`.
+- **A logging session is scoped to the page it started on.** It was keyed by
+  tab id, which outlives navigation — so starting a session on a dev server
+  and then navigating that tab to a bank captured the bank's request and
+  response bodies. A cross-origin top-level navigation ends the session;
+  same-origin and subframe navigation do not.
+- **`browser_screenshot(full_page=true)` has never worked** —
+  `captureFullPage` returned page dimensions, which the server then treated as
+  a data URL. It now returns the visible capture with
+  `fullPageCaptured: false` and points at `browser_scroll_and_capture` or the
+  headless backend.
+- `browser_reload_all` defaulted `bypass_cache` to false while its schema
+  documented true.
+- `filterAttached`, internal bookkeeping, no longer appears in results.
+
+### Note
+Headless mode (Playwright) captures the page console in full; this limitation
+is specific to attended Firefox.
+
 ## [1.7.2]
 
 ### Fixed
