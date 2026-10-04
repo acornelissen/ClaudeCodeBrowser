@@ -17,7 +17,9 @@ browser. The guard enforces, in order:
                            means "everything not blocked". The blocklist
                            matches loosely (re.search); the allowlist grants
                            access, so a pattern there has to cover a whole
-                           URL prefix or a whole host - see _permitted().
+                           URL prefix or a whole host - see _permitted(). A
+                           granting list whose patterns all fail to compile
+                           keeps the restriction on and permits nothing.
                            URLs are normalised the way the browser parses
                            them before any of this - see _normalise_url().
 3. Protected domains     - banking / payment / healthcare / government login
@@ -58,7 +60,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 logger = logging.getLogger('ClaudeCodeBrowser.Safety')
 
@@ -93,22 +95,69 @@ _REMOVED_URL_CHARS = str.maketrans('', '', '\t\n\r')
 # anywhere else has only matched part of a name.
 _URL_DELIMITERS = ':/?#'
 
+# Code points a host cannot contain (WHATWG "forbidden host code point").
+# A host still holding one of these once its escapes are decoded is a URL the
+# browser refuses outright, so there is nothing to normalise it towards.
+_FORBIDDEN_HOST_CHARS = frozenset('\x00\t\n\r #/:<>?@[\\]^|%')
+
 
 def _normalise_url(url: str) -> str:
     """Return the URL the browser would load, for matching purposes.
 
-    Three WHATWG rules, which are the ones that changed the host or the
-    first delimiter: leading and trailing C0 controls and spaces are
-    stripped, tabs and line breaks are removed wherever they appear, and a
-    backslash counts as a forward slash. The last one applies to http(s)
-    only in the standard, and http(s) and about:blank are the only schemes
-    this guard lets through anyway, so it is applied unconditionally rather
-    than parsed for.
+    The WHATWG rules that change the host or the first delimiter, which are
+    the ones the guard reads: leading and trailing C0 controls and spaces are
+    stripped, tabs and line breaks are removed wherever they appear, a
+    backslash counts as a forward slash, and the host is percent-decoded,
+    lowercased and stripped of trailing dots. The backslash rule applies to
+    http(s) only in the standard, and http(s) and about:blank are the only
+    schemes this guard lets through anyway, so it is applied unconditionally
+    rather than parsed for.
+
+    The host rules are not cosmetic: new URL('https://%63hase.com/transfer')
+    loads chase.com, and so does 'https://chase.com./transfer', while the
+    guard matched the text as written and saw neither a protected domain nor
+    a blocklist hit.
+
+    Userinfo is dropped too. That is not a normalisation the browser performs
+    - it sends the credentials - but ':' is both this guard's delimiter and
+    the userinfo password separator, so 'https://localhost:3000@evil.com/'
+    satisfied a permit pattern anchored on 'https://localhost' while loading
+    evil.com. Only this copy is rewritten; the URL handed to the browser is
+    the one the caller sent.
     """
     if not isinstance(url, str):
         return url
     cleaned = url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS)
-    return cleaned.replace('\\', '/')
+    cleaned = cleaned.replace('\\', '/')
+    try:
+        parts = urlsplit(cleaned)
+        host = parts.hostname
+    except ValueError:
+        # Not a URL the browser will load either. Leave the text as it came
+        # so the scheme guard and the blocklist still see the original.
+        return cleaned
+    if not host:
+        # about:blank, or a string with no authority at all.
+        return cleaned
+    host = unquote(host).rstrip('.').lower()
+    if not host or _FORBIDDEN_HOST_CHARS.intersection(host):
+        return cleaned
+    if ':' in host:
+        # urlsplit strips the brackets off an IPv6 literal; put them back or
+        # the colon reads as a port separator.
+        host = f'[{host}]'
+    # Everything up to and including the last '@' is userinfo. The port text
+    # is kept verbatim because parts.port raises on a port that is not a
+    # number, and a URL the browser rejects is not ours to rewrite.
+    hostport = parts.netloc.rpartition('@')[2]
+    if hostport.startswith('['):
+        tail = hostport.partition(']')[2]
+        port = tail if tail.startswith(':') else ''
+    else:
+        _, found, tail = hostport.rpartition(':')
+        port = f':{tail}' if found else ''
+    return urlunsplit((parts.scheme, host + port, parts.path, parts.query,
+                       parts.fragment))
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -226,6 +275,10 @@ _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps', 'action_scrip
 # SafetyGuard._choice so that "Human" or " human" lands where it was meant to.
 _APPROVAL_MODES = ('auto', 'human', 'token')
 _UNLISTED_MODES = ('allow', 'confirm')
+
+# Stands in for a permit list whose every pattern failed to compile, so the
+# restriction stays switched on and permits nothing instead of evaporating.
+_NEVER_MATCHES = re.compile(r'(?!)')
 
 # How long a confirmation token stays valid, and how many can be outstanding.
 _TOKEN_TTL_SECONDS = 120
@@ -417,13 +470,22 @@ class SafetyGuard:
         self._compile_patterns()
 
     def _compile_patterns(self):
+        # Patterns that would not compile, so browser_safety_status can say
+        # so. The only other record is a log line, and the native host runs
+        # the server with stderr=DEVNULL.
+        self._pattern_errors: List[str] = []
+
+        def record_error(key, pattern, error):
+            self._pattern_errors.append(f'{key}: {pattern!r} ({error})')
+            logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({error})")
+
         def compile_list(key):
             patterns = []
-            for pattern in self.config.get(key, []):
+            for pattern in self.config.get(key, []) or []:
                 try:
                     patterns.append(re.compile(pattern, re.IGNORECASE))
                 except re.error as e:
-                    logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({e})")
+                    record_error(key, pattern, e)
             return patterns
 
         def compile_permit_list(key):
@@ -434,23 +496,38 @@ class SafetyGuard:
             https://localhostile.io/, so in allowlist mode - the strictest
             setting on offer - any name an attacker can register that merely
             starts with an allowed one opened the guard, and then reads on
-            that page were free too. A permit pattern now has to cover a
-            whole URL prefix (anchored at the start, ending where the
-            authority or path segment ends) or match the host outright.
+            that page were free too. A permit pattern has to cover a whole
+            URL prefix (anchored at the start, ending where the authority or
+            a path segment ends) or match the host outright; _permitted()
+            does both tests on the match.
+
+            The pattern is compiled exactly as written. Wrapping it in
+            "(?:...)(?=...)" to do the delimiter test moved a leading "(?i)",
+            "(?s)" or "(?m)" off position 0, which Python rejects outright -
+            so every such pattern was dropped, and a permit list with nothing
+            left in it is a permit list that permits everything.
             """
+            configured = self.config.get(key, []) or []
             patterns = []
-            for pattern in self.config.get(key, []):
+            for pattern in configured:
                 try:
-                    # The lookahead makes the engine find a match that stops
-                    # at a delimiter, so "^https://localhost" still covers
-                    # https://localhost:3000/app.
-                    prefix = re.compile(f'(?:{pattern})(?=[{_URL_DELIMITERS}]|$)',
-                                        re.IGNORECASE)
-                    host = re.compile(pattern, re.IGNORECASE)
+                    patterns.append(re.compile(pattern, re.IGNORECASE))
                 except re.error as e:
-                    logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({e})")
-                    continue
-                patterns.append((prefix, host))
+                    record_error(key, pattern, e)
+            if configured and not patterns:
+                # Fail closed. allowed_url_patterns is only consulted when it
+                # is non-empty, so a list whose patterns all failed to
+                # compile switched allowlist mode off and allowed every URL:
+                # the user asked for the strictest confinement on offer and
+                # got none of it. The sentinel matches nothing, so the mode
+                # stays on and refuses everything until the config is fixed.
+                self._pattern_errors.append(
+                    f'{key}: no pattern compiled, so nothing is permitted')
+                logger.error(
+                    f"Every pattern in safety.json {key} failed to compile. "
+                    f"The restriction stays on and permits nothing - fix the "
+                    f"patterns in {_CONFIG_FILE}.")
+                patterns.append(_NEVER_MATCHES)
             return patterns
 
         self._blocked = compile_list('blocked_url_patterns')
@@ -551,6 +628,10 @@ class SafetyGuard:
             'blocked_url_patterns': self.config.get('blocked_url_patterns', []),
             'allowed_url_patterns': self.config.get('allowed_url_patterns', []),
             'protected_url_patterns': self.config.get('protected_url_patterns', []),
+            # A pattern that would not compile is a policy the user asked
+            # for and did not get, so it is part of the status, not just a log
+            # line the native host throws away.
+            'pattern_errors': list(self._pattern_errors),
             'config_file': str(_CONFIG_FILE),
             'audit_log': str(_AUDIT_FILE) if self.config.get('audit_log', True) else None,
         }
@@ -593,7 +674,11 @@ class SafetyGuard:
             if self._allowed and not self._permitted(self._allowed, policy_url):
                 return self._deny('not_allowlisted',
                                   f"URL {policy_url!r} does not match allowed_url_patterns "
-                                  f"in safety.json (allowlist mode is active).")
+                                  f"in safety.json (allowlist mode is active). A pattern "
+                                  f"there has to cover a whole URL prefix or match the "
+                                  f"whole host: \"example\\.com\" covers example.com and "
+                                  f"not www.example.com, so write "
+                                  f"\"(.+\\.)?example\\.com\" for a whole domain tree.")
 
         if is_observe:
             return None
@@ -669,18 +754,38 @@ class SafetyGuard:
         return _normalise_url(url)
 
     @staticmethod
-    def _permitted(patterns: List[Tuple[Any, Any]], url: str) -> bool:
+    def _permitted(patterns: List[Any], url: str) -> bool:
         """True when one permit pattern covers the whole of what it names."""
-        host = urlsplit(url).hostname or ''
-        for prefix, host_re in patterns:
-            # Anchored at the start of the URL: "^https://localhost" covers
-            # https://localhost:3000/app and stops at the ':', so it cannot
-            # also cover https://localhost.evil.com/x.
-            if prefix.match(url):
+        try:
+            host = urlsplit(url).hostname or ''
+        except ValueError:
+            host = ''
+        # A permit pattern may not be satisfied by the query string or the
+        # fragment. That text is whatever the page author put there, so
+        # README's own ".*\.stripe\.com" granted
+        # https://evil.com/?x=a.stripe.com. A pattern that genuinely
+        # constrains a query string stops working here, and fails closed.
+        granting_end = len(url)
+        for found in (url.find('?'), url.find('#')):
+            if found != -1:
+                granting_end = min(granting_end, found)
+        for pattern in patterns:
+            # Anchored at the start of the URL and required to stop where the
+            # authority or a path segment stops: "^https://localhost" covers
+            # https://localhost:3000/app because its match ends at the ':',
+            # and cannot cover https://localhost.evil.com/x because that
+            # match would end at a '.'.
+            match = pattern.match(url)
+            if (match is not None and match.end() <= granting_end
+                    and (match.end() == len(url)
+                         or url[match.end()] in _URL_DELIMITERS)):
                 return True
             # A bare host pattern ("localhost", r".*\.example\.com") names a
-            # host, so it has to match all of one.
-            if host and host_re.fullmatch(host):
+            # host, so it has to match all of one. It covers that host only:
+            # r"example\.com" does not cover www.example.com, which is a
+            # deliberate break with the old re.search behaviour - write
+            # r"(.+\.)?example\.com" for the whole tree.
+            if host and pattern.fullmatch(host):
                 return True
         return False
 

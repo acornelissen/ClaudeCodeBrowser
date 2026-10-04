@@ -207,7 +207,10 @@ _FALSE_FLAGS = {'false', '0', 'no', 'off'}
 
 # browser_get_tabs/browser_find_tabs honour "limit" as the caller gives it.
 DEFAULT_TAB_LIMIT = 50
-MAX_TAB_LIMIT = 200
+# The cap the browser actually applies: MAX_TAB_RESULTS in
+# extension/background.js. This said 200, so the schema and the tool
+# descriptions promised an agent up to 200 tabs while 50 came back.
+MAX_TAB_LIMIT = 50
 
 
 def parse_flag(value: Any, fallback: bool) -> bool:
@@ -238,14 +241,19 @@ def parse_number(value: Any, fallback: float) -> float:
     The numeric counterpart of parse_flag, and the same rule as
     parse_number() in headless_backend.py: anything unparseable, infinite or
     NaN falls back. json.loads accepts the literals Infinity and NaN, so a
-    client really can send them, and int(float('inf')) raises OverflowError,
-    which a plain `except (TypeError, ValueError)` does not catch.
+    client really can send them.
+
+    OverflowError is in the except list because json.loads turns a long run
+    of digits into an exact int, and float() on an int too large to represent
+    raises it - not ValueError. {"tab_id": 10**400} therefore escaped
+    execute_tool, which has no broad catch, and killed the HTTP connection
+    with no JSON body and no audit entry.
     """
     if value is None or value == '' or isinstance(value, bool):
         return fallback
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback
     if not math.isfinite(number):
         return fallback
@@ -484,7 +492,7 @@ MCP_TOOLS: List[MCPTool] = [
             "type": "object",
             "properties": {
                 "current_window_only": {"type": "boolean", "default": True, "description": "Only list tabs in the current window. Set false to include every open Firefox window."},
-                "limit": {"type": "integer", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT, "description": f"Max tabs to return. Clamped to {MAX_TAB_LIMIT}."},
+                "limit": {"type": "integer", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT, "description": f"Max tabs to return. The browser returns at most {MAX_TAB_LIMIT} however high this goes."},
                 "url_pattern": {"type": "string", "description": "Regex to filter tabs by URL before applying limit."},
                 "include_favicon": {"type": "boolean", "default": False, "description": "Include favIconUrl (often a large base64 data URI) per tab."}
             }
@@ -522,7 +530,7 @@ MCP_TOOLS: List[MCPTool] = [
                 "title": {"type": "string", "description": "Text to search for in tab titles (case-insensitive)."},
                 "active": {"type": "boolean", "description": "Filter by active state."},
                 "audible": {"type": "boolean", "description": "Filter by playing audio."},
-                "limit": {"type": "integer", "description": f"Max tabs to return. Default {DEFAULT_TAB_LIMIT}, clamped to {MAX_TAB_LIMIT}.", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT}
+                "limit": {"type": "integer", "description": f"Max tabs to return. Default {DEFAULT_TAB_LIMIT}, and the browser returns at most {MAX_TAB_LIMIT} however high this goes.", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT}
             }
         }
     ),
@@ -1170,7 +1178,10 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         elif parsed.path == '/screenshots':
             # List saved screenshots
             screenshots = []
-            for f in SCREENSHOTS_DIR.glob('*.png'):
+            # Case-folded, matching prune_screenshots: an older version let
+            # the caller name capture.PNG, which was swept but never listed.
+            for f in (f for f in SCREENSHOTS_DIR.iterdir()
+                      if f.suffix.lower() == '.png' and f.is_file()):
                 screenshots.append({
                     'name': f.name,
                     'path': str(f),
@@ -1250,7 +1261,17 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                     {'error': 'arguments must be a JSON object'}, 400)
                 return
 
-            result = self.execute_tool(tool_name, arguments)
+            try:
+                result = self.execute_tool(tool_name, arguments)
+            except Exception as e:
+                # Last resort. An exception here used to propagate out of the
+                # handler, which closes the socket: the client saw a dropped
+                # connection rather than an error it could read, and nothing
+                # said which tool did it. Report it and keep serving.
+                logger.exception(f"Unhandled error in {tool_name!r}")
+                result = {'success': False,
+                          'error': f'{tool_name} failed internally: '
+                                   f'{type(e).__name__}: {e}'}
             self.send_json_response(result)
 
         elif parsed.path == '/browser/command':
@@ -1795,6 +1816,15 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             filename = Path(arguments.get('filename') or generated).name
             if filename in ('', '.', '..'):
                 filename = generated
+            # The payload is always a PNG, and the retention sweep and
+            # GET /screenshots both look for *.png - so filename:
+            # "dashboard.jpg" was written, never listed and never pruned,
+            # which is the longest-lived copy of the user's screen in the
+            # project. The suffix is corrected, in one spelling, rather than
+            # the sweep widened: pruning must never consider a file this
+            # project did not write.
+            if not filename.endswith('.png'):
+                filename = Path(filename).with_suffix('.png').name
 
             if not save_to_file:
                 return result

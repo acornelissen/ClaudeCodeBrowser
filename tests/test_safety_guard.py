@@ -209,6 +209,138 @@ class UrlPolicyTests(unittest.TestCase):
         self.assertIsNotNone(denial, 'only localhost itself is trusted')
         self.assertEqual(denial['safety_decision'], 'confirmation_required')
 
+    def test_a_pattern_with_an_inline_flag_still_restricts(self):
+        """The delimiter test used to be a (?=...) wrapped round the pattern,
+        which moved a leading "(?i)" off position 0. Python refuses a global
+        flag anywhere else, so every such pattern was dropped - and an
+        allowlist with nothing left in it was treated as no allowlist."""
+        g = guard(allowed_url_patterns=['(?i)^https://localhost'])
+        self.assertEqual(g.status()['pattern_errors'], [],
+                         'this pattern compiled before the wrapper existed')
+        denial = g.check('browser_navigate', {'url': 'https://evil.example/x'})
+        self.assertIsNotNone(denial, 'allowlist mode must still be on')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+        self.assertIsNone(g.check('browser_navigate',
+                                  {'url': 'https://localhost:3000/app'}))
+
+    def test_an_allowlist_that_cannot_compile_permits_nothing(self):
+        """Fail closed. allowed_url_patterns is only consulted when it is
+        non-empty, so dropping every pattern switched the strictest setting on
+        offer off entirely."""
+        g = guard(allowed_url_patterns=['(unterminated'])
+        denial = g.check('browser_navigate', {'url': 'https://localhost/x'})
+        self.assertIsNotNone(denial, 'a broken allowlist must not open up')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+        self.assertTrue(any('no pattern compiled' in e
+                            for e in g.status()['pattern_errors']),
+                        'browser_safety_status has to say why nothing works')
+
+    def test_userinfo_does_not_satisfy_a_permit_pattern(self):
+        """':' is this guard's delimiter and also the userinfo password
+        separator, so the match stopped at the ':' and never looked at the
+        authority: https://localhost:3000@evil.com/ loads evil.com."""
+        hostile = 'https://localhost:3000@evil.com/steal'
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        denial = g.check('browser_navigate', {'url': hostile})
+        self.assertIsNotNone(denial, 'this URL loads evil.com')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
+        t = guard(unlisted_domains='confirm',
+                  trusted_url_patterns=[r'^https://localhost'])
+        t.note_url({'url': hostile})
+        denial = t.check('browser_click', {'selector': '#x'})
+        self.assertIsNotNone(denial, 'evil.com is not trusted')
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_an_encoded_host_does_not_evade_the_blocklist(self):
+        """The browser percent-decodes the host, so chase%2Ecom loads
+        chase.com; the guard matched the text as written."""
+        g = guard(blocked_url_patterns=[r'chase\.com'])
+        for url in ('https://chase%2Ecom/x', 'https://%63hase.com/x',
+                    'https://chase.com./x'):
+            with self.subTest(url=url):
+                denial = g.check('browser_navigate', {'url': url})
+                self.assertIsNotNone(denial, f'{url} loads chase.com')
+                self.assertEqual(denial['safety_decision'], 'blocked_url')
+
+    def test_a_permit_pattern_is_not_satisfied_by_the_query_string(self):
+        r"""A pattern with a leading wildcard could match into the query, which
+        is text the page author chooses: README's own ".*\.stripe\.com"
+        granted https://evil.com/?x=a.stripe.com."""
+        g = guard(allowed_url_patterns=[r'.*\.stripe\.com'])
+        g.note_url({'url': 'https://evil.com/?x=a.stripe.com'})
+        denial = g.check('browser_screenshot', {})
+        self.assertIsNotNone(denial, 'the host here is evil.com')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+        g.note_url({'url': 'https://js.stripe.com/v3'})
+        self.assertIsNone(g.check('browser_screenshot', {}),
+                          'the pattern still names stripe.com subdomains')
+
+    def test_a_bare_host_pattern_covers_that_host_and_no_other(self):
+        r"""A permit pattern naming a host matches the whole of one host.
+        r"example\.com" does not cover www.example.com - write
+        r"(.+\.)?example\.com" for the tree."""
+        g = guard(allowed_url_patterns=[r'example\.com'])
+        g.note_url({'url': 'https://example.com/x'})
+        self.assertIsNone(g.check('browser_screenshot', {}))
+        g.note_url({'url': 'https://www.example.com/x'})
+        self.assertIsNotNone(g.check('browser_screenshot', {}),
+                             'a bare host pattern names one host')
+
+        tree = guard(allowed_url_patterns=[r'(.+\.)?example\.com'])
+        for url in ('https://example.com/x', 'https://www.example.com/x'):
+            with self.subTest(url=url):
+                tree.note_url({'url': url})
+                self.assertIsNone(tree.check('browser_screenshot', {}))
+        for url in ('https://evilexample.com/x',
+                    'https://example.com.evil.com/x'):
+            with self.subTest(url=url):
+                tree.note_url({'url': url})
+                self.assertIsNotNone(tree.check('browser_screenshot', {}),
+                                     f'{url} is not in the example.com tree')
+
+
+class ProtectedDomainNormalisationTests(unittest.TestCase):
+    """protected_url_patterns is matched against the URL the browser will
+    load, not the text the agent typed. The browser percent-decodes the host
+    and keeps no trailing dot, so https://%63hase.com/transfer and
+    https://www.irs.gov./payments both reached a protected site unchallenged."""
+
+    def test_a_percent_encoded_host_is_still_protected(self):
+        for url in ('https://%63hase.com/transfer',
+                    'https://www.irs.%67ov/payments',
+                    'https://CHASE%2Ecom/transfer'):
+            with self.subTest(url=url):
+                denial = guard().check('browser_navigate', {'url': url})
+                self.assertIsNotNone(denial, f'{url} is a protected site')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
+
+    def test_a_trailing_dot_is_still_protected(self):
+        for url in ('https://www.irs.gov./payments',
+                    'https://www.chase.com../transfer'):
+            with self.subTest(url=url):
+                denial = guard().check('browser_navigate', {'url': url})
+                self.assertIsNotNone(denial, f'{url} is a protected site')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
+
+    def test_the_url_sent_to_the_browser_is_not_rewritten(self):
+        """The guard judges a normalised copy. Dropping userinfo or a trailing
+        dot from the arguments would change the page the browser loads."""
+        g = guard()
+        arguments = {'url': 'https://localhost:3000@example.com/x'}
+        g.check('browser_navigate', arguments)
+        self.assertEqual(arguments['url'],
+                         'https://localhost:3000@example.com/x')
+
+    def test_an_ordinary_url_is_left_alone(self):
+        for url in ('about:blank', 'http://[::1]:8080/x',
+                    'https://host:abc/x', 'https://localhost:3000/app?a=b#c'):
+            with self.subTest(url=url):
+                self.assertIsNone(guard().check('browser_navigate',
+                                                {'url': url}))
+
 
 class ToolClassificationTests(unittest.TestCase):
 

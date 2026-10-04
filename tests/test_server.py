@@ -8,6 +8,7 @@ Run: python3 -m unittest discover -s tests -v
 import asyncio
 import base64
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -20,7 +21,7 @@ from pathlib import Path
 # its API token, config and screenshot directories under the home directory at
 # import time, and a test run must not touch the real installation.
 
-from tests import TEST_HOME  # noqa: F401  (redirects HOME on import)
+from tests import REPO_ROOT, TEST_HOME  # noqa: F401  (redirects HOME on import)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'mcp-server'))
@@ -502,6 +503,29 @@ class NumericArgumentTests(unittest.TestCase):
         self.assertEqual(server.clamp_tab_limit(float('inf')),
                          server.DEFAULT_TAB_LIMIT)
 
+    def test_an_integer_too_large_for_a_float_falls_back(self):
+        """json.loads turns a long run of digits into an exact int, and
+        float() on one too large to represent raises OverflowError - not
+        ValueError. It escaped execute_tool, which has no broad catch, and
+        killed the connection with no JSON body and no audit entry."""
+        huge = 10 ** 400
+        self.assertEqual(server.parse_number(huge, 1.5), 1.5)
+        self.assertEqual(server.parse_int(huge, 5), 5)
+        self.assertEqual(server.parse_number(str(huge), 1.5), 1.5)
+        self.assertEqual(server.clamp_tab_limit(huge), server.DEFAULT_TAB_LIMIT)
+
+    def test_a_tab_id_too_large_for_a_float_is_a_plain_error(self):
+        with self.assertRaises(ValueError):
+            server.parse_tab_id(10 ** 400)
+
+    def test_such_a_tab_id_gets_a_json_answer_not_a_dropped_socket(self):
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._dispatch_action = lambda action, tab_id, arguments: {'success': True}
+        out = handler.execute_tool('browser_get_page_info',
+                                   {'tab_id': 10 ** 400})
+        self.assertFalse(out['success'])
+        self.assertIn('tab_id', out['error'])
+
 
 class ScreenshotSaveFlagTests(unittest.TestCase):
     """save_to_file is the privacy-relevant one: the PNG lands in
@@ -570,6 +594,24 @@ class ScreenshotSaveFlagTests(unittest.TestCase):
                 written = Path(out['filepath'])
                 self.addCleanup(lambda p=written: p.unlink(missing_ok=True))
                 self.assertEqual(written.parent, server.SCREENSHOTS_DIR)
+                self.assertTrue(written.is_file())
+
+    def test_a_filename_the_sweep_would_miss_is_given_a_png_suffix(self):
+        """The payload is always a PNG, and both prune_screenshots and
+        GET /screenshots look for *.png. filename: "dashboard.jpg" was
+        written, never listed and never pruned - the longest-lived copy of
+        the user's screen in the project."""
+        for given, expected in (('dashboard.jpg', 'dashboard.png'),
+                                ('report', 'report.png'),
+                                ('shot.PNG', 'shot.png')):
+            with self.subTest(filename=given):
+                out = self.handler._save_screenshot(
+                    {'success': True, 'data': self.PNG, 'tab': {}},
+                    {'filename': given})
+                self.assertTrue(out.get('success'), out.get('error'))
+                written = Path(out['filepath'])
+                self.addCleanup(lambda p=written: p.unlink(missing_ok=True))
+                self.assertEqual(written.name, expected)
                 self.assertTrue(written.is_file())
 
     def test_the_default_still_saves(self):
@@ -757,6 +799,20 @@ class TabLimitTests(unittest.TestCase):
         handler.execute_tool('browser_find_tabs',
                              {'url_pattern': 'stub', 'limit': 100000})
         self.assertEqual(captured['arguments']['limit'], server.MAX_TAB_LIMIT)
+
+    def test_the_advertised_cap_is_the_one_the_extension_enforces(self):
+        """The schema and both tool descriptions said 200 while the extension
+        returned at most 50, so an agent planned around a number it could
+        never get."""
+        background = (REPO_ROOT / 'extension' / 'background.js').read_text()
+        enforced = re.search(r'const MAX_TAB_RESULTS = (\d+);', background)
+        self.assertIsNotNone(enforced, 'extension cap constant moved or renamed')
+        self.assertEqual(server.MAX_TAB_LIMIT, int(enforced.group(1)))
+        for name in ('browser_get_tabs', 'browser_find_tabs'):
+            tool = next(t for t in server.MCP_TOOLS if t.name == name)
+            text = tool.description + str(tool.input_schema)
+            self.assertNotIn('200', text,
+                             f'{name} still advertises a cap it cannot deliver')
 
     def test_the_schema_tells_the_agent_what_it_needs(self):
         """The filter requirement was added to the handler and never to the
