@@ -90,6 +90,28 @@ them is part of releasing, and that is being held for approval.
   filed as a screenshot of some other page. The private-tab check
   also fails closed: it returned "not private" whenever the tab could not be
   inspected, which is how a private window's traffic reached the buffer.
+- **A page could stall the whole extension for minutes.** Moving the body
+  scrub before the truncation (so a credential straddling the cut could not
+  survive as a fragment) removed the only bound on what the regex passes saw —
+  and the collection check runs *before* appending, so a single chunk lands in
+  full and Firefox can deliver a whole response in one. The passes are
+  quadratic on adversarial input: 5,000 characters of punctuation take 30ms,
+  320,000 take nearly two minutes, on the single-threaded background script
+  that also services every tool call and the native port. Found by measuring
+  rather than trusting the fix; the collected text is now hard-bounded, with
+  enough margin to keep the straddle fix working.
+- **`login()` and `fill_form()` abort the sequence on a refusal.** The first
+  round of this guarded only the password step, so a refused *username* was
+  followed by typing the password and pressing Enter, with the last result
+  saying success — the account-lockout generator, with the fields swapped.
+  `fill_form` checked a field's result only to decide whether to retry the
+  locator, then submitted anyway.
+- **A credential no longer travels in an error message.** The content script
+  built `Element not found with options: {...}` from the whole options object,
+  and `text` is the value being typed, so a failed `browser_type` put the
+  password into the agent's log and action history. The extension now names
+  only the locator, and the agent additionally scrubs the values it knows it
+  sent out of any result text.
 - **The agent no longer sends the API token off-machine.** `CLAUDE_BROWSER_URL`
   chooses the server with no validation, and the token is full control of the
   browser; it is now attached for loopback only unless
