@@ -118,6 +118,51 @@ class CredentialGuardPlumbingTests(unittest.TestCase):
                          f'these read paths bypass safeElementValue: {offenders}')
 
 
+class CommandQueueTests(unittest.TestCase):
+    """A queued command runs whenever the browser next polls. If the caller
+    has already timed out, running it is an action nobody asked for -
+    observed live with a disconnected extension."""
+
+    def _handler(self, pending):
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler.server = type('S', (), {'_pending_commands': pending})()
+        handler.path = '/browser/poll'
+        handler.headers = {'X-API-Key': server.API_TOKEN}
+        sent = {}
+        handler.send_json_response = lambda data, status=200: sent.update(data)
+        handler._check_auth = lambda: True
+        handler.do_GET()
+        return sent
+
+    def test_a_fresh_command_is_delivered(self):
+        import time
+        sent = self._handler([{'action': 'click', 'queuedAt': time.time()}])
+        self.assertIsNotNone(sent['command'])
+        self.assertEqual(sent['command']['action'], 'click')
+
+    def test_a_stale_command_is_dropped_not_delivered(self):
+        import time
+        stale = time.time() - (server.COMMAND_QUEUE_TTL + 60)
+        sent = self._handler([{'action': 'click', 'queuedAt': stale}])
+        self.assertIsNone(sent['command'],
+                          'a command the caller gave up on must not run later')
+
+    def test_a_fresh_command_behind_a_stale_one_still_runs(self):
+        import time
+        now = time.time()
+        pending = [
+            {'action': 'stale', 'queuedAt': now - (server.COMMAND_QUEUE_TTL + 60)},
+            {'action': 'fresh', 'queuedAt': now},
+        ]
+        sent = self._handler(pending)
+        self.assertEqual(sent['command']['action'], 'fresh')
+
+    def test_the_ttl_outlasts_the_longest_human_wait(self):
+        """A captcha prompt blocks for 200s; dropping that command would make
+        the guard's own flow unusable."""
+        self.assertGreater(server.COMMAND_QUEUE_TTL, 200)
+
+
 class SafetyGuardTests(unittest.TestCase):
 
     def test_read_only_mode_still_allows_observation(self):

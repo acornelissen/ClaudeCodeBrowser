@@ -164,6 +164,12 @@ WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 # a bad Content-Length made the handler read unboundedly.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
+# How long a queued browser command stays executable. Longer than the longest
+# human-in-the-loop wait (solveCaptcha, 200s) so a legitimately slow approval
+# is not discarded, but finite so a command cannot execute long after the
+# caller abandoned it.
+COMMAND_QUEUE_TTL = float(os.environ.get('CLAUDE_BROWSER_COMMAND_TTL', '240'))
+
 # Screenshots directory: ~/.claudecodebrowser/screenshots (0700), or wherever
 # CLAUDE_BROWSER_SCREENSHOTS_DIR points.
 SCREENSHOTS_DIR = resolve_screenshots_dir()
@@ -1051,10 +1057,24 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         elif parsed.path == '/browser/poll':
             # Extension/native host polls for pending commands
             # Pop under the lock: two pollers could both pass an unguarded
-            # "if pending" and the loser would raise IndexError.
+            # "if pending" and the loser would raise IndexError. Expired
+            # commands are dropped rather than delivered: the caller stopped
+            # waiting long ago, so running one now is an unrequested action.
+            now = time.time()
             with _PENDING_COMMANDS_LOCK:
                 pending = getattr(self.server, '_pending_commands', [])
-                command = pending.pop(0) if pending else None
+                command = None
+                while pending:
+                    candidate = pending.pop(0)
+                    age = now - candidate.get('queuedAt', now)
+                    if age > COMMAND_QUEUE_TTL:
+                        logger.warning(
+                            f"Dropping stale queued command "
+                            f"{candidate.get('action')} after {age:.0f}s - the "
+                            f"caller has already given up on it")
+                        continue
+                    command = candidate
+                    break
                 has_more = len(pending) > 0
             if command is not None:
                 self.send_json_response({'command': command, 'has_more': has_more})
@@ -1373,6 +1393,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         result_holder = {}
         connection_manager.http_pending_requests[request_id] = (event, result_holder)
 
+        # Timestamped so a command the caller has already given up on is not
+        # executed later. Observed live: two calls timed out while the browser
+        # was disconnected and their commands sat in the queue, ready to run
+        # whenever it came back. A stale getTabs is harmless; a stale click or
+        # type would fire on whatever page happened to be loaded by then.
+        command_data['queuedAt'] = time.time()
         with _PENDING_COMMANDS_LOCK:
             if not hasattr(self.server, '_pending_commands'):
                 self.server._pending_commands = []
