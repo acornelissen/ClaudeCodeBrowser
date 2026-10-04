@@ -393,7 +393,7 @@
   function describeLocator(options) {
     const parts = [];
     for (const key of ['selector', 'xpath', 'name', 'id', 'placeholder',
-                       'role', 'ariaLabel', 'aria_label', 'tag', 'index']) {
+                       'role', 'ariaLabel', 'x', 'y']) {
       if (options && options[key] !== undefined && options[key] !== null
           && options[key] !== '') {
         parts.push(`${key}=${JSON.stringify(options[key])}`);
@@ -1764,9 +1764,11 @@
       const wanted = parseFlag(options.value, null);
       if (wanted === null) {
         throw new Error(
-          `Cannot set a ${element.type} from ${JSON.stringify(options.value)}: ` +
-          'its state is checked/unchecked, not text. Pass true or false ' +
-          '(or "on"/"off"), or use browser_click to toggle it.'
+          `Cannot set a ${element.type} from the value given: its state is ` +
+          'checked/unchecked, not text. Pass true or false (or "on"/"off"), ' +
+          'or use browser_click to toggle it. (The value is not quoted back ' +
+          'here: browser_set_value carries the value being set, so echoing ' +
+          'it would put a credential in an error message.)'
         );
       }
       element.checked = wanted;
@@ -1804,23 +1806,42 @@
         'value-bearing custom element. Nothing was changed.');
     }
 
+    const currentValue = () => (element.isContentEditable
+      ? element.textContent
+      : element.value);
+
+    // Read back BEFORE dispatching the events. That is what tells us the
+    // assignment took - a custom element may ignore it entirely, and
+    // reporting set: true for an assignment the element dropped is the same
+    // lie in a different costume. Reading back AFTER the events was wrong:
+    // every input mask on the web (cleave.js, imask, react-number-format)
+    // reformats inside the `input` listener, and the browser itself
+    // sanitises - type=color lowercases, type=range snaps to step, type=url
+    // trims - so a set that worked reported failure, and the message blamed a
+    // framework, so an agent would retry. On a card field, repeatedly.
+    const accepted = String(currentValue()) === String(options.value);
+    if (!accepted) {
+      throw new Error(
+        'The value did not take: the element still holds its previous value. ' +
+        'It may be a custom element that ignores assignment to .value, or ' +
+        'read-only. Nothing was changed.');
+    }
+
     element.dispatchEvent(new Event('input', { bubbles: true }));
     element.dispatchEvent(new Event('change', { bubbles: true }));
 
-    // Read it back. A custom element may ignore the assignment entirely, and
-    // reporting set: true for an assignment the element dropped is the same
-    // lie in a different costume.
-    const readBack = element.isContentEditable
-      ? element.textContent
-      : element.value;
-    if (String(readBack) !== String(options.value)) {
-      throw new Error(
-        `The value did not take: asked for ${JSON.stringify(options.value)}, ` +
-        `the element now reads ${JSON.stringify(String(readBack))}. ` +
-        'The element may be controlled by a framework that overwrote it.');
+    // What the field holds now the page has had its say. A mask or the
+    // browser's own sanitisation legitimately changes this, so it is reported
+    // rather than treated as a failure.
+    const settled = String(currentValue());
+    const result = { set: true, value: options.value,
+                     element: getElementInfo(element) };
+    if (settled !== String(options.value)) {
+      result.normalisedTo = settled;
+      result.note = 'The page reformatted the value after it was set ' +
+                    '(an input mask, or the browser normalising it).';
     }
-
-    return { set: true, value: options.value, element: getElementInfo(element) };
+    return result;
   }
 
   // Get attribute
@@ -1948,7 +1969,8 @@
     const raw = visible ? element.innerText : (element.textContent || '');
     const source = visible ? 'innerText' : 'textContent';
 
-    const { text, masked } = withoutNestedCredentialText(raw, element, options);
+    const { text, masked, fields, capped } =
+      withoutNestedCredentialText(raw, element, options);
 
     return {
       text: text.slice(0, maxLength),
@@ -1956,9 +1978,16 @@
       totalLength: text.length,
       source,
       ...(masked ? {
-        maskedFields: masked,
-        note: `${masked} credential field(s) inside this element had their ` +
-              'text replaced with ***.'
+        maskedFields: fields,
+        maskedSecrets: masked,
+        // Saying so beats silently returning the rest in clear, which is what
+        // hitting the cap used to do.
+        ...(capped ? { maskedFieldsCapped: true } : {}),
+        note: `${fields} credential field(s) inside this element had their ` +
+              'text replaced with ***.' +
+              (capped ? ` More than ${MAX_SCRUBBED_FIELDS} were present; ` +
+                        'the rest were NOT masked. Read a narrower selector.'
+                      : '')
       } : {}),
       url: window.location.href,
       title: document.title
@@ -1978,10 +2007,15 @@
   // prose with a regex is not something it could do honestly, and the note on
   // the result says how many fields were masked so a caller is not left
   // guessing.
-  const MAX_SCRUBBED_FIELDS = 50;
+  // A cap on how many credential fields are masked in one page read. It is
+  // only here to bound the work; 50 was low enough that a page with more
+  // credential-named editable fields than that leaked the rest silently, so
+  // it is both higher and reported when it bites.
+  const MAX_SCRUBBED_FIELDS = 500;
 
   function withoutNestedCredentialText(text, root, options) {
     if (!text || passwordAllowed(options)) return { text, masked: 0 };
+    let capped = false;
     let candidates;
     try {
       // Filter FIRST, then cap. Capping the raw [contenteditable] list meant
@@ -1990,11 +2024,12 @@
       // so the exact leak this function exists to stop came back on any busy
       // page. The cap is on how many credentials we mask, not on how many
       // elements we look at.
-      candidates = root.querySelectorAll
+      const all = root.querySelectorAll
         ? Array.from(root.querySelectorAll('[contenteditable], textarea'))
             .filter(el => el !== root && isPasswordField(el))
-            .slice(0, MAX_SCRUBBED_FIELDS)
         : [];
+      capped = all.length > MAX_SCRUBBED_FIELDS;
+      candidates = all.slice(0, MAX_SCRUBBED_FIELDS);
     } catch (e) {
       candidates = [];
     }
@@ -2026,7 +2061,10 @@
       out = out.split(secret).join('***');
       masked++;
     }
-    return { text: out, masked };
+    // `masked` counts secrets replaced, and two fields holding the same value
+    // are one secret - so report the field count separately rather than let
+    // the caller infer it.
+    return { text: out, masked, fields: secrets.length, capped };
   }
 
   // Select option

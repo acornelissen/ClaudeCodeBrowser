@@ -918,6 +918,84 @@ test('a not-found error names the locator, never the text being typed', async ()
                'the locator must still be named, or the error is useless');
 });
 
+test('set_value reports a reformatted value as set, not as a failure', async () => {
+  // The read-back happened AFTER the input/change events, and every input
+  // mask on the web reformats inside the input listener - as does the browser
+  // itself (type=color lowercases, type=range snaps). So a set that worked
+  // reported failure, and the message blamed a framework, so a reasonable
+  // agent retries. On a card field, repeatedly.
+  const card = makeElement('input', { id: 'card', value: '' });
+  card.dispatchEvent = function (event) {
+    if (event.type === 'input' && /^\d+$/.test(this.value)) {
+      this.value = this.value.replace(/(\d{4})(?=\d)/g, '$1 ');
+    }
+    return true;
+  };
+  const ctx = loadContentScript({ '#card': card });
+
+  const result = await ctx.send({ action: 'setValue', selector: '#card',
+                                  value: '4111111111111111' });
+
+  assert.equal(result.set, true, result.error);
+  assert.equal(result.normalisedTo, '4111 1111 1111 1111');
+  assert.match(result.note, /reformatted/i);
+});
+
+test('set_value still refuses when the element ignores the assignment', async () => {
+  const stubborn = makeElement('input', { id: 'ro', value: 'old' });
+  Object.defineProperty(stubborn, 'value', { get: () => 'old', set: () => {} });
+  const ctx = loadContentScript({ '#ro': stubborn });
+
+  const result = await ctx.send({ action: 'setValue', selector: '#ro',
+                                  value: 'new' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /did not take/i);
+});
+
+test('no refusal from set_value quotes the value back', async () => {
+  // browser_set_value carries the value being set, so an error that echoes
+  // it puts a credential in a message the agent prints and keeps - the same
+  // leak describeLocator was written to stop on the not-found path.
+  const box = makeElement('input', { id: 'c', type: 'checkbox' });
+  const div = makeElement('div', { id: 'd' });
+  const ctx = loadContentScript({ '#c': box, '#d': div });
+
+  for (const selector of ['#c', '#d']) {
+    const result = await ctx.send({ action: 'setValue', selector,
+                                    value: 'hunter2-correct-horse' });
+    assert.equal(result.success, false, selector);
+    assert.ok(!result.error.includes('hunter2-correct-horse'),
+              `${selector} echoed the value: ${result.error}`);
+  }
+});
+
+test('a not-found error names a coordinate locator', async () => {
+  // describeLocator listed aria_label, tag and index, which findElement
+  // ignores, and omitted x/y, which it honours via elementFromPoint - so a
+  // coordinate click that missed said "no locator given".
+  const ctx = loadContentScript({});
+  const result = await ctx.send({ action: 'click', x: 10, y: 20 });
+  assert.equal(result.success, false);
+  assert.match(result.error, /x=10/);
+  assert.match(result.error, /y=20/);
+});
+
+test('whole-page get_text says when the credential cap bit', async () => {
+  const many = Array.from({ length: 600 }, (_, i) =>
+    Object.assign(makeElement('div', { id: 'otp-' + i,
+                                       textContent: 'SEC' + String(i).padStart(4, '0') }),
+                  { isContentEditable: true }));
+  const ctx = loadContentScript({ '[contenteditable]': many });
+  ctx.document.body.innerText = many.map(f => f.innerText).join(' ');
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.equal(result.maskedFieldsCapped, true,
+    'hitting the cap used to return the rest in clear with no indication');
+  assert.match(result.note, /NOT masked/);
+});
+
 test('a textarea holding a credential is masked in whole-page text', async () => {
   // The comment claimed "an <input> contributes nothing to innerText", which
   // is true, and then relied on that for every form control. A <textarea>'s

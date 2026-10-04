@@ -335,7 +335,13 @@ function redactHtmlInputValues(text) {
 // webRequest's requestBody.formData is ALWAYS array-valued
 // ({"password":["hunter2"]}), so the single most privacy-relevant request the
 // extension sees - an HTML form login - logged the password verbatim.
-const MAX_REDACT_DEPTH = 12;
+// Deep enough that real data is never reached. 12 was too shallow: the
+// comment below conceded that depth 13 is ordinary in GraphQL and paginated
+// responses, which meant an ordinary deep body had its deepest subtree
+// replaced with a withheld marker AND was forced through the lossy
+// re-serialisation. The limit exists only to bound recursion, and JSON.parse
+// has already bounded the depth by the time we get here.
+const MAX_REDACT_DEPTH = 64;
 
 function redactStructure(value, depth = 0) {
   if (depth > MAX_REDACT_DEPTH) {
