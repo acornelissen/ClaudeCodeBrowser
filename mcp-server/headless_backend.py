@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -27,6 +28,10 @@ logger = logging.getLogger('ClaudeCodeBrowser.Headless')
 
 SCREENSHOTS_DIR = resolve_screenshots_dir()
 
+# Floor for waitAndAct's poll interval, in ms. See the comment there: 0 and
+# negative values turned the poll loop into an infinite one.
+MIN_POLL_INTERVAL_MS = 10
+
 # Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
 BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
 
@@ -34,6 +39,62 @@ BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
 # browser or a pre-installed Playwright build at a nonstandard revision,
 # instead of requiring "playwright install".
 EXECUTABLE_PATH = os.environ.get('CLAUDE_BROWSER_EXECUTABLE')
+
+
+# Argument coercion, mirroring parseFlag() in extension/background.js.
+#
+# MCP clients hand-write JSON, so a boolean argument arrives as "false", "0"
+# or 0 often enough to matter: a bare `if args.get('flag')` read the string
+# "false" as true. That was a confirmed live bug on the extension side
+# (capture_bodies: "false" started a capture anyway), and this file had the
+# same class of bug in six places. Numbers arrive as strings for the same
+# reason, and `"15000" / 1000` raised TypeError from inside a poll loop.
+#
+# The leniency is for FEATURE arguments only. allow_password stays a strict
+# `is True` everywhere in this file: a fail-closed security switch must not be
+# unlocked by anything that merely looks truthy.
+_TRUE_WORDS = ('true', '1', 'yes', 'on')
+_FALSE_WORDS = ('false', '0', 'no', 'off')
+
+
+def parse_flag(value: Any, fallback: bool) -> bool:
+    """Read a boolean argument that may have arrived as a string or number."""
+    if value is None or value == '':
+        return fallback
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+    return fallback
+
+
+def parse_number(value: Any, fallback: float) -> float:
+    """Read a numeric argument that may have arrived as a string.
+
+    Anything unparseable, infinite or NaN falls back: these values end up as
+    Playwright timeouts, loop increments and JS literals, where inf and nan
+    are worse than a sane default.
+    """
+    if value is None or value == '' or isinstance(value, bool):
+        return fallback
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(number):
+        return fallback
+    return number
+
+
+def parse_int(value: Any, fallback: int) -> int:
+    """parse_number for arguments that must be whole (lengths, limits, ms)."""
+    return int(parse_number(value, fallback))
 
 
 class CredentialProbeFailed(RuntimeError):
@@ -85,12 +146,6 @@ class HeadlessBrowser:
         self._page = await self._context.new_page()
         self._register_tab(self._page)
 
-        # Wire up persistent console + network logging to stderr
-        self._page.on('console', lambda m: logger.debug(f"[browser:console:{m.type}] {m.text}"))
-        self._page.on('pageerror', lambda e: logger.warning(f"[browser:pageerror] {e}"))
-        self._page.on('request', lambda r: logger.debug(f"[browser:request] {r.method} {r.url}"))
-        self._page.on('response', lambda r: logger.debug(f"[browser:response] {r.status} {r.url}"))
-
         logger.info(f"Headless {BROWSER_TYPE} started")
 
     async def stop(self):
@@ -98,6 +153,16 @@ class HeadlessBrowser:
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
+        # Forget the tabs as well. is_ready() still reported True after stop(),
+        # so server.py went on dispatching commands onto a closed browser and
+        # the caller got an error from deep inside Playwright instead of being
+        # told the browser is gone.
+        self._page = None
+        self._tabs = {}
+        self._active_tab_id = None
+        self._context = None
+        self._browser = None
+        self._playwright = None
         logger.info("Headless browser stopped")
 
     def is_ready(self) -> bool:
@@ -111,7 +176,21 @@ class HeadlessBrowser:
         self._tabs[tab_id] = page
         self._active_tab_id = tab_id
         page.on('close', lambda: self._forget_tab(tab_id))
+        self._wire_logging(page)
         return tab_id
+
+    @staticmethod
+    def _wire_logging(page):
+        """Mirror a page's console, errors and traffic to stderr.
+
+        Wired per tab, next to the tab bookkeeping: start() used to attach
+        these to the first page only, so a tab opened with createTab produced
+        no diagnostics at all.
+        """
+        page.on('console', lambda m: logger.debug(f"[browser:console:{m.type}] {m.text}"))
+        page.on('pageerror', lambda e: logger.warning(f"[browser:pageerror] {e}"))
+        page.on('request', lambda r: logger.debug(f"[browser:request] {r.method} {r.url}"))
+        page.on('response', lambda r: logger.debug(f"[browser:response] {r.status} {r.url}"))
 
     def _forget_tab(self, tab_id: int):
         self._tabs.pop(tab_id, None)
@@ -228,6 +307,82 @@ class HeadlessBrowser:
                 'to override.'
             )
 
+    # The directions browser_scroll's schema allows.
+    _RELATIVE_DIRECTIONS = {'up': (0, -1), 'down': (0, 1),
+                            'left': (-1, 0), 'right': (1, 0)}
+    _EDGE_DIRECTIONS = ('top', 'bottom')
+
+    async def _scroll(self, page, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Scroll the page or one element, as browser_scroll documents it.
+
+        This handler used to read x/y/deltaX/deltaY - none of which the schema
+        defines - and ignore direction, amount, selector and to_element. So
+        scroll(direction='up', amount=1000) wheeled 300px DOWN and returned
+        success: true, telling the caller something happened that did not. The
+        x/y and delta names still work for any caller that learned them here.
+
+        A selector that matches nothing raises, which execute() reports:
+        scrolling the window instead of the element the caller named and
+        calling it success is worse than failing (the same rule the
+        extension's performScroll follows).
+        """
+        selector = args.get('selector') or None
+        to_element = args.get('to_element') or args.get('toElement') or None
+        direction = str(args.get('direction') or '').strip().lower()
+
+        if to_element:
+            await page.eval_on_selector(
+                to_element, "el => el.scrollIntoView({block: 'center'})")
+            return {'success': True, 'scrolledTo': to_element}
+
+        if direction in self._EDGE_DIRECTIONS:
+            edge = '0' if direction == 'top' else 'target.scrollHeight'
+            if selector:
+                await page.eval_on_selector(
+                    selector, f"target => target.scrollTo({{top: {edge}}})")
+            else:
+                await page.evaluate(
+                    'window.scrollTo({top: 0})' if direction == 'top'
+                    else 'window.scrollTo({top: document.body.scrollHeight})')
+            return {'success': True, 'direction': direction}
+
+        if direction and direction not in self._RELATIVE_DIRECTIONS:
+            allowed = sorted(set(self._RELATIVE_DIRECTIONS) |
+                             set(self._EDGE_DIRECTIONS))
+            return {'success': False,
+                    'error': f'Unknown scroll direction {direction!r}. '
+                             f'Expected one of: {", ".join(allowed)}'}
+
+        if direction:
+            amount = parse_number(args.get('amount'), 300.0)
+            step_x, step_y = self._RELATIVE_DIRECTIONS[direction]
+            delta_x, delta_y = step_x * amount, step_y * amount
+        elif args.get('deltaX') is not None or args.get('deltaY') is not None:
+            delta_x = parse_number(args.get('deltaX'), 0.0)
+            delta_y = parse_number(args.get('deltaY'), 0.0)
+        elif args.get('x') is not None or args.get('y') is not None:
+            # x/y are an absolute position, as the extension treats them.
+            position = {'left': parse_number(args.get('x'), 0.0),
+                        'top': parse_number(args.get('y'), 0.0)}
+            if selector:
+                await page.eval_on_selector(
+                    selector, f"target => target.scrollTo({json.dumps(position)})")
+            else:
+                await page.evaluate(f"window.scrollTo({json.dumps(position)})")
+            return {'success': True, 'position': position}
+        else:
+            # No arguments at all: the historical default, one wheel notch down.
+            delta_x, delta_y = 0.0, 300.0
+
+        if selector:
+            offset = {'left': delta_x, 'top': delta_y}
+            await page.eval_on_selector(
+                selector, f"target => target.scrollBy({json.dumps(offset)})")
+            return {'success': True, 'selector': selector, 'scrolledBy': offset}
+
+        await page.mouse.wheel(float(delta_x), float(delta_y))
+        return {'success': True, 'scrolledBy': {'x': delta_x, 'y': delta_y}}
+
     async def execute(self, action: str, tab_id: Optional[int], arguments: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
             try:
@@ -246,9 +401,20 @@ class HeadlessBrowser:
 
         elif action == 'screenshot':
             from datetime import datetime
-            filename = Path(args.get('filename') or f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png').name
+            generated = f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
+            # Taking .name strips directories, but it leaves a filename that
+            # is nothing but directory components: Path('.').name is '' and
+            # Path('..').name is '..', so the target became the screenshots
+            # directory itself or its parent and the write failed with an
+            # IsADirectoryError naming a path the caller never asked for.
+            # Treated as no filename at all instead.
+            filename = Path(args.get('filename') or generated).name
+            if filename in ('', '.', '..'):
+                filename = generated
             filepath = SCREENSHOTS_DIR / filename
-            await page.screenshot(path=str(filepath), full_page=args.get('full_page', False))
+            await page.screenshot(
+                path=str(filepath),
+                full_page=parse_flag(args.get('full_page'), False))
             data = filepath.read_bytes()
             # The headless path writes through Playwright rather than
             # server.py's _save_screenshot, so without this the retention
@@ -290,12 +456,7 @@ class HeadlessBrowser:
             return {'success': True}
 
         elif action == 'scroll':
-            x = args.get('x', 0)
-            y = args.get('y', 0)
-            delta_x = args.get('deltaX', 0)
-            delta_y = args.get('deltaY', 300)
-            await page.mouse.wheel(float(delta_x), float(delta_y))
-            return {'success': True}
+            return await self._scroll(page, args)
 
         elif action == 'getPageInfo':
             return {
@@ -306,17 +467,33 @@ class HeadlessBrowser:
 
         elif action == 'getElements':
             selector = args.get('selector', 'a, button, input, select, textarea')
+            limit = parse_int(args.get('limit'), 50)
+            if limit <= 0:
+                limit = 50
             elements = await page.query_selector_all(selector)
             results = []
-            for el in elements[:50]:
+            skipped = 0
+            for el in elements[:limit]:
                 try:
                     tag = await el.evaluate('e => e.tagName.toLowerCase()')
                     text = (await el.inner_text())[:100]
                     box = await el.bounding_box()
                     results.append({'tag': tag, 'text': text, 'box': box})
                 except Exception:
-                    pass
-            return {'success': True, 'elements': results}
+                    # An element that detached between the query and the read
+                    # is dropped - but it is counted. A caller reasoning about
+                    # "all the buttons" was handed a list cut at 50, with any
+                    # unreadable element silently missing, and nothing in the
+                    # result said so.
+                    skipped += 1
+            return {
+                'success': True,
+                'elements': results,
+                'totalMatched': len(elements),
+                'returned': len(results),
+                'truncated': len(elements) > limit,
+                'skipped': skipped,
+            }
 
         elif action == 'executeScript':
             script = args.get('script', '')
@@ -325,12 +502,12 @@ class HeadlessBrowser:
 
         elif action == 'waitForElement':
             selector = args.get('selector', '')
-            timeout = args.get('timeout', 10000)
+            timeout = parse_number(args.get('timeout'), 10000)
             await page.wait_for_selector(selector, timeout=timeout)
             return {'success': True}
 
         elif action == 'waitForNetworkIdle':
-            timeout = args.get('timeout', 10000)
+            timeout = parse_number(args.get('timeout'), 10000)
             await page.wait_for_load_state('networkidle', timeout=timeout)
             return {'success': True}
 
@@ -379,9 +556,17 @@ class HeadlessBrowser:
             if args.get('allow_password') is not True and \
                     await self._is_password_field(page, selector,
                                                   include_hidden=True):
+                # Masked rather than refused so the caller can still tell
+                # whether the field is filled - which only works if an EMPTY
+                # credential field reads back as null instead of '***'. The
+                # extension's safeElementValue makes the same distinction. The
+                # emptiness test runs in the page, so the credential itself
+                # never crosses into this process.
+                filled = bool(await page.eval_on_selector(
+                    selector, 'el => !!el.value'))
                 return {
                     'success': True,
-                    'value': '***',
+                    'value': '***' if filled else None,
                     'masked': True,
                     'note': 'Credential field value withheld. Set '
                             '"allow_password_typing": true in '
@@ -407,22 +592,45 @@ class HeadlessBrowser:
             # Detect what's there, but a captcha is by design a human check —
             # headless mode has no human and this project does not auto-solve.
             detection = await page.evaluate(_DETECT_CAPTCHA_JS)
-            if args.get('detect_only'):
+            if parse_flag(args.get('detect_only'), False):
                 return {'success': True, **detection}
             widgets = detection.get('widgets', [])
-            tokened = [w for w in widgets if w.get('solved') is not None]
-            if tokened and all(w.get('solved') for w in tokened):
-                return {'success': True, 'present': True, 'solved': True,
-                        'widgets': widgets, 'message': 'Captcha already solved.'}
+
+            if not detection.get('present'):
+                # A step that found nothing to do is not a failed step. This
+                # was reported as success: false, so a workflow could not tell
+                # "no captcha here" from "a captcha blocked us". The extension
+                # returns success here too.
+                return {'success': True, 'present': False, 'widgets': widgets,
+                        'message': 'No captcha detected on the page.'}
+
+            # EVERY widget must report itself solved. The old test skipped
+            # widgets whose state is unknowable (a generic image captcha,
+            # solved: null) instead of counting them against the result, so
+            # one solved reCAPTCHA next to an unsolved generic one reported
+            # solved: true.
+            if widgets and all(w.get('solved') is True for w in widgets):
+                return {
+                    'success': True, 'present': True, 'solved': True,
+                    # The response token is written by the page, so a hostile
+                    # page can set it. "Captcha already solved." read as proof
+                    # that a human passed the check; it is not, and the
+                    # extension says so in the same words.
+                    'humanVerified': False,
+                    'widgets': widgets,
+                    'message': ('Captcha reports itself already solved. The '
+                                'response token is page-writable, so this is '
+                                'not proof a human solved it.'),
+                }
+
             return {
                 'success': False,
-                'present': detection.get('present', False),
-                'widgets': detection.get('widgets', []),
+                'present': True,
+                'widgets': widgets,
                 'needs_human': True,
                 'error': ('A captcha requires a human to solve and none is present '
                           'in headless mode. Re-run this step in attended mode '
-                          '(the Firefox extension) so the person can complete it.')
-                          if detection.get('present') else 'No captcha detected.'
+                          '(the Firefox extension) so the person can complete it.'),
             }
 
         elif action == 'hover':
@@ -437,7 +645,8 @@ class HeadlessBrowser:
             elif args.get('text') is not None:
                 await page.select_option(selector, label=args['text'])
             elif args.get('index') is not None:
-                await page.select_option(selector, index=int(args['index']))
+                await page.select_option(selector,
+                                         index=parse_int(args['index'], 0))
             else:
                 return {'success': False, 'error': 'selectOption requires value, text, or index'}
             return {'success': True}
@@ -482,15 +691,19 @@ class HeadlessBrowser:
             if selector:
                 await page.focus(selector)
             modifiers = [m for m, on in (
-                ('Control', args.get('ctrl')), ('Shift', args.get('shift')),
-                ('Alt', args.get('alt')), ('Meta', args.get('meta'))) if on]
+                ('Control', parse_flag(args.get('ctrl'), False)),
+                ('Shift', parse_flag(args.get('shift'), False)),
+                ('Alt', parse_flag(args.get('alt'), False)),
+                ('Meta', parse_flag(args.get('meta'), False))) if on]
             combination = '+'.join(modifiers + [key]) if modifiers else key
             await page.keyboard.press(combination)
             return {'success': True, 'key': combination}
 
         elif action == 'getText':
             selector = args.get('selector') or 'body'
-            max_length = int(args.get('max_length', 20000))
+            max_length = parse_int(args.get('max_length'), 20000)
+            if max_length <= 0:
+                max_length = 20000
             text = await page.inner_text(selector, timeout=10000)
             truncated = len(text) > max_length
             return {
@@ -520,8 +733,8 @@ class HeadlessBrowser:
             for i, step in enumerate(steps):
                 script = step.get('script', '')
                 label = step.get('label', f'step_{i}')
-                capture = step.get('capture_console', True)
-                stop_on_error = step.get('stop_on_error', True)
+                capture = parse_flag(step.get('capture_console'), True)
+                stop_on_error = parse_flag(step.get('stop_on_error'), True)
 
                 console_msgs = []
                 listener = None
@@ -541,6 +754,11 @@ class HeadlessBrowser:
                     results.append({'label': label, 'result': result, 'console': console_msgs, 'error': None})
                 except Exception as e:
                     results.append({'label': label, 'result': None, 'console': console_msgs, 'error': str(e)})
+                    # A failed step has no result, so the next step's $prev is
+                    # null. It used to keep the value from the step before,
+                    # handing the next script data from two steps back while
+                    # the tool documents $prev as "the prior result".
+                    prev = None
                     if stop_on_error:
                         break
                 finally:
@@ -562,10 +780,19 @@ class HeadlessBrowser:
         elif action == 'waitAndAct':
             condition = args.get('condition', 'true')
             action_script = args.get('action_script', '')
-            poll_ms = args.get('poll_interval_ms', 200)
-            timeout_ms = args.get('timeout_ms', 15000)
+            # A non-positive poll interval never advanced `elapsed` (and a
+            # negative one walked it backwards), so the loop never ended: the
+            # call held the single headless event loop, and every other
+            # browser tool with it, until the server was killed. The floor
+            # also keeps a tiny interval from becoming a busy spin.
+            poll_ms = max(parse_int(args.get('poll_interval_ms'), 200),
+                          MIN_POLL_INTERVAL_MS)
+            timeout_ms = parse_int(args.get('timeout_ms'), 15000)
             elapsed = 0
-            while elapsed < timeout_ms:
+            # Tested after the body, not before it: `while elapsed < timeout_ms`
+            # skipped the body entirely on timeout_ms=0, so an already-true
+            # condition was reported as "not met" without ever being evaluated.
+            while True:
                 try:
                     ready = await page.evaluate(condition)
                 except Exception as e:
@@ -587,15 +814,19 @@ class HeadlessBrowser:
                                 'error': f'Action failed: {e}',
                                 'elapsed_ms': elapsed}
                     return {'success': True, 'result': result, 'elapsed_ms': elapsed}
+                if elapsed + poll_ms >= timeout_ms:
+                    break
                 await asyncio.sleep(poll_ms / 1000)
                 elapsed += poll_ms
-            return {'success': False, 'error': f'Condition not met within {timeout_ms}ms'}
+            return {'success': False,
+                    'error': f'Condition not met within {timeout_ms}ms',
+                    'elapsed_ms': elapsed}
 
         elif action == 'injectObserver':
             selector = args.get('selector', 'body')
-            observe_attrs = args.get('observe_attributes', True)
-            observe_children = args.get('observe_child_list', True)
-            observe_subtree = args.get('observe_subtree', True)
+            observe_attrs = parse_flag(args.get('observe_attributes'), True)
+            observe_children = parse_flag(args.get('observe_child_list'), True)
+            observe_subtree = parse_flag(args.get('observe_subtree'), True)
             script = f"""
                 (function() {{
                     if (window.__ccb_observer) window.__ccb_observer.disconnect();

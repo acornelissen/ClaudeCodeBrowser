@@ -144,33 +144,128 @@ last_restart_time = 0
 health_monitor_running = True
 
 
-def read_message():
-    """Read a message from stdin using native messaging protocol."""
-    try:
-        # Read message length (4 bytes)
-        raw_length = sys.stdin.buffer.read(4)
-        if len(raw_length) == 0:
-            return None
+# Native messaging framing.
+#
+# '@I' is NATIVE byte order, and that is correct: Firefox documents the length
+# prefix as "a 32-bit value in native byte order", so '<I' would be wrong on a
+# big-endian host rather than more portable.
+NATIVE_LENGTH_FORMAT = '@I'
 
-        message_length = struct.unpack('@I', raw_length)[0]
+# The documented size limits are asymmetric, so these two are not the same
+# number: a message from the add-on to this application may be up to 4 GB,
+# while a message from this application back to the add-on must stay under
+# 1 MB. The inbound cap is therefore NOT 1 MB - one screenshot data URL is
+# routinely larger than that, and a 1 MB inbound cap would drop real
+# screenshots. It is a sanity bound only: a corrupt length prefix must not
+# make us attempt a multi-gigabyte read.
+MAX_INCOMING_MESSAGE_BYTES = 64 * 1024 * 1024
+MAX_OUTGOING_MESSAGE_BYTES = 1024 * 1024
 
-        # Read message content
-        message = sys.stdin.buffer.read(message_length).decode('utf-8')
-        return json.loads(message)
-    except Exception as e:
-        logger.error(f"Error reading message: {e}")
+
+class FramingError(Exception):
+    """The stdin byte stream is no longer aligned to a message boundary.
+
+    After a truncated or impossible length prefix there is no way to find
+    where the next message starts, so the connection cannot continue. Kept
+    distinct from EOF, which is Firefox closing the pipe normally.
+    """
+
+
+class MessageDecodeError(Exception):
+    """One frame's bytes were not valid JSON.
+
+    The frame was read in full, so the stream is still aligned: this one
+    message is dropped and the next one can be read.
+    """
+
+
+def _read_exactly(stream, count):
+    """Read exactly count bytes, or raise FramingError.
+
+    read() on a pipe may return fewer bytes than asked for. The old code read
+    the whole message in one call and used whatever came back, so a short read
+    silently truncated the message and surfaced as a JSON error that looked
+    like the extension had sent nonsense.
+    """
+    chunks = []
+    remaining = count
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise FramingError(
+                f'stream ended {remaining} bytes short of a {count}-byte frame')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+
+def read_message(stream=None):
+    """Read one message from the extension using the native messaging protocol.
+
+    Returns None at EOF, which means Firefox closed the pipe. Raises
+    MessageDecodeError for a single unreadable frame (the stream is still
+    usable) and FramingError when the stream can no longer be trusted. All
+    three used to return None, so the caller could not tell a closed pipe from
+    one bad frame and shut the host down either way.
+    """
+    stream = sys.stdin.buffer if stream is None else stream
+
+    raw_length = stream.read(4)
+    if len(raw_length) == 0:
         return None
+    if len(raw_length) < 4:
+        # A prefix split across two reads is legitimate; a stream that ends
+        # inside one is not.
+        try:
+            raw_length += _read_exactly(stream, 4 - len(raw_length))
+        except FramingError as e:
+            raise FramingError(f'truncated length prefix: {e}') from e
+
+    message_length = struct.unpack(NATIVE_LENGTH_FORMAT, raw_length)[0]
+    if message_length == 0:
+        raise FramingError('length prefix claims a zero-length message')
+    if message_length > MAX_INCOMING_MESSAGE_BYTES:
+        raise FramingError(
+            f'length prefix claims {message_length} bytes, over the '
+            f'{MAX_INCOMING_MESSAGE_BYTES}-byte sanity limit')
+
+    payload = _read_exactly(stream, message_length)
+    try:
+        return json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise MessageDecodeError(str(e)) from e
 
 
-def send_message(message):
-    """Send a message to stdout using native messaging protocol."""
+def send_message(message, stream=None):
+    """Send a message to the extension using the native messaging protocol."""
+    stream = sys.stdout.buffer if stream is None else stream
     try:
         encoded = json.dumps(message).encode('utf-8')
-        length = struct.pack('@I', len(encoded))
 
-        sys.stdout.buffer.write(length)
-        sys.stdout.buffer.write(encoded)
-        sys.stdout.buffer.flush()
+        if len(encoded) > MAX_OUTGOING_MESSAGE_BYTES:
+            # Firefox drops a message over its 1 MB limit and tears the port
+            # down, so sending it anyway loses the message AND the
+            # connection: the extension sees the host vanish with no
+            # explanation, and whoever was waiting on this requestId waits
+            # out its timeout. Send a small failure in its place instead,
+            # carrying the same requestId so the waiter gets an answer.
+            logger.error(
+                f"Outgoing message is {len(encoded)} bytes, over the "
+                f"{MAX_OUTGOING_MESSAGE_BYTES}-byte native messaging limit; "
+                f"sending a failure in its place")
+            replacement = {
+                'success': False,
+                'error': (f'The native host had a {len(encoded)}-byte response, '
+                          f'over the {MAX_OUTGOING_MESSAGE_BYTES}-byte native '
+                          f'messaging limit, so it was not sent.'),
+            }
+            if isinstance(message, dict) and message.get('requestId') is not None:
+                replacement['requestId'] = message['requestId']
+            encoded = json.dumps(replacement).encode('utf-8')
+
+        stream.write(struct.pack(NATIVE_LENGTH_FORMAT, len(encoded)))
+        stream.write(encoded)
+        stream.flush()
 
         logger.debug(f"Sent message: {describe_message(message)}")
     except Exception as e:
@@ -466,26 +561,44 @@ def kill_existing_server():
 # Children we have spawned, so they can be waited on rather than left as
 # zombies. The server is started with start_new_session, but it is still our
 # child until reaped.
+#
+# The lock matters: this list is read-modify-written from the health-monitor
+# thread (through start_mcp_server), from the main thread and from the signal
+# handler (through shutdown). Rebuilding it unlocked could drop a child that
+# another thread had just appended - exactly the one it was meant to reap.
 _spawned_children = []
+_spawned_children_lock = threading.Lock()
 
 
 def _reap_finished_children():
-    """Wait on any finished child so it does not linger as a zombie."""
-    still_running = []
-    for child in _spawned_children:
-        if child.poll() is None:
-            still_running.append(child)
-        else:
+    """Reap any finished child so it does not linger as a zombie.
+
+    poll() does the reaping: it is waitpid(WNOHANG) and it sets returncode.
+    The old code followed a non-None poll() with child.wait(timeout=0), which
+    could only ever be a no-op on a process poll() had already reaped.
+    """
+    with _spawned_children_lock:
+        still_running = []
+        for child in _spawned_children:
             try:
-                child.wait(timeout=0)
-            except Exception:
-                pass
-    _spawned_children[:] = still_running
+                finished = child.poll() is not None
+            except Exception as e:
+                # Cannot tell; keep it and try again on the next pass rather
+                # than forgetting a child we may still have to reap.
+                logger.debug(f"Could not poll child: {e}")
+                finished = False
+            if not finished:
+                still_running.append(child)
+        _spawned_children[:] = still_running
 
 
 def start_mcp_server():
     """Start the MCP server if it's not running."""
     global server_process, restart_attempts, last_restart_time
+
+    # Before the backoff check, not after it: a dead child must be reaped even
+    # on a call that gives up early.
+    _reap_finished_children()
 
     # Check backoff
     now = time.time()
@@ -533,11 +646,8 @@ def start_mcp_server():
         restart_attempts += 1
         last_restart_time = time.time()
 
-        # Reap any previously started child, or each crash-and-restart cycle
-        # leaves a zombie behind for the life of this host process.
-        _reap_finished_children()
-
-        _spawned_children.append(server_process)
+        with _spawned_children_lock:
+            _spawned_children.append(server_process)
         logger.info(f"Started MCP server (PID: {server_process.pid}, attempt #{restart_attempts})")
 
         # Save PID for tracking
@@ -621,11 +731,20 @@ def handle_local_command(message):
         }
 
     elif action == 'saveScreenshot':
-        # Save screenshot to file
+        # Save screenshot to file. Only reached when the extension explicitly
+        # asks for it: responses that merely happen to carry image data are
+        # left to server.py, which saves them under the caller's own filename
+        # (see process_message).
         try:
             data = message.get('data', '')
             # Strip directory components to prevent path traversal
-            filename = Path(message.get('filename', f'screenshot_{int(time.time())}.png')).name
+            generated = f'screenshot_{int(time.time())}.png'
+            filename = Path(message.get('filename') or generated).name
+            # Path('.').name is '' and Path('..').name is '..', so a filename
+            # made only of directory components pointed at the screenshots
+            # directory or its parent instead of a file in it.
+            if filename in ('', '.', '..'):
+                filename = generated
 
             # A screenshot can contain anything that was on screen, so the
             # default is the user's own directory at 0700, not a shared /tmp.
@@ -650,7 +769,16 @@ def handle_local_command(message):
                 import base64
                 image_data = base64.b64decode(data)
 
-            with open(filepath, 'wb') as f:
+            # 0600 and O_NOFOLLOW, matching _save_screenshot in server.py: a
+            # plain open() wrote the file at umask permissions (0644) and
+            # followed a symlink, so with a shared
+            # CLAUDE_BROWSER_SCREENSHOTS_DIR someone could pre-create a
+            # predictable name as a symlink and have another file of this
+            # user's truncated.
+            flags = (os.O_CREAT | os.O_WRONLY | os.O_TRUNC |
+                     getattr(os, 'O_NOFOLLOW', 0))
+            fd = os.open(str(filepath), flags, 0o600)
+            with os.fdopen(fd, 'wb') as f:
                 f.write(image_data)
 
             return {'success': True, 'filepath': str(filepath)}
@@ -669,24 +797,16 @@ def process_message(message):
     if 'requestId' in message and 'action' not in message:
         logger.info(f"Forwarding response for requestId: {message.get('requestId')}")
 
-        # Save screenshot data locally if present
-        # Only an actual image, and only when it looks like one: this fired
-        # for every response carrying a `data` field, writing non-image
-        # payloads to disk as .png junk and duplicating screenshots that
-        # server.py had already saved.
-        data = message.get('data')
-        if (message.get('success') and isinstance(data, str)
-                and data.startswith('data:image/')):
-            save_result = handle_local_command({
-                'action': 'saveScreenshot',
-                'data': data,
-                'filename': f'screenshot_{int(time.time())}.png'
-            })
-            if save_result and save_result.get('success'):
-                logger.info(f"Screenshot saved: {save_result.get('filepath')}")
-            elif save_result:
-                logger.warning(f"Screenshot not saved: {save_result.get('error')}")
-
+        # Nothing is written to disk here, deliberately. server.py's
+        # _save_screenshot already saves every screenshot that comes back,
+        # under the filename the caller asked for, with O_NOFOLLOW and mode
+        # 0600, and prunes the directory afterwards. This used to write a
+        # SECOND copy named screenshot_<epoch>.png through a plain open():
+        # umask permissions (0644 rather than 0600), symlinks followed, and
+        # the 500-file retention cap consumed at double rate. And because a
+        # response here carries no action, any response whose `data` happened
+        # to be a data:image/ URL - getValue on an input holding an inline
+        # image - landed on disk as a .png.
         forward_response_to_server(message)
         return message
 
@@ -732,9 +852,16 @@ def forward_response_to_server(response):
 def input_thread():
     """Thread for reading messages from the extension."""
     while True:
-        message = read_message()
+        try:
+            message = read_message()
+        except MessageDecodeError as e:
+            logger.error(f"Dropping one unreadable message: {e}")
+            continue
+        except FramingError as e:
+            logger.error(f"Native messaging stream is corrupt ({e}); stopping")
+            break
         if message is None:
-            logger.info("Extension disconnected")
+            logger.info("Extension closed the pipe")
             break
 
         logger.debug(f"Received message: {describe_message(message)}")
@@ -798,6 +925,13 @@ def health_monitor_thread():
 
             if not health_monitor_running:
                 break
+
+            # Reap on every pass. Reaping used to happen only inside the next
+            # start_mcp_server(), which does not run while the backoff is in
+            # effect and never runs again once MAX_RESTART_ATTEMPTS is hit -
+            # so the last dead child stayed a zombie for the life of the
+            # host. A poll() per tick is cheap and this loop is already here.
+            _reap_finished_children()
 
             # Check server health
             if check_mcp_server():
@@ -881,9 +1015,19 @@ def main():
 
     # Process messages in main thread
     while health_monitor_running:
-        message = read_message()
+        try:
+            message = read_message()
+        except MessageDecodeError as e:
+            # The frame was read in full, so the stream is still aligned:
+            # drop this message and carry on rather than treating a single
+            # bad message as a disconnect.
+            logger.error(f"Dropping one unreadable message: {e}")
+            continue
+        except FramingError as e:
+            logger.error(f"Native messaging stream is corrupt ({e}); exiting")
+            break
         if message is None:
-            logger.info("Input stream closed, exiting")
+            logger.info("Extension closed the pipe, exiting")
             break
 
         logger.debug(f"Received: {describe_message(message)}")

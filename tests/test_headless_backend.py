@@ -14,11 +14,12 @@ Playwright is not installed and is not required: every test drives
 HeadlessBrowser._dispatch() with a fake page that records what was asked of
 it, and the two start() tests stub the playwright module.
 
-Tests marked "DEFECT" assert the behaviour the requirements call for, not
-what the code does today, and carry @unittest.expectedFailure so the suite
-stays green until the source is fixed. Fixing a defect turns its test into
-an "unexpected success", which fails the run - that is the signal to drop
-the decorator.
+Tests marked "Regression test. Was:" were written against a defect this
+module had: the comment states the bug, and the test fails again if it comes
+back. A test for a defect that is still open instead carries
+@unittest.expectedFailure, so fixing it turns the test into an "unexpected
+success" and fails the run - the signal to drop the decorator. There are
+none open at the moment.
 
 Run: python3 -m unittest tests.test_headless_backend -v
 """
@@ -303,6 +304,10 @@ class FakePage:
             raise SelectorError(f'no element for {selector}')
         if script == 'el => el.value':
             return el.value
+        # The read mask asks whether a credential field is filled without
+        # pulling the value out of the page, so the fake answers that too.
+        if script == 'el => !!el.value':
+            return bool(el.value)
         return None
 
 
@@ -629,12 +634,11 @@ class CredentialGuardReadTests(unittest.IsolatedAsyncioTestCase):
         result = await browser.execute('getValue', None, {'selector': '#nope'})
         self.assertFalse(result['success'])
 
-    # DEFECT (medium): headless_backend.py:316-323 - the comment says reads
+    # Regression test. Was: headless_backend.py:316-323 - the comment says reads
     # are "masked, not refused, so the caller can still tell whether the
     # field is filled", but an empty credential field is reported as '***'
     # too. The extension's safeElementValue returns null for an empty one.
     # As written, the caller cannot tell filled from empty.
-    @unittest.expectedFailure
     async def test_get_value_distinguishes_an_empty_credential_field(self):
         browser, page = make_browser(
             elements={'#pw': Element(input_type='password', value='')})
@@ -846,12 +850,11 @@ class EvalChainTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result['final'])
         self.assertEqual(page.evaluate_count, 0)
 
-    # DEFECT (low): headless_backend.py:445-454 - when a step fails and
+    # Regression test. Was: headless_backend.py:445-454 - when a step fails and
     # stop_on_error is false, `prev` keeps the value from the step before it,
     # so the next step's $prev is stale data from two steps back while the
     # tool documents $prev as "the prior result". A failed step has no result,
     # so the following step should see null.
-    @unittest.expectedFailure
     async def test_prev_is_null_after_a_failed_step(self):
         browser, page = self._browser([5, RuntimeError('boom'), None])
         await browser._dispatch('evalChain', None, {'steps': [
@@ -944,12 +947,11 @@ class WaitAndActTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Condition not met within 5ms', result['error'])
         self.assertEqual(len(page.action_calls), 0)
 
-    # DEFECT (medium): headless_backend.py:474-500 - poll_interval_ms is used
+    # Regression test. Was: headless_backend.py:474-500 - poll_interval_ms is used
     # unvalidated as the loop increment. 0 never advances `elapsed` and a
     # negative value walks it backwards, so the loop never terminates: the
     # call hangs the single headless event loop (and with it every other
     # browser tool) until the server is killed.
-    @unittest.expectedFailure
     async def test_zero_or_negative_poll_interval_still_terminates(self):
         for poll in (0, -100):
             with self.subTest(poll_interval_ms=poll):
@@ -961,11 +963,10 @@ class WaitAndActTests(unittest.IsolatedAsyncioTestCase):
                     timeout=0.75)
                 self.assertFalse(result['success'])
 
-    # DEFECT (low): headless_backend.py:477 - with timeout_ms=0 the loop body
+    # Regression test. Was: headless_backend.py:477 - with timeout_ms=0 the loop body
     # never runs, so an already-true condition is reported as "not met" and
     # the condition is never even evaluated. A poll loop should test once
     # before giving up (or reject a non-positive timeout outright).
-    @unittest.expectedFailure
     async def test_zero_timeout_still_checks_the_condition_once(self):
         browser, page = self._browser([True], action_result='ok')
         result = await browser._dispatch('waitAndAct', None, {
@@ -1013,12 +1014,11 @@ class SolveCaptchaTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('solveCaptcha', None, {})
         self.assertNotIn('solve', result.get('message', '').lower())
 
-    # DEFECT (medium): headless_backend.py:347-349 - the extension's
+    # Regression test. Was: headless_backend.py:347-349 - the extension's
     # equivalent returns humanVerified: false and spells out that the
     # response token is page-writable, so a hostile page can fake it. The
     # headless copy returns a bare "Captcha already solved." with
     # solved: true, which reads as proof that a human passed the check.
-    @unittest.expectedFailure
     async def test_already_solved_reports_that_no_human_was_verified(self):
         browser, page = self._browser(
             {'present': True,
@@ -1026,12 +1026,11 @@ class SolveCaptchaTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('solveCaptcha', None, {})
         self.assertIs(result.get('humanVerified'), False)
 
-    # DEFECT (medium): headless_backend.py:346-349 - only widgets with a
+    # Regression test. Was: headless_backend.py:346-349 - only widgets with a
     # non-None `solved` are considered, so a generic captcha (solved: null,
     # state unknowable) sitting next to one solved widget is ignored and the
     # call reports solved: true. The extension requires every widget to be
     # solved.
-    @unittest.expectedFailure
     async def test_unknown_widget_state_is_not_treated_as_solved(self):
         browser, page = self._browser({'present': True, 'widgets': [
             {'type': 'generic', 'solved': None},
@@ -1039,10 +1038,9 @@ class SolveCaptchaTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('solveCaptcha', None, {})
         self.assertIsNot(result.get('solved'), True)
 
-    # DEFECT (low): headless_backend.py:350-359 - "no captcha present" is
+    # Regression test. Was: headless_backend.py:350-359 - "no captcha present" is
     # returned as success: false, so a step that had nothing to do looks like
     # a failed step. The extension returns {success: true, present: false}.
-    @unittest.expectedFailure
     async def test_no_captcha_is_not_a_failure(self):
         browser, page = self._browser({'present': False, 'widgets': []})
         result = await browser._dispatch('solveCaptcha', None, {})
@@ -1128,11 +1126,10 @@ class ScreenshotTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('screenshot', None, {'filename': ''})
         self.assertTrue(result['filename'].startswith('screenshot_'))
 
-    # DEFECT (low): headless_backend.py:187 - Path('..').name is '', so the
+    # Regression test. Was: headless_backend.py:187 - Path('..').name is '', so the
     # target path becomes the screenshots directory itself. Nothing escapes
     # the directory, but the write fails with an unrelated IsADirectoryError
     # instead of the filename being rejected or replaced.
-    @unittest.expectedFailure
     async def test_dot_dot_filename_is_rejected_or_replaced(self):
         for hostile in ('..', '.', '../', 'foo/..'):
             with self.subTest(filename=hostile):
@@ -1183,12 +1180,11 @@ class SimpleActionTests(unittest.IsolatedAsyncioTestCase):
         result = await browser.execute('click', None, {'selector': '#go'})
         self.assertFalse(result['success'])
 
-    # DEFECT (medium): headless_backend.py:226-232 - browser_scroll's
+    # Regression test. Was: headless_backend.py:226-232 - browser_scroll's
     # documented arguments are direction/amount/selector/to_element, but the
     # headless handler reads deltaX/deltaY only. Scrolling up, by a given
     # amount, or to an element silently scrolls down 300px and reports
     # success: true, so the caller is told something happened that did not.
-    @unittest.expectedFailure
     async def test_scroll_honours_direction_and_amount(self):
         browser, page = make_browser()
         await browser._dispatch('scroll', None,
@@ -1196,6 +1192,66 @@ class SimpleActionTests(unittest.IsolatedAsyncioTestCase):
         _, delta_x, delta_y = calls_named(page, 'mouse.wheel')[0]
         self.assertLess(delta_y, 0, 'direction=up must scroll upwards')
         self.assertEqual(abs(delta_y), 500.0)
+
+    async def test_scroll_to_bottom_does_not_wheel_a_fixed_amount(self):
+        browser, page = make_browser()
+        result = await browser._dispatch('scroll', None,
+                                         {'direction': 'bottom'})
+        self.assertTrue(result['success'])
+        self.assertEqual(calls_named(page, 'mouse.wheel'), [])
+        self.assertIn('scrollHeight', page.evaluate_scripts[0])
+
+    async def test_scroll_in_a_named_container(self):
+        browser, page = make_browser(elements={'#list': Element()})
+        result = await browser._dispatch(
+            'scroll', None,
+            {'selector': '#list', 'direction': 'down', 'amount': 120})
+        self.assertTrue(result['success'])
+        self.assertEqual(calls_named(page, 'mouse.wheel'), [],
+                         'a named container must not be scrolled by '
+                         'wheeling the window')
+        script = calls_named(page, 'eval_on_selector')[0][2]
+        self.assertIn('scrollBy', script)
+        self.assertIn('120', script)
+
+    async def test_scroll_to_element_scrolls_it_into_view(self):
+        browser, page = make_browser(elements={'#footer': Element()})
+        result = await browser._dispatch('scroll', None,
+                                         {'to_element': '#footer'})
+        self.assertTrue(result['success'])
+        self.assertIn('scrollIntoView',
+                      calls_named(page, 'eval_on_selector')[0][2])
+
+    async def test_scroll_to_a_missing_element_is_not_a_success(self):
+        """Scrolling the window instead of the element the caller named, and
+        reporting success, is worse than failing."""
+        browser, page = make_browser(elements={})
+        result = await browser.execute('scroll', None,
+                                       {'to_element': '#gone'})
+        self.assertFalse(result['success'])
+        self.assertEqual(calls_named(page, 'mouse.wheel'), [])
+
+    async def test_scroll_in_a_missing_container_is_not_a_success(self):
+        browser, page = make_browser(elements={})
+        result = await browser.execute('scroll', None,
+                                       {'selector': '#gone',
+                                        'direction': 'down'})
+        self.assertFalse(result['success'])
+        self.assertEqual(calls_named(page, 'mouse.wheel'), [])
+
+    async def test_unknown_scroll_direction_is_rejected(self):
+        browser, page = make_browser()
+        result = await browser._dispatch('scroll', None,
+                                         {'direction': 'sideways'})
+        self.assertFalse(result['success'])
+        self.assertIn('sideways', result['error'])
+        self.assertEqual(calls_named(page, 'mouse.wheel'), [])
+
+    async def test_scroll_still_honours_the_delta_names(self):
+        browser, page = make_browser()
+        await browser._dispatch('scroll', None, {'deltaX': 10, 'deltaY': -20})
+        self.assertEqual(calls_named(page, 'mouse.wheel'),
+                         [('mouse.wheel', 10.0, -20.0)])
 
     async def test_scroll_default_is_a_downward_wheel(self):
         browser, page = make_browser()
@@ -1258,11 +1314,10 @@ class SimpleActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e['tag'] for e in result['elements']],
                          ['a', 'button'])
 
-    # DEFECT (low): headless_backend.py:245-252 - the match list is cut to 50
+    # Regression test. Was: headless_backend.py:245-252 - the match list is cut to 50
     # and any element that throws is dropped silently, with nothing in the
     # result to say so. A caller reasoning about "all the buttons" is given a
     # partial list it cannot detect.
-    @unittest.expectedFailure
     async def test_get_elements_discloses_truncation_and_drops(self):
         browser, page = make_browser()
         page.query_results = ([FakeElementHandle(tag='a') for _ in range(60)]
@@ -1404,11 +1459,10 @@ class TabBookkeepingTests(unittest.IsolatedAsyncioTestCase):
         await browser._dispatch('createTab', None, {})
         self.assertEqual(calls_named(browser._tabs[2], 'goto'), [])
 
-    # DEFECT (low): headless_backend.py:285-292 - start() wires console,
+    # Regression test. Was: headless_backend.py:285-292 - start() wires console,
     # pageerror, request and response logging onto the first page only, so
     # pages opened with createTab produce no diagnostics at all. The listener
     # wiring belongs next to _register_tab.
-    @unittest.expectedFailure
     async def test_created_tabs_get_the_same_logging_as_the_first(self):
         browser, page = make_browser()
         await browser._dispatch('createTab', None, {})
@@ -1578,17 +1632,160 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_before_start_is_harmless(self):
         await HeadlessBrowser().stop()
 
-    # DEFECT (low): headless_backend.py:81-86 - stop() leaves _page and
+    # Regression test. Was: headless_backend.py:81-86 - stop() leaves _page and
     # _tabs populated, so is_ready() still reports True and server.py will
     # dispatch commands onto a closed browser, failing deep inside Playwright
     # instead of saying the browser is gone.
-    @unittest.expectedFailure
     async def test_browser_is_not_ready_after_stop(self):
         self._stub_playwright()
         browser = HeadlessBrowser()
         await browser.start()
         await browser.stop()
         self.assertFalse(browser.is_ready())
+
+
+# ==========================================================================
+# 9. Argument coercion
+#
+# Regression tests. Was: every flag in this module was read with a bare
+# `args.get(...)` truthiness test and every number with int()/float() or
+# nothing at all. MCP clients hand-write JSON, so "false" arrived where a
+# boolean was expected and was read as TRUE - the same bug that was
+# confirmed live on the extension side (capture_bodies: "false" started a
+# capture), which is why parseFlag() exists in background.js. Numbers
+# arrived as strings and "15000" / 1000 raised TypeError from inside the
+# waitAndAct poll loop.
+# ==========================================================================
+
+class FlagParsingTests(unittest.TestCase):
+
+    def test_the_words_a_flag_accepts_match_the_extensions(self):
+        for value in (True, 'true', 'True', ' TRUE ', '1', 'yes', 'on', 1, 2.5):
+            with self.subTest(value=value):
+                self.assertIs(headless_backend.parse_flag(value, False), True)
+        for value in (False, 'false', 'False', '0', 'no', 'off', 0, 0.0):
+            with self.subTest(value=value):
+                self.assertIs(headless_backend.parse_flag(value, True), False)
+
+    def test_an_unrecognised_flag_value_keeps_the_default(self):
+        for value in (None, '', 'maybe', {}, [], object()):
+            with self.subTest(value=value):
+                self.assertIs(headless_backend.parse_flag(value, True), True)
+                self.assertIs(headless_backend.parse_flag(value, False), False)
+
+    def test_numbers_may_arrive_as_strings(self):
+        self.assertEqual(headless_backend.parse_number('15000', 1), 15000.0)
+        self.assertEqual(headless_backend.parse_number(' 2.5 ', 1), 2.5)
+        self.assertEqual(headless_backend.parse_int('250', 1), 250)
+
+    def test_unusable_numbers_keep_the_default(self):
+        """inf and nan would become Playwright timeouts, loop increments and
+        JS literals, which is worse than a sane default."""
+        for value in (None, '', 'soon', 'inf', '-inf', 'nan', {}, [1], True):
+            with self.subTest(value=value):
+                self.assertEqual(headless_backend.parse_number(value, 7.0), 7.0)
+                self.assertEqual(headless_backend.parse_int(value, 7), 7)
+
+
+class ArgumentCoercionTests(unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self):
+        self.shots_dir = headless_backend.SCREENSHOTS_DIR
+        before = set(self.shots_dir.iterdir())
+        self.addCleanup(self._clean_up, before)
+
+    def _clean_up(self, before):
+        for path in set(self.shots_dir.iterdir()) - before:
+            if path.is_file():
+                path.unlink()
+
+    async def test_full_page_false_as_a_string_is_not_a_full_page_capture(self):
+        browser, page = make_browser()
+        await browser._dispatch('screenshot', None,
+                                {'filename': 'a.png', 'full_page': 'false'})
+        self.assertIs(calls_named(page, 'screenshot')[0][2], False)
+
+    async def test_full_page_true_as_a_string_is_a_full_page_capture(self):
+        browser, page = make_browser()
+        await browser._dispatch('screenshot', None,
+                                {'filename': 'b.png', 'full_page': 'true'})
+        self.assertIs(calls_named(page, 'screenshot')[0][2], True)
+
+    async def test_detect_only_false_as_a_string_still_hands_off_to_a_human(self):
+        browser, page = make_browser()
+        page.evaluate_handler = lambda script: {
+            'present': True, 'widgets': [{'type': 'hcaptcha', 'solved': False}]}
+        result = await browser._dispatch('solveCaptcha', None,
+                                         {'detect_only': 'false'})
+        self.assertFalse(result['success'])
+        self.assertTrue(result['needs_human'])
+
+    async def test_press_key_modifier_false_as_a_string_is_not_held(self):
+        browser, page = make_browser(elements={'#q': Element()})
+        result = await browser._dispatch('pressKey', None, {
+            'selector': '#q', 'key': 'Enter', 'ctrl': 'false',
+            'shift': 'off', 'alt': 0, 'meta': None})
+        self.assertEqual(result['key'], 'Enter')
+
+    async def test_press_key_modifier_true_as_a_string_is_held(self):
+        browser, page = make_browser(elements={'#q': Element()})
+        result = await browser._dispatch('pressKey', None, {
+            'selector': '#q', 'key': 'Enter', 'ctrl': 'true'})
+        self.assertEqual(result['key'], 'Control+Enter')
+
+    async def test_string_timeouts_do_not_raise_a_type_error(self):
+        browser, page = make_browser()
+        browser._tabs[1].evaluate_handler = lambda script: False
+        result = await browser.execute('waitAndAct', None, {
+            'condition': 'c', 'action_script': 'a',
+            'poll_interval_ms': '10', 'timeout_ms': '20'})
+        self.assertFalse(result['success'])
+        self.assertNotIn('TypeError', result['error'])
+        self.assertIn('20ms', result['error'])
+
+    async def test_string_wait_timeouts_reach_playwright_as_numbers(self):
+        browser, page = make_browser()
+        await browser._dispatch('waitForElement', None,
+                                {'selector': '#x', 'timeout': '500'})
+        self.assertEqual(calls_named(page, 'wait_for_selector')[0][2],
+                         {'timeout': 500.0})
+
+    async def test_eval_chain_stop_on_error_false_as_a_string_continues(self):
+        browser, page = make_browser()
+        page.evaluate_handler = chain_handler(page,
+                                              [RuntimeError('boom'), 'second'])
+        result = await browser._dispatch('evalChain', None, {'steps': [
+            {'script': 'nope()', 'stop_on_error': 'false'},
+            {'script': '2'}]})
+        self.assertEqual(len(result['steps']), 2)
+        self.assertEqual(result['steps'][1]['result'], 'second')
+
+    async def test_observer_flags_false_as_strings_reach_the_script_as_false(self):
+        browser, page = make_browser()
+        page.evaluate_handler = lambda script: 'observer installed on BODY'
+        await browser._dispatch('injectObserver', None, {
+            'observe_attributes': 'false', 'observe_child_list': '0',
+            'observe_subtree': 'no'})
+        script = page.evaluate_scripts[0]
+        self.assertIn('attributes: false', script)
+        self.assertIn('childList: false', script)
+        self.assertIn('subtree: false', script)
+
+    async def test_string_max_length_truncates(self):
+        browser, page = make_browser(elements={'#p': Element(value='x' * 50)})
+        result = await browser._dispatch('getText', None,
+                                         {'selector': '#p',
+                                          'max_length': '10'})
+        self.assertEqual(len(result['text']), 10)
+
+    async def test_string_element_limit_is_honoured(self):
+        browser, page = make_browser()
+        page.query_results = [FakeElementHandle(tag='a') for _ in range(10)]
+        result = await browser._dispatch('getElements', None, {'limit': '3'})
+        self.assertEqual(len(result['elements']), 3)
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['totalMatched'], 10)
+
 
 if __name__ == '__main__':
     unittest.main()
