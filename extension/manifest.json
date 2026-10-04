@@ -53,7 +53,7 @@
 
   "browser_specific_settings": {
     "gecko": {
-      "id": "{31c66d81-5dcd-4210-97ab-098400466392}",
+      "id": "{efac2f8e-6c88-4c94-a050-f45cd0298aeb}",
       "strict_min_version": "78.0",
       "update_url": "https://github.com/acornelissen/ClaudeCodeBrowser/releases/latest/download/updates.json"
     }

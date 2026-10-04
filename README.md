@@ -281,6 +281,15 @@ Mozilla without a public listing:
 4. Install the signed `.xpi` in Firefox: `about:addons` → gear →
    *Install Add-on From File*.
 
+> **Never delete the add-on on AMO.** AMO keeps a deleted add-on's ID on a
+> denylist, so it can never be signed under again — a later `web-ext sign`
+> fails with `Conflict: Duplicate add-on ID found.` and the only way forward
+> is a brand-new ID, which means a new add-on identity plus matching updates
+> to `allowed_extensions` everywhere. Builds you already signed keep working
+> (Firefox verifies the signature against Mozilla's CA offline, and
+> `update_url` points at GitHub, not AMO), but you cannot ship another
+> version under that ID. Leave unwanted add-ons in place instead.
+>
 > **Second and later versions may need the Developer Hub.** `web-ext sign`
 > creates a new add-on happily, but adding a *version* to an existing unlisted
 > add-on requires addressing it by GUID — and AMO answers 404 for every
