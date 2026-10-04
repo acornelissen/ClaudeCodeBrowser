@@ -34,5 +34,11 @@ screenshots/
 # Local mise config (AMO signing credentials, tokens)
 mise.local.toml
 
+# Per-session workflow scratch, by the same *.local.* convention as the line
+# above. ralph-loop.local.md is one plugin's bookkeeping - it carries a
+# session id and an iteration counter - and it reached a commit here once via
+# `git add -A`, which is why it is named explicitly.
+.claude/*.local.*
+
 # web-ext build state (AMO upload UUID)
 extension/.amo-upload-uuid
