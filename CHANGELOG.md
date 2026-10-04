@@ -197,6 +197,25 @@ them is part of releasing, and that is being held for approval.
 - `requestBody.error` and a raw chunk carrying a `file` were both dropped, so
   a body Firefox could not read and a file upload each logged as a request
   with no body at all.
+- `tab_id: "1"` reached the headless backend uncoerced, which keys its tab map
+  by integer, so it reported "No headless tab with id 1" for a tab that was
+  open.
+- `browser_get_tabs(limit=12.7)` silently gave you the 50-tab default — a
+  wider reach than asked for, from the tool whose purpose is the cap — and
+  `limit: Infinity`, which `json.loads` accepts, propagated out as a
+  traceback instead of a result.
+- Credential redaction was *over*-reaching as well as under-reaching: `auth`
+  matched `author`, so every captured API response had its whole author
+  object replaced with `***`, and `session`, `pass` and `otp` hid
+  `sessionCount`, `bypassCache` and `notPublished`. A log that eats the
+  fields you were reading is a log you turn the scrubber off for. The short
+  entries are anchored now, losing no credential name, and the extension's
+  two copies of the list are pinned identical by test — their drift was the
+  reason a field could read `***` in the network log and plaintext from
+  `browser_get_value`.
+- "Take Screenshot for Claude" in the context menu has never done anything.
+  It posted an action the native host has no handler for, so the message fell
+  through to `/browser/command`.
 
 ### Changed
 
@@ -221,10 +240,15 @@ them is part of releasing, and that is being held for approval.
 
 ### Tests
 
+The suite cleared two `CLAUDE_BROWSER_*` variables, so it gave a different
+answer depending on what you had exported — and `CLAUDE_BROWSER_HEADLESS`
+*hung* it, waiting out the headless startup timeout for a browser that was
+never coming. All of them are cleared now.
+
 `headless_backend.py`, `agent/browser_agent.py`, `getText`,
 `getComputedStyles`, `_save_screenshot`, the native host's framing and the
-attended human-approval branch had no tests at all. The suite is now 352
-Python tests plus 146 JavaScript ones, with every fix above shown to fail
+attended human-approval branch had no tests at all. The suite is now 364
+Python tests plus 171 JavaScript ones, with every fix above shown to fail
 against the source it replaced. Several fixtures were found to be hiding the
 bugs they were meant to cover: `attachShadow()` discarded its argument, so
 changing the approval prompt's shadow root from `closed` to `open` — which
