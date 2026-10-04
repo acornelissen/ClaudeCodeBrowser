@@ -865,28 +865,44 @@ class RequestShapeTests(AgentTestCase):
         self.assertEqual((args.get('x'), args.get('y')), (0, 0))
 
     # Regression test for defect D16.
-    def test_reload_localhost_honours_port_zero_or_rejects_it(self):
+    def test_reload_localhost_refuses_port_zero(self):
         """reload_localhost(port=0) tested the port with 'if port:', so 0
         silently became "reload every localhost tab" instead of the one port
         asked for. --reload-localhost 0 reaches this.
 
-        Either answer is acceptable, as the name says, so long as 0 does not
-        widen the request. It refuses: 0 is not a port anything listens on,
-        and saying so beats reloading nothing or everything."""
+        An earlier version of this test accepted either refusing 0 or sending
+        it, which meant it pinned nothing: both branches passed, so it could
+        not have caught a change of mind in either direction. The behaviour is
+        decided - 0 is not a port anything listens on, so it is refused with a
+        message - and that is what is asserted."""
         self.serve_ok()
         agent = browser_agent.BrowserAutomationAgent()
+
         result = agent.reload_localhost(port=0)
 
-        if not self.requests:
-            self.assertFalse(result.get('success'),
-                             'refusing port 0 must say it refused')
-            self.assertIn('port', result['error'].lower())
-            return
+        self.assertEqual(self.requests, [],
+                         'port 0 must not reach the server at all')
+        self.assertFalse(result.get('success'))
+        self.assertIn('port', result['error'].lower())
+
+    def test_reload_localhost_refuses_a_port_outside_the_range(self):
+        for port in (-1, 65536, 99999):
+            with self.subTest(port=port):
+                self.requests.clear()
+                self.serve_ok()
+                result = browser_agent.BrowserAutomationAgent().reload_localhost(
+                    port=port)
+                self.assertFalse(result.get('success'), port)
+                self.assertEqual(self.requests, [])
+
+    def test_reload_localhost_sends_a_real_port_as_one_url(self):
+        """The companion assertion: a usable port must still narrow the
+        request to that port rather than falling back to a pattern."""
+        self.serve_ok()
+        browser_agent.BrowserAutomationAgent().reload_localhost(port=5173)
         args = self.only_request().arguments
-        self.assertNotIn(
-            'url_pattern', args,
-            'port 0 was dropped and every localhost tab was reloaded: %r'
-            % args)
+        self.assertNotIn('url_pattern', args)
+        self.assertIn('5173', str(args.get('url', '')))
 
 
 # --------------------------------------------------------------------------
