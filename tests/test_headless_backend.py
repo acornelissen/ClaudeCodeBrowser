@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'mcp-server'))
 
 import headless_backend  # noqa: E402
+import safety  # noqa: E402
 from headless_backend import HeadlessBrowser  # noqa: E402
 
 # The backend logs every refused or failed command at error level; these
@@ -1072,6 +1073,25 @@ class ScreenshotTests(unittest.IsolatedAsyncioTestCase):
         for path in set(self.shots_dir.iterdir()) - before:
             if path.is_file():
                 path.unlink()
+
+    async def test_the_retention_policy_runs_in_headless_mode_too(self):
+        """Playwright writes the file directly, bypassing server.py's
+        _save_screenshot, so retention did not exist in headless mode: a
+        headless run kept every screenshot it ever took."""
+        import os, time
+        marker = self.shots_dir / safety.OWNED_DIR_MARKER
+        stale = self.shots_dir / 'ancient.png'
+        stale.write_bytes(b'\x89PNG\r\n\x1a\n')
+        old = time.time() - 400 * 86400
+        os.utime(stale, (old, old))
+        self.assertTrue(marker.is_file(),
+                        'the default directory must be marked as ours')
+
+        browser, page = make_browser()
+        await browser._dispatch('screenshot', None, {'filename': 'new.png'})
+
+        self.assertFalse(stale.exists(),
+                         'a 400-day-old screenshot must be pruned')
 
     async def test_path_traversal_in_filename_is_stripped(self):
         for hostile in ('../../../../tmp/evil.png',

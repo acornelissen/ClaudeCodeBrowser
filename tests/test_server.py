@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 # Point HOME at a throwaway directory before importing the server: it creates
@@ -163,6 +164,39 @@ class CommandQueueTests(unittest.TestCase):
         self.assertGreater(server.COMMAND_QUEUE_TTL, 200)
 
 
+class RetentionConfigTests(unittest.TestCase):
+    """These two variables are read at import time and the native host runs
+    the server with stderr=DEVNULL, so a bad value used to be a server that
+    never starts with the traceback thrown away - the user saw only restart
+    backoff."""
+
+    def _read(self, raw, default, cast):
+        with unittest.mock.patch.dict(os.environ, {'CCB_TEST_NUM': raw}):
+            return safety._env_number('CCB_TEST_NUM', default, cast)
+
+    def test_an_unparseable_value_falls_back_to_the_default(self):
+        for raw in ('7d', 'forever', '', 'one week'):
+            with self.subTest(value=raw):
+                self.assertEqual(self._read(raw, 7.0, float), 7.0)
+
+    def test_a_fractional_file_cap_falls_back(self):
+        self.assertEqual(self._read('0.5', 500, int), 500)
+
+    def test_a_negative_value_falls_back(self):
+        self.assertEqual(self._read('-1', 500, int), 500)
+
+    def test_a_valid_value_is_honoured(self):
+        self.assertEqual(self._read('3', 500, int), 3)
+        self.assertEqual(self._read('0', 500, int), 0,
+                         'zero disables the cap and must be honoured')
+
+    def test_an_unset_variable_uses_the_default(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('CCB_TEST_NUM', None)
+            self.assertEqual(safety._env_number('CCB_TEST_NUM', 7.0, float),
+                             7.0)
+
+
 class ScreenshotPruningTests(unittest.TestCase):
     """Screenshots hold whatever was on screen and nothing ever removed them,
     making the directory the longest-lived record of the user's browsing in
@@ -171,6 +205,9 @@ class ScreenshotPruningTests(unittest.TestCase):
     def setUp(self):
         import tempfile
         self.dir = Path(tempfile.mkdtemp(prefix='ccb-shots-'))
+        # Pruning only touches a directory this project created, so the tests
+        # that expect deletion have to say the directory is ours.
+        (self.dir / safety.OWNED_DIR_MARKER).touch()
 
     def _shot(self, name, age_days=0):
         import os, time
@@ -220,6 +257,62 @@ class ScreenshotPruningTests(unittest.TestCase):
     def test_a_missing_directory_does_not_raise(self):
         result = safety.prune_screenshots(self.dir / 'does-not-exist')
         self.assertEqual(result, {'removed_age': 0, 'removed_count': 0})
+
+    def test_a_directory_we_did_not_create_is_never_pruned(self):
+        """CLAUDE_BROWSER_SCREENSHOTS_DIR can point at ~/Pictures or a repo's
+        docs/screenshots. Pruning every *.png older than the retention window
+        there would delete the user's own files on the first screenshot, which
+        is a worse failure than the retention it closes."""
+        theirs = self.dir / 'not-ours'
+        theirs.mkdir()
+        holiday = theirs / 'holiday.png'
+        holiday.write_bytes(b'\x89PNG\r\n\x1a\n')
+        import os, time
+        old = time.time() - 400 * 86400
+        os.utime(holiday, (old, old))
+
+        result = safety.prune_screenshots(theirs)
+
+        self.assertTrue(holiday.exists(),
+                        "a 400-day-old PNG in a directory we did not create "
+                        "must survive")
+        self.assertEqual(result, {'removed_age': 0, 'removed_count': 0})
+
+    def test_the_marker_is_written_for_the_default_directory(self):
+        with unittest.mock.patch.dict(
+                os.environ, {'CLAUDE_BROWSER_SCREENSHOTS_DIR': ''},
+                clear=False):
+            os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+            resolved = safety.resolve_screenshots_dir()
+        self.assertTrue((resolved / safety.OWNED_DIR_MARKER).exists(),
+                        'our own directory must be marked as prunable')
+
+    def test_an_override_at_a_fresh_path_is_ours(self):
+        fresh = self.dir / 'fresh-override'
+        with unittest.mock.patch.dict(
+                os.environ,
+                {'CLAUDE_BROWSER_SCREENSHOTS_DIR': str(fresh)}):
+            resolved = safety.resolve_screenshots_dir()
+        self.assertTrue((resolved / safety.OWNED_DIR_MARKER).exists(),
+                        'a directory we created is ours to prune')
+
+    def test_an_override_at_an_existing_path_is_not_ours(self):
+        theirs = self.dir / 'pictures'
+        theirs.mkdir()
+        with unittest.mock.patch.dict(
+                os.environ,
+                {'CLAUDE_BROWSER_SCREENSHOTS_DIR': str(theirs)}):
+            resolved = safety.resolve_screenshots_dir()
+        self.assertFalse((resolved / safety.OWNED_DIR_MARKER).exists(),
+                         'a directory that already held the user\'s files '
+                         'must not become prunable')
+
+    def test_an_uppercase_extension_is_pruned_too(self):
+        """The filename comes from the caller, so capture.PNG is reachable and
+        was kept forever by a case-sensitive glob."""
+        stale = self._shot('CAPTURE.PNG', age_days=30)
+        safety.prune_screenshots(self.dir)
+        self.assertFalse(stale.exists())
 
     def test_non_png_files_are_left_alone(self):
         note = self.dir / 'notes.txt'

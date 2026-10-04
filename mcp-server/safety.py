@@ -190,10 +190,44 @@ _MAX_PENDING_TOKENS = 32
 # save_to_file defaulting to true, and nothing ever removed them. They hold
 # whatever was on screen, so an unbounded pile of them is the longest-lived
 # copy of the user's browsing in the whole project.
-SCREENSHOT_RETENTION_DAYS = float(
-    os.environ.get('CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS', '7'))
-SCREENSHOT_MAX_FILES = int(
-    os.environ.get('CLAUDE_BROWSER_SCREENSHOT_MAX_FILES', '500'))
+def _env_number(name: str, default, cast):
+    """Read a numeric environment variable without being able to kill startup.
+
+    These are read at import time, and the native host launches the server
+    with stderr=DEVNULL, so a bare float()/int() here turned
+    RETENTION_DAYS=7d into a server that never starts and a user who sees
+    only restart backoff with no traceback anywhere.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Ignoring {name}={raw!r}: not a number. "
+                       f"Using {default}.")
+        return default
+    if value < 0:
+        logger.warning(f"Ignoring {name}={raw!r}: negative. "
+                       f"Using {default}.")
+        return default
+    return value
+
+
+SCREENSHOT_RETENTION_DAYS = _env_number(
+    'CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS', 7.0, float)
+SCREENSHOT_MAX_FILES = _env_number(
+    'CLAUDE_BROWSER_SCREENSHOT_MAX_FILES', 500, int)
+
+# Pruning only ever touches a directory this project created, and this file is
+# how it knows. CLAUDE_BROWSER_SCREENSHOTS_DIR can point anywhere - ~/Pictures,
+# ~/Desktop, a repo's docs/screenshots - and the retention pass deletes every
+# *.png older than the window with no way to tell ours from the user's. So an
+# override aimed at an existing directory is never pruned: a privacy feature
+# that silently deletes holiday photographs is a worse bug than the retention
+# it closes. resolve_screenshots_dir() writes the marker for directories it
+# creates; a user who wants an existing directory swept can create it by hand.
+OWNED_DIR_MARKER = '.ccb-screenshots'
 
 
 def prune_screenshots(directory: Path) -> Dict[str, int]:
@@ -206,9 +240,16 @@ def prune_screenshots(directory: Path) -> Dict[str, int]:
     """
     removed_age = 0
     removed_count = 0
+    if not (directory / OWNED_DIR_MARKER).is_file():
+        logger.debug(f"Not pruning {directory}: no {OWNED_DIR_MARKER} marker, "
+                     "so this directory was not created by us")
+        return {'removed_age': 0, 'removed_count': 0}
     try:
+        # Case-folded, not glob('*.png'): the filename comes from the caller,
+        # so capture.PNG is reachable and was kept for ever.
         shots = sorted(
-            (p for p in directory.glob('*.png') if p.is_file()),
+            (p for p in directory.iterdir()
+             if p.suffix.lower() == '.png' and p.is_file()),
             key=lambda p: p.stat().st_mtime)
     except OSError as e:
         logger.warning(f"Could not list screenshots for pruning: {e}")
@@ -243,6 +284,20 @@ def prune_screenshots(directory: Path) -> Dict[str, int]:
     return {'removed_age': removed_age, 'removed_count': removed_count}
 
 
+def _mark_as_ours(path: Path) -> None:
+    """Record that this project created the directory, so prune may run."""
+    marker = path / OWNED_DIR_MARKER
+    if marker.exists():
+        return
+    try:
+        marker.write_text(
+            'Created by ClaudeCodeBrowser. Its presence allows the retention '
+            'policy to delete *.png files in this directory. Remove it to '
+            'keep screenshots indefinitely.\n')
+    except OSError as e:
+        logger.warning(f"Could not mark {path} as prunable: {e}")
+
+
 def resolve_screenshots_dir() -> Path:
     """Return the directory screenshots are written to, creating it if needed.
 
@@ -250,16 +305,22 @@ def resolve_screenshots_dir() -> Path:
     logged-in dashboard — so the default lives in the user's own directory with
     0700 permissions rather than a world-readable shared /tmp. An explicit
     CLAUDE_BROWSER_SCREENSHOTS_DIR is honoured as given: the location is then
-    the user's choice and its permissions are left alone.
+    the user's choice and its permissions are left alone. A directory this
+    function creates is marked as ours so retention can prune it; one that
+    already existed is not, because its other contents are not ours to delete.
     """
     override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
     if override:
         path = Path(override).expanduser()
+        existed = path.is_dir()
         path.mkdir(parents=True, exist_ok=True)
+        if not existed:
+            _mark_as_ours(path)
         return path
 
     path = Path.home() / '.claudecodebrowser' / 'screenshots'
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _mark_as_ours(path)
     try:
         # mkdir's mode only applies on creation; tighten an existing directory
         # left behind by an earlier version.

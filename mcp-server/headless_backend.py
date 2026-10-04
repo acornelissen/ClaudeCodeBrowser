@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from safety import resolve_screenshots_dir
+from safety import prune_screenshots, resolve_screenshots_dir
 
 logger = logging.getLogger('ClaudeCodeBrowser.Headless')
 
@@ -250,6 +250,10 @@ class HeadlessBrowser:
             filepath = SCREENSHOTS_DIR / filename
             await page.screenshot(path=str(filepath), full_page=args.get('full_page', False))
             data = filepath.read_bytes()
+            # The headless path writes through Playwright rather than
+            # server.py's _save_screenshot, so without this the retention
+            # policy simply did not exist in headless mode.
+            prune_screenshots(SCREENSHOTS_DIR)
             return {
                 'success': True,
                 'filepath': str(filepath),
