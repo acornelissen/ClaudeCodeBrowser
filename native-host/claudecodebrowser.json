@@ -4,6 +4,6 @@
   "path": "/ABSOLUTE/PATH/TO/HOME/.claudecodebrowser/native-host/claudecodebrowser_host.py",
   "type": "stdio",
   "allowed_extensions": [
-    "claudecodebrowser@ligandal.com"
+    "{31c66d81-5dcd-4210-97ab-098400466392}"
   ]
 }

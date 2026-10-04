@@ -33,3 +33,6 @@ screenshots/
 
 # Local mise config (AMO signing credentials, tokens)
 mise.local.toml
+
+# web-ext build state (AMO upload UUID)
+extension/.amo-upload-uuid

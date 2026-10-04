@@ -80,12 +80,23 @@ Write-Host "[ok] Native host wrapper created: $HostBat"
 # --- Native messaging manifest + registry key ---------------------------
 
 $ManifestPath = Join-Path $InstallDir "native-host\claudecodebrowser.json"
+
+# Read the extension ID from the manifest rather than repeating it here.
+# Firefox only talks to the native host if this list matches the ID exactly,
+# and a copy that drifts out of sync breaks the bridge silently.
+$ExtManifest = Get-Content (Join-Path $RepoRoot "extension\manifest.json") -Raw | ConvertFrom-Json
+$ExtId = $ExtManifest.browser_specific_settings.gecko.id
+if (-not $ExtId) {
+    Write-Host "Error: could not read the extension ID from extension\manifest.json"
+    exit 1
+}
+
 $Manifest = @{
     name = "claudecodebrowser"
     description = "ClaudeCodeBrowser Native Messaging Host"
     path = $HostBat
     type = "stdio"
-    allowed_extensions = @("claudecodebrowser@ligandal.com")
+    allowed_extensions = @($ExtId)
 }
 $Manifest | ConvertTo-Json | Set-Content -Path $ManifestPath -Encoding UTF8
 

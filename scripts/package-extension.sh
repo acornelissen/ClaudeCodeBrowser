@@ -82,8 +82,22 @@ if [ "$SIGN" = "1" ]; then
     echo "  2. Upload BOTH assets: $XPI  and  $DIST/updates.json"
     echo "  Installed copies then update within ~24h (or via about:addons > Check for Updates)."
 else
+    # Refuse to clobber a signed build with an unsigned one. Both land at the
+    # same path, and publish-release.sh uploads that path — so a stray
+    # unsigned rebuild would otherwise ship an unsigned .xpi that nobody can
+    # install permanently.
+    if [ -f "$XPI" ] && unzip -l "$XPI" 2>/dev/null | grep -q 'META-INF/mozilla.rsa'; then
+        echo "Error: $XPI is a SIGNED build. Refusing to overwrite it with an" >&2
+        echo "unsigned one. Delete it first if that is really what you want:" >&2
+        echo "  rm '$XPI'" >&2
+        exit 1
+    fi
+
     # Plain zip -> .xpi. The archive root must be the manifest, not a folder.
-    ( cd "$SRC" && zip -r -FS "$XPI" . -x '*.DS_Store' > /dev/null )
+    # Exclude build state and editor droppings; web-ext already skips dotfiles
+    # when signing, so the two paths produce the same archive contents.
+    ( cd "$SRC" && zip -r -FS "$XPI" . \
+        -x '*.DS_Store' -x '.amo-upload-uuid' -x '*/.*' > /dev/null )
     echo "Unsigned package: $XPI"
     echo ""
     echo "To load it: Firefox -> about:debugging -> This Firefox ->"

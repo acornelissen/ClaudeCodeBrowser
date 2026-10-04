@@ -100,6 +100,15 @@ WRAPEOF
     NATIVE_HOST_PATH="$INSTALL_DIR/native-host/run_host.sh"
 fi
 
+# Read the extension ID from the manifest rather than repeating it here.
+# Firefox only talks to the native host if this list matches the ID exactly,
+# and a copy that drifts out of sync breaks the bridge silently.
+EXT_ID=$(python3 -c "import json; print(json.load(open('$SCRIPT_DIR/extension/manifest.json'))['browser_specific_settings']['gecko']['id'])")
+if [ -z "$EXT_ID" ]; then
+    echo -e "${RED}Error: could not read the extension ID from extension/manifest.json${NC}"
+    exit 1
+fi
+
 cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" << EOF
 {
   "name": "claudecodebrowser",
@@ -107,11 +116,11 @@ cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" << EOF
   "path": "$NATIVE_HOST_PATH",
   "type": "stdio",
   "allowed_extensions": [
-    "claudecodebrowser@ligandal.com"
+    "$EXT_ID"
   ]
 }
 EOF
-echo -e "${GREEN}✓ Firefox native messaging manifest installed${NC}"
+echo -e "${GREEN}✓ Firefox native messaging manifest installed (extension $EXT_ID)${NC}"
 
 # Create convenience scripts
 echo -e "\n${YELLOW}Creating convenience scripts...${NC}"
