@@ -571,6 +571,56 @@ class CredentialHandlingTests(AgentTestCase):
         self.assertIn('NOT submitted', results[-1].get('error', ''))
 
 
+class RedactionListParityTests(unittest.TestCase):
+    """This client cannot import from mcp-server/, so its redaction list is a
+    deliberate mirror of the guard's. It was the copy left behind: `key` and
+    `url` were added to safety.py's list and never here, so browser_press_key
+    printed the key and browser_navigate printed a URL with its token."""
+
+    def _safety_module(self):
+        import importlib.util
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            'ccb_safety_for_parity', root / 'mcp-server' / 'safety.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_mirror_covers_everything_the_guard_redacts(self):
+        guard_args = set(self._safety_module().SENSITIVE_ARGS)
+        missing = guard_args - browser_agent._SENSITIVE_ARGS \
+            - browser_agent._URL_ARGS
+        self.assertEqual(missing, set(),
+                         'safety.py redacts these and this client does not: '
+                         f'{sorted(missing)}')
+
+    def test_a_url_argument_is_reduced_not_printed(self):
+        for raw, secret in (
+            ('https://alice:hunter2@intranet.test/', 'hunter2'),
+            ('https://example.test/reset?token=S3CRET', 'S3CRET'),
+            ('https://sso.test/cb#id_token=eyJhbGci', 'eyJhbGci'),
+        ):
+            with self.subTest(url=raw):
+                out = browser_agent._redact({'url': raw})
+                self.assertNotIn(secret, str(out), out)
+                self.assertIn('test', str(out['url']),
+                              'the host is what a log is read for')
+
+    def test_a_pressed_key_is_not_printed(self):
+        self.assertEqual(browser_agent._redact({'key': 'h'})['key'], '***')
+
+    def test_a_credential_under_a_nested_key_is_masked(self):
+        """The key pass ran only at the top level and inside `element`, so a
+        value the PAGE held - browser_get_elements returns a list of them -
+        was caught only if this client had sent it."""
+        result = {'success': True, 'elements': [
+            {'tag': 'input', 'name': 'pw', 'value': 'PAGE-HELD-SECRET'},
+            {'tag': 'input', 'name': 'email', 'value': 'ada@example.test'},
+        ]}
+        safe = browser_agent._redact_result(result, ())
+        self.assertNotIn('PAGE-HELD-SECRET', json.dumps(safe), safe)
+
+
 # --------------------------------------------------------------------------
 # 3. Selector interpolation into JavaScript
 # --------------------------------------------------------------------------

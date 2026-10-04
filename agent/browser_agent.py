@@ -28,12 +28,24 @@ import urllib.error
 MCP_SERVER_URL = os.environ.get('CLAUDE_BROWSER_URL', 'http://127.0.0.1:8765')
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
-# Argument names whose values must never be logged or retained. The server
-# redacts exactly these from its own logs and from audit.jsonl; this client
+# Argument names whose values must never be logged or retained. This client
 # printed them in the clear to the terminal, which lands in any tee'd session
 # log or agent transcript.
+#
+# This is the THIRD copy of this list in the project, and it was the one left
+# behind: the server and the safety guard now share one definition in
+# safety.py, and `key` and `url` were added there while this copy still had
+# neither. It cannot import from mcp-server/ - this is a standalone client
+# that runs without the server package on the path - so it is a deliberate
+# mirror, and tests/test_browser_agent.py pins it against safety.py's list so
+# the two cannot drift again.
 _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
-                   'action_script', 'condition'}
+                   'action_script', 'condition', 'key'}
+
+# Arguments that are URLs: reduced rather than masked, because which page was
+# acted on is the thing a log is read for, while the userinfo, query and
+# fragment are where a reset token, an SSO code or a password lives.
+_URL_ARGS = {'url'}
 
 _LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
 
@@ -67,14 +79,56 @@ def _sensitive_values(arguments: dict) -> List[str]:
             and len(value) >= _MIN_SCRUB_LEN]
 
 
+def _reduce_url(value):
+    """Keep the scheme, host and path; drop userinfo, query and fragment.
+
+    Mirrors redact_url() in mcp-server/safety.py. A URL in a scheme that is
+    not http(s) is a payload rather than a location, so only its scheme name
+    is kept.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        parts = urllib.parse.urlsplit(value)
+    except ValueError:
+        return '***'
+    if parts.scheme and parts.scheme not in ('http', 'https'):
+        return f'{parts.scheme}:***' if parts.scheme != 'about' else value
+    authority = parts.netloc
+    if '@' in authority:
+        authority = '***@' + authority.rpartition('@')[2]
+    out = urllib.parse.urlunsplit(
+        (parts.scheme, authority, parts.path, '', ''))
+    if parts.query:
+        out += '?***'
+    if parts.fragment:
+        out += '#***'
+    return out
+
+
 def _scrub(value, secrets):
-    """Replace known sent values wherever they appear, at any depth."""
+    """Replace known sent values wherever they appear, at any depth.
+
+    Masks a credential-shaped KEY at any depth as well. The key pass used to
+    run only at the top level and inside `element`, so a value under a nested
+    ordinary key - {'elements': [{'value': ...}]} from browser_get_elements -
+    was caught only by the sent-value scrub, i.e. only if this client had sent
+    it. Anything the page already held was not.
+    """
     if isinstance(value, str):
         for secret in secrets:
             value = value.replace(secret, '***')
         return value
     if isinstance(value, dict):
-        return {k: _scrub(v, secrets) for k, v in value.items()}
+        out = {}
+        for k, v in value.items():
+            if k in _SENSITIVE_ARGS:
+                out[k] = '***'
+            elif k in _URL_ARGS:
+                out[k] = _reduce_url(v)
+            else:
+                out[k] = _scrub(v, secrets)
+        return out
     if isinstance(value, list):
         return [_scrub(v, secrets) for v in value]
     return value
@@ -88,25 +142,23 @@ def _redact_result(result, secrets=()):
     out of everything else - 'error' above all, which the key pass never
     touched and which quotes the arguments back at us verbatim.
     """
-    if not isinstance(result, dict):
-        return _scrub(result, secrets)
-    safe = {}
-    for key, value in result.items():
-        if key in _SENSITIVE_ARGS:
-            safe[key] = '***'
-        elif key == 'element' and isinstance(value, dict):
-            safe[key] = {k: ('***' if k in _SENSITIVE_ARGS
-                             else _scrub(v, secrets))
-                         for k, v in value.items()}
-        else:
-            safe[key] = _scrub(value, secrets)
-    return safe
+    # One pass now: _scrub masks sensitive keys at every depth, so the
+    # top-level and `element` special cases it used to need are gone - and
+    # with them the gap at every other depth.
+    return _scrub(result, secrets)
 
 
 def _redact(arguments: dict) -> dict:
     """A log-safe and history-safe copy of a tool's arguments."""
-    return {k: ('***' if k in _SENSITIVE_ARGS else v)
-            for k, v in (arguments or {}).items()}
+    out = {}
+    for k, v in (arguments or {}).items():
+        if k in _SENSITIVE_ARGS:
+            out[k] = '***'
+        elif k in _URL_ARGS:
+            out[k] = _reduce_url(v)
+        else:
+            out[k] = v
+    return out
 
 
 def _api_headers(url: Optional[str] = None) -> dict:

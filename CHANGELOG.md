@@ -118,6 +118,33 @@ them is part of releasing, and that is being held for approval.
   filed as a screenshot of some other page. The private-tab check
   also fails closed: it returned "not private" whenever the tab could not be
   inspected, which is how a private window's traffic reached the buffer.
+- **Two read paths returned credentials in clear.** `browser_observe_element`
+  reported a mutation's previous value raw, so any page rewriting the `value`
+  *attribute* of a password or one-time-code input handed the old value to the
+  agent — and because that tool counts as observation it is allowed in
+  read-only mode and on a protected site with no confirmation, and the server
+  never attached `allow_password` to it, so the guard was not consulted at
+  all. `browser_scroll_and_capture` returned element text raw while using the
+  same selector list as `browser_get_page_info`, which has always masked. The
+  README's claim that "one function decides this for every read path" was
+  false in exactly these two places, and that sentence is plausibly *why*
+  per-commit review walked past them twice; it now names the set.
+- **A credential in a URL reached the agent and the audit log.** The scrubber
+  only ever saw request and response *bodies*, so the same `password=hunter2`
+  pair was `***` in a POST body and verbatim in the GET URL beside it, along
+  with a password-reset `?token=`, an OAuth `?code=`, an implicit-flow
+  `#access_token=` and `https://user:pw@host/`. A redirect's `Location` header
+  and the recorded redirect target had the same hole — an OAuth code sat next
+  to a `Set-Cookie` that *was* redacted. Host and path are kept; query and
+  fragment are parsed rather than regexed, since an encoded value can contain
+  `&` and `=`.
+- **`__proto__` exempted a whole captured body from redaction.** Building the
+  scrubbed object with `{}` meant `out["__proto__"] = subtree` invoked the
+  `Object.prototype` setter: the subtree became the prototype, `Object.keys()`
+  came back empty, nothing was marked `***`, and the "return the original
+  bytes when nothing was redacted" optimisation concluded there was nothing to
+  do and returned the body verbatim. One attacker-chosen key name, reachable
+  from any page because `JSON.parse` creates `__proto__` as an own property.
 - **A page could stall the whole extension for minutes.** Moving the body
   scrub before the truncation (so a credential straddling the cut could not
   survive as a fragment) removed the only bound on what the regex passes saw —
@@ -328,6 +355,25 @@ them is part of releasing, and that is being held for approval.
   (and the result says when the cap bit), and an overrunning call is now
   cancelled.
 
+- **`browser_get_console_logs` promised a headless capture that does not
+  exist.** Its description said headless "captures the page console in full";
+  the headless backend has no `getConsoleLogs` action at all, so the call
+  fails with `Unsupported headless action`, and an agent that believed the
+  description read that error as "the page logged nothing". The same false
+  sentence was in the extension's own result note and in a shipped changelog
+  entry. `browser_inject_observer` likewise pointed at
+  `browser_get_console_logs` to read a buffer nothing has ever read: it is
+  `window.__ccb_mutations` in the page, fetched with
+  `browser_execute_script`, and it holds DOM mutations, not console output.
+- The standalone agent client had a **third** copy of the redaction list, and
+  it was the one left behind — `key` and `url` had been added to the shared
+  definition and never to it, so `browser_press_key` printed the key and
+  `browser_navigate` printed a URL with its token. Its key masking also ran
+  only at the top level and inside `element`, so a credential the *page* held
+  under a nested key (`browser_get_elements` returns a list of them) was
+  caught only if the client had sent it. A test now pins the mirror against
+  the shared list.
+
 ### Tests
 
 **Nothing in the suite ever executed the headless credential guard's
@@ -382,8 +428,11 @@ would let the page read it and click its buttons — kept every test green.
 - `filterAttached`, internal bookkeeping, no longer appears in results.
 
 ### Note
-Headless mode (Playwright) captures the page console in full; this limitation
-is specific to attended Firefox.
+Headless mode (Playwright) does not capture the page console either: it does
+not implement `browser_get_console_logs` at all, and the call fails with
+`Unsupported headless action: getConsoleLogs`. *(Corrected after release —
+this entry originally claimed headless captured it in full, which was never
+true. See the Unreleased section.)*
 
 ## [1.7.2]
 

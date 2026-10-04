@@ -258,7 +258,9 @@
             '(source: "page"), and output from the extension\'s own scripts ' +
             'including browser_execute_script (source: "extension"). An empty ' +
             'result does not mean the page logged nothing. Headless mode ' +
-            'captures the page console in full.'
+            'does not implement this action at all: the call fails there ' +
+            'with "Unsupported headless action: getConsoleLogs", which is ' +
+            'an error, not an empty console.'
     };
   }
 
