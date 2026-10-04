@@ -190,6 +190,34 @@ them is part of releasing, and that is being held for approval.
 - `reload_localhost(port=0)` meant "reload every localhost tab" rather than
   the one port asked for, and interactive mode spun forever on a closed
   stdin.
+- A tab argument of `0` meant "no tab" at thirteen call sites, so a request
+  naming that tab acted on whichever tab happened to be in front, and
+  `tab_id: "7"` from a JSON client made `browser.tabs.get` throw inside
+  Firefox.
+- `requestBody.error` and a raw chunk carrying a `file` were both dropped, so
+  a body Firefox could not read and a file upload each logged as a request
+  with no body at all.
+
+### Changed
+
+- **`browser_get_value` on a checkbox or radio returns its boolean state**,
+  not the submit string. It returned `"on"` whether or not the box was
+  ticked, so an agent reading a consent box or a radio group learned nothing;
+  the submit string is still reported alongside as `submitValue`.
+- **`browser_set_value` on a checkbox or `<select>` now errors rather than
+  claiming success.** It assigned `.value` blind and reported `{set: true}`
+  having changed nothing, and `browser_select_option` reported success for an
+  option that does not exist — where a real `<select>` resets to `''`, so the
+  caller believed a choice had been made and the form was submitted empty.
+- **`browser_get_text` returns visible text.** It fell back from `innerText`
+  to `textContent` unconditionally, and `textContent` includes
+  `display:none` content, so a hidden template was returned from a tool whose
+  description promises what is visible. A new `source` field says which was
+  read.
+- `getComputedStyles`' three camelCase defaults (`backgroundColor`,
+  `fontSize`, `fontFamily`) were permanently empty, because
+  `getPropertyValue` takes a CSS property name. Callers may still pass
+  camelCase; the result is keyed by whatever they asked for.
 
 ### Tests
 
