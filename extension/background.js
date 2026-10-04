@@ -32,6 +32,28 @@ const MAX_RECONNECT_DELAY = 30000;     // 30 seconds
 // browser that nobody asked to log pays nothing.
 // ============================================================
 
+// Feature flags arrive over JSON-RPC, HTTP and native messaging, and a client
+// that has not loaded the current schema can coerce a boolean to a string:
+// observed live as include_all_types: "true", which === true rejected, so a
+// documented option silently did nothing. Worse for capture_bodies, where
+// "false" !== false would have captured bodies for a caller who asked for
+// none - a privacy option failing open.
+//
+// This leniency is for FEATURE flags only. The credential override stays
+// strictly === true (see passwordAllowed in content.js): a fail-closed
+// security switch must not be unlocked by any truthy-looking value.
+function parseFlag(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(text)) return true;
+    if (['false', '0', 'no', 'off'].includes(text)) return false;
+  }
+  return fallback;
+}
+
 const MAX_LOG_ENTRIES = 500;
 const MAX_BODY_CHARS = 5000;
 const MAX_PENDING_REQUESTS = 300;
@@ -433,12 +455,12 @@ function detachWebRequestListeners() {
 }
 
 function startNetworkLogging(tabId, options = {}) {
-  if (options.clearExisting) {
+  if (parseFlag(options.clearExisting, false)) {
     networkLogsByTab.delete(tabId);
   }
   loggedTabs.set(tabId, {
-    captureBodies: options.captureBodies !== false,
-    includeAllTypes: options.includeAllTypes === true
+    captureBodies: parseFlag(options.captureBodies, true),
+    includeAllTypes: parseFlag(options.includeAllTypes, false)
   });
   return attachWebRequestListeners();
 }
@@ -519,7 +541,7 @@ function getNetworkLogsFor(tabId, options = {}) {
   if (options.status) {
     logs = logs.filter(log => log.status === options.status);
   }
-  if (options.errorsOnly || options.errors_only) {
+  if (parseFlag(options.errorsOnly, false) || parseFlag(options.errors_only, false)) {
     logs = logs.filter(log => log.error || (log.status && log.status >= 400));
   }
 
@@ -1167,7 +1189,7 @@ async function startLogging(tabId, data = {}) {
     network: {
       capturing: network.attached,
       capturesFetch: network.attached,
-      captureBodies: data.captureBodies !== false,
+      captureBodies: parseFlag(data.captureBodies, true),
       error: network.error
     },
     console: {
@@ -1216,10 +1238,10 @@ async function clearLogs(tabId, data = {}) {
   if (resolved === undefined) {
     return { success: false, error: "No tab to clear logs for" };
   }
-  if (data.network !== false) {
+  if (parseFlag(data.network, true)) {
     clearNetworkLogs(resolved);
   }
-  if (data.console !== false) {
+  if (parseFlag(data.console, true)) {
     await sendToContentScript(resolved, { action: "clearLogs", ...data });
   }
   return { success: true, message: "Logs cleared", tabId: resolved };
@@ -1423,9 +1445,9 @@ async function getAllTabs(options = {}) {
     // both spellings have to be accepted or the options are silently dropped.
     const currentWindowOnlyOpt = options.currentWindowOnly !== undefined
       ? options.currentWindowOnly : options.current_window_only;
-    const currentWindowOnly = currentWindowOnlyOpt !== false;
-    const includeFavicon =
-      (options.includeFavicon === true) || (options.include_favicon === true);
+    const currentWindowOnly = parseFlag(currentWindowOnlyOpt, true);
+    const includeFavicon = parseFlag(options.includeFavicon, false)
+      || parseFlag(options.include_favicon, false);
     const rawPattern = options.urlPattern || options.url_pattern;
     const urlPattern = rawPattern ? new RegExp(rawPattern) : null;
     const limit = Number.isInteger(options.limit) ? options.limit : 50;

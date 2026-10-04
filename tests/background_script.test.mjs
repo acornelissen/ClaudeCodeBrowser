@@ -910,6 +910,68 @@ test('external messages are still refused outright', async () => {
 });
 
 // --------------------------------------------------------------------------
+// Flags arriving as strings. Observed live: the MCP client sent
+// include_all_types: "true", and === true rejected it, so a documented option
+// silently did nothing. capture_bodies: "false" was worse - it would have
+// captured bodies for a caller who asked for none.
+
+test('include_all_types works when it arrives as the string "true"', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', { includeAllTypes: 'true' }, 7);
+
+  fireRequest(webRequest, { requestId: 'img', type: 'image',
+                            url: 'http://stub.test/logo.png' });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs.length, 1,
+    'a string "true" must enable asset logging, as the boolean does');
+  assert.equal(result.logs[0].type, 'image');
+});
+
+test('capture_bodies fails CLOSED when it arrives as the string "false"', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', { captureBodies: 'false' }, 7);
+
+  const body = new TextEncoder().encode('{"password":"hunter2"}');
+  fireRequest(webRequest, { method: 'POST', requestBody: { raw: [{ bytes: body }] } });
+
+  assert.equal(filters.length, 0, 'no response filter should be attached');
+  const result = await command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs[0].requestBody, undefined,
+    'a privacy option must not fail open because it arrived as a string');
+  assert.ok(!JSON.stringify(result).includes('hunter2'));
+});
+
+test('flag parsing accepts the usual spellings and ignores nonsense', async () => {
+  for (const [value, expected] of [
+    [true, 1], ['true', 1], ['TRUE', 1], [' true ', 1], ['1', 1], [1, 1],
+    ['yes', 1], ['on', 1],
+    [false, 0], ['false', 0], ['0', 0], [0, 0], ['no', 0], ['off', 0],
+    // Unparseable values fall back to the default (false here), rather than
+    // being treated as true because they are truthy strings.
+    ['maybe', 0], ['', 0], [null, 0], [undefined, 0],
+  ]) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', { includeAllTypes: value }, 7);
+    fireRequest(webRequest, { requestId: 'i', type: 'image',
+                              url: 'http://stub.test/x.png' });
+    const result = await command('getNetworkLogs', {}, 7);
+    assert.equal(result.logs.length, expected,
+      `includeAllTypes: ${JSON.stringify(value)} should give ${expected} log(s)`);
+  }
+});
+
+test('clear_existing works as a string too', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest);
+  assert.equal((await command('getNetworkLogs', {}, 7)).logs.length, 1);
+
+  await command('startLogging', { clearExisting: 'true' }, 7);
+  assert.equal((await command('getNetworkLogs', {}, 7)).logs.length, 0);
+});
+
+// --------------------------------------------------------------------------
 
 let failed = 0;
 for (const [name, fn] of tests) {
