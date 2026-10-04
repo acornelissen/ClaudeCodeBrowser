@@ -1017,7 +1017,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'status': 'ok',
                 'timestamp': datetime.now().isoformat(),
-                'version': '1.6.0',
+                'version': '1.7.0',
                 'browsers_connected': len(connection_manager.browser_connections)
             })
 
@@ -1749,7 +1749,7 @@ def main():
     mode_label = "HEADLESS (Playwright)" if HEADLESS_MODE else "EXTENSION (Firefox/native-host)"
     print(f"""
 +--------------------------------------------------------------+
-|          ClaudeCodeBrowserX MCP Server v1.6.0                |
+|          ClaudeCodeBrowserX MCP Server v1.7.0                |
 +--------------------------------------------------------------+
 |  Mode:             {mode_label:<40} |
 |  HTTP Server:      http://{HOST}:{HTTP_PORT:<5}                       |

@@ -9,6 +9,49 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.7.0]
+
+Closes three gaps that 1.6.0's notes listed as unfixable. They were not.
+
+### Security
+- **The approval decision left the page entirely.** Even in a closed shadow
+  root, a prompt rendered in the automated page sits in DOM the page owns and
+  can be covered. The Approve/Deny decision now happens in an extension page
+  in its own window (`moz-extension://`), which the page cannot read, restyle
+  or dispatch events into. Only the extension's own pages may answer — a
+  message carrying `sender.tab` is refused, so neither a content script nor
+  another extension can decide one — and closing the window is a denial. The
+  in-page banner survives only as a fallback where no window can be opened,
+  and the result then carries `degraded: true`. Firefox does not support
+  buttons on notifications, so the notification stays an attention-getter.
+- **`browser_execute_script` is refused on protected sites**, not confirmed. A
+  script can read any field, so the credential guard never constrained it, and
+  a `confirm_token` the agent satisfies itself is no control over arbitrary
+  JavaScript. `deny_scripts_on_protected_urls` defaults to true.
+- **`unlisted_domains: "confirm"`** inverts the protected-domain policy, so
+  anything not in `trusted_url_patterns` requires confirmation. The built-in
+  list is ~16 finance, health and government patterns, which left mail, cloud
+  consoles and admin panels unprotected by default. Opt-in: it prompts until
+  the trusted list is right, and prompt fatigue is its own hazard.
+
+### Changed
+- `browser_safety_status` reports whether the credential guard is `enforced`,
+  `enforced_except_scripts` or `advisory`, so an agent can discover the limit
+  rather than assume the guard covers scripts.
+
+### Added
+- 151 tests, up from 141. The background harness's `runtime.onMessage` and
+  `onMessageExternal` were `addListener(){}` black holes, so those handlers
+  were unreachable from any test — including the gate on who may answer an
+  approval and the `onMessageExternal` refusal. Both are now driven.
+
+### Still not fixed, and not fixable here
+- Page text in an LLM's context. The untrusted-content fence narrows it.
+- Two-step confirmation inside one agent's context: both steps are the same
+  party. Only a channel the agent cannot drive is a real second party.
+- The guard reads `~/.claudecodebrowser/safety.json`, which the agent being
+  gated can write. That belongs in the harness permission layer.
+
 ## [1.6.0]
 
 A security and correctness release following a six-dimension audit of the
