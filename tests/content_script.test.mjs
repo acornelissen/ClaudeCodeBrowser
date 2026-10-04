@@ -1007,6 +1007,67 @@ test('set_value on a custom element verifies the value took', async () => {
   assert.match(result.error, /did not take/i);
 });
 
+test('observe_element does not report a credential as a mutation oldValue', async () => {
+  // The observer watches attributes with attributeOldValue and returned
+  // mutation.oldValue verbatim, so any page that rewrites the `value`
+  // ATTRIBUTE of a password or OTP input handed the old value to the agent.
+  // Worse than the other readers: browser_observe_element counts as
+  // observation, so it is allowed in read-only mode and on a protected site
+  // with no confirmation, and the server never attaches allow_password to it.
+  const pw = makeElement('input', { id: 'pw', type: 'password' });
+  const ctx = loadContentScript({ '#pw': pw });
+
+  const started = await ctx.send({ action: 'observeElement', selector: '#pw' });
+  const observer = ctx.observers.at(-1);
+  observer.cb([{ type: 'attributes', target: pw, attributeName: 'value',
+                 oldValue: 'OLD-SECRET-PASSWORD',
+                 addedNodes: [], removedNodes: [] }]);
+
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: started.observerId });
+
+  const dump = JSON.stringify(stopped);
+  assert.ok(!dump.includes('OLD-SECRET-PASSWORD'),
+            `the previous credential leaked through a mutation: ${dump}`);
+  assert.equal(stopped.changes[0].oldValue, '***');
+});
+
+test('observe_element still reports an ordinary attribute change', async () => {
+  const box = makeElement('div', { id: 'box' });
+  const ctx = loadContentScript({ '#box': box });
+
+  const started = await ctx.send({ action: 'observeElement', selector: '#box' });
+  ctx.observers.at(-1).cb([{ type: 'attributes', target: box,
+                             attributeName: 'class', oldValue: 'open',
+                             addedNodes: [], removedNodes: [] }]);
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: started.observerId });
+
+  assert.equal(stopped.changes[0].oldValue, 'open',
+    'masking an ordinary class change would make the tool useless');
+});
+
+test('scroll_and_capture masks a credential field like get_page_info does', async () => {
+  // Both use the same selector list; getPageInfo masked and this did not, so
+  // the same field read *** from one tool and in clear from the other.
+  const ta = makeElement('textarea', { id: 't', name: 'password',
+                                       textContent: 'hunter2-from-textarea' });
+  const otp = Object.assign(
+    makeElement('div', { id: 'otp-code', textContent: '884213' }),
+    { isContentEditable: true });
+  const ctx = loadContentScript({ '__interactive__': [ta, otp] });
+
+  // delay 0 and one scroll: the default is 500ms x 20 scrolls.
+  const result = await ctx.send({ action: 'scrollAndCapture',
+                                  delay: 0, maxScrolls: 1 });
+
+  const dump = JSON.stringify(result);
+  assert.ok(!dump.includes('hunter2-from-textarea'),
+            `a textarea credential leaked: ${dump}`);
+  assert.ok(!dump.includes('884213'),
+            `a contenteditable OTP leaked: ${dump}`);
+});
+
 // --------------------------------------------------------------------------
 // The credential guard, against the markup real pages ship.
 //

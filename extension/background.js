@@ -76,6 +76,13 @@ const REDACTED_HEADERS = new Set([
   "api-key", "auth-token", "x-session-token", "x-access-token"
 ]);
 
+// Headers whose value is a URL, and so can carry a credential in its query
+// string. Scrubbed as URLs rather than blanked, because where a redirect went
+// is the thing you are reading the log for.
+const URL_VALUED_HEADERS = new Set([
+  "location", "content-location", "refresh"
+]);
+
 // Response bodies are only collected for types that are text to begin with.
 const TEXTUAL_CONTENT_TYPE = /^(text\/|application\/(json|javascript|xml|x-www-form-urlencoded)|application\/[^;]*\+json)/i;
 
@@ -227,8 +234,14 @@ function noteRequestFinished(details) {
 function redactHeaderList(headers) {
   const out = {};
   for (const header of headers || []) {
-    const value = REDACTED_HEADERS.has(header.name.toLowerCase())
+    const name = header.name.toLowerCase();
+    const value = REDACTED_HEADERS.has(name)
       ? "***"
+      : URL_VALUED_HEADERS.has(name)
+      // A redirect target carries whatever the next URL carries - an OAuth
+      // `code=` in a Location header sat next to a Set-Cookie that *was*
+      // redacted.
+      ? redactUrlForLog(header.value)
       // A header with only a binaryValue gave undefined for its name.
       : (header.value !== undefined ? header.value : "[binary]");
     // A plain assignment collapsed repeats onto one key, and almost every
@@ -334,7 +347,15 @@ function redactStructure(value, depth = 0) {
     return value.map(item => redactStructure(item, depth + 1));
   }
   if (value && typeof value === "object") {
-    const out = {};
+    // Object.create(null), not {}: `out["__proto__"] = x` on a plain object
+    // invokes the Object.prototype setter, so the subtree became the
+    // prototype rather than an own property. Object.keys() was then empty,
+    // JSON.stringify gave "{}", no *** appeared anywhere - and the branch
+    // below concluded nothing had been redacted and returned the ORIGINAL
+    // bytes. One attacker-chosen key name therefore exempted a whole body
+    // from redaction. JSON.parse does create __proto__ as an own property,
+    // so any page could reach this.
+    const out = Object.create(null);
     for (const key of Object.keys(value)) {
       const child = value[key];
       // A boolean or null is never a credential, whatever the key is called,
@@ -404,7 +425,8 @@ function redactSecretsInBody(text) {
     const trimmed = text.trim();
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
-        const scrubbed = JSON.stringify(redactStructure(JSON.parse(trimmed)));
+        const parsed = JSON.parse(trimmed);
+        const scrubbed = JSON.stringify(redactStructure(parsed));
         // Re-serialising is lossy: JSON.stringify(JSON.parse(x)) turns
         // 12345678901234567890 into 12345678901234567000, 1e400 into null and
         // 1.0 into 1. A Snowflake- or Twitter-style id in a captured body
@@ -413,8 +435,12 @@ function redactSecretsInBody(text) {
         // bytes are both safe and exact. When something WAS removed the body
         // is rewritten and a large id may lose precision - the *** says so,
         // and redacting a credential is worth more than an exact id.
-        if (scrubbed.includes('***') ||
-            scrubbed.includes('[nested too deep; withheld]')) {
+        // Compared against a re-serialisation of the SAME parse, so any
+        // difference at all forces the rebuilt text. Searching the output for
+        // "***" asked the wrong question: a redaction that loses a value
+        // without leaving a marker - which is what the __proto__ case did -
+        // looked like no redaction at all.
+        if (scrubbed !== JSON.stringify(parsed)) {
           return scrubbed;
         }
         return text;
@@ -425,6 +451,71 @@ function redactSecretsInBody(text) {
     return redactTextPasses(text);
   } catch (e) {
     return "[redaction failed; body withheld]";
+  }
+}
+
+// A URL safe to put in the network log.
+//
+// The scrubber only ever saw request and response BODIES, so the same
+// `password=hunter2` pair was *** in a POST body and verbatim in the GET URL
+// beside it - along with a password-reset `?token=`, an OAuth `?code=` and
+// `https://user:pw@host/`. This file's own rationale for scrubbing bodies
+// ("the header allowlist is worthless if the body that mints the token is
+// logged verbatim one request earlier") applies word for word to a query
+// string. The host and path are the diagnostic value and are kept; userinfo
+// is dropped and the query and fragment go through the same text passes.
+// Query parameters that are credentials in a URL even though their names are
+// not credential-shaped on their own. `code` is an OAuth authorization code
+// and `state` is not secret, so the general name list cannot be used here:
+// `code` would redact every HTTP status code and country code in a body.
+const SECRET_URL_PARAMS = new Set([
+  "code", "id_token", "access_token", "refresh_token", "token", "key",
+  "signature", "sig", "auth", "ticket", "otp", "pin", "password", "pw",
+  "session", "sid", "apikey", "api_key", "secret", "assertion", "jwt"
+]);
+
+function redactSearchParams(search) {
+  // Parsed, not regexed: a value can contain & and = once encoded, and the
+  // text passes cannot tell a parameter boundary from one inside a value.
+  try {
+    const params = new URLSearchParams(search);
+    let touched = false;
+    for (const name of Array.from(params.keys())) {
+      if (SECRET_URL_PARAMS.has(name.toLowerCase())
+          || looksLikeCredentialName(name)) {
+        params.set(name, "***");
+        touched = true;
+      }
+    }
+    return touched ? `?${params.toString()}` : search;
+  } catch (e) {
+    return redactTextPasses(search);
+  }
+}
+
+function redactUrlForLog(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    // Userinfo is never diagnostic and is always a credential.
+    if (parsed.username || parsed.password) {
+      parsed.username = "";
+      parsed.password = "";
+    }
+    if (parsed.search) {
+      parsed.search = redactSearchParams(parsed.search);
+    }
+    if (parsed.hash) {
+      // An implicit-flow access_token arrives in the fragment, not the query.
+      parsed.hash = parsed.hash.startsWith("#")
+        ? "#" + redactSearchParams(parsed.hash.slice(1)).replace(/^\?/, "")
+        : redactTextPasses(parsed.hash);
+    }
+    return parsed.href;
+  } catch (e) {
+    // Not a URL we can parse (about:, moz-extension:, something malformed).
+    // Scrub it as text rather than handing it over unexamined.
+    return redactTextPasses(rawUrl);
   }
 }
 
@@ -525,7 +616,7 @@ const onBeforeRequestListener = (details) => {
   pendingNetworkRequests.set(details.requestId, {
     type: details.type,
     method: details.method,
-    url: details.url,
+    url: redactUrlForLog(details.url),
     tabId: details.tabId,
     requestBody: (options && options.captureBodies)
       ? describeRequestBody(details.requestBody)
@@ -738,7 +829,7 @@ const onBeforeRedirectListener = (details) => {
   const entry = pendingNetworkRequests.get(details.requestId);
   if (!entry) return;
   pendingNetworkRequests.delete(details.requestId);
-  entry.redirectedTo = details.redirectUrl;
+  entry.redirectedTo = redactUrlForLog(details.redirectUrl);
   entry.status = details.statusCode;
   if (entry.startedAt) {
     entry.duration = Date.now() - entry.startedAt;
@@ -1035,7 +1126,18 @@ function handleDisconnect(port) {
 }
 
 function handleNativeMessage(message) {
-  console.log("[ClaudeCodeBrowser] Received from native host:", message);
+  // Shape only, not the payload. This logged the whole command - including
+  // data.text, data.value and data.script - into the Firefox Browser Console,
+  // where it is kept for the session and exportable. Every other stage on
+  // this path redacts (the server's redact_for_log, the guard's audit, the
+  // native host's describe_message, the agent's _redact); this one did not.
+  console.log("[ClaudeCodeBrowser] Received from native host:", {
+    action: message && message.action,
+    requestId: message && message.requestId,
+    tabId: message && message.tabId,
+    dataKeys: message && message.data && typeof message.data === "object"
+      ? Object.keys(message.data) : undefined
+  });
 
   if (message.requestId && pendingRequests.has(message.requestId)) {
     const { resolve, reject } = pendingRequests.get(message.requestId);

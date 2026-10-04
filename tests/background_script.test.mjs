@@ -927,6 +927,95 @@ test('a captured body keeps its numbers exactly when nothing is redacted', async
   }
 });
 
+test('a credential in a request URL is scrubbed like one in a body', async () => {
+  // The scrubber only ever saw bodies, so the same password=hunter2 pair was
+  // *** in a POST body and verbatim in the GET URL beside it.
+  const cases = [
+    ['https://app.test/login?user=alice&password=hunter2', 'hunter2'],
+    ['https://app.test/reset?token=RESET-T0KEN-9f3a', 'RESET-T0KEN-9f3a'],
+    ['https://sso.test/cb?code=AUTHCODE-XYZ&id_token=eyJhbGciOiJ', 'AUTHCODE-XYZ'],
+    ['https://alice:hunter2@intranet.test/', 'hunter2'],
+    ['https://app.test/x#access_token=FRAGMENT-SECRET', 'FRAGMENT-SECRET']
+  ];
+  for (const [url, secret] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, { url });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.ok(!JSON.stringify(entry).includes(secret),
+              `${secret} leaked from ${url}: ${entry.url}`);
+    assert.ok(entry.url.includes('.test'),
+              `the host must stay readable: ${entry.url}`);
+  }
+});
+
+test('an ordinary query string is left readable', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { url: 'https://api.test/items?page=2&sort=name' });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(entry.url.includes('page=2') && entry.url.includes('sort=name'),
+            `an ordinary query was destroyed: ${entry.url}`);
+});
+
+test('a redirect target is scrubbed, and still says where it went', async () => {
+  // An OAuth code in a Location header sat next to a Set-Cookie that *was*
+  // redacted.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    statusCode: 302,
+    responseHeaders: [
+      { name: 'content-type', value: 'text/html' },
+      { name: 'location', value: 'https://app.test/cb?code=AUTHCODE-XYZ' },
+      { name: 'set-cookie', value: 'session=abc' }
+    ]
+  });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  const dump = JSON.stringify(entry);
+  assert.ok(!dump.includes('AUTHCODE-XYZ'), `the redirect code leaked: ${dump}`);
+  assert.ok(String(entry.responseHeaders.location).includes('app.test'),
+            'where the redirect went is the thing you read the log for');
+});
+
+test('a redirect records its target scrubbed', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  webRequest.onBeforeRequest.fire({ requestId: '1', tabId: 7,
+    type: 'xmlhttprequest', method: 'GET', url: 'https://app.test/go',
+    requestBody: null });
+  webRequest.onBeforeRedirect.fire({ requestId: '1', tabId: 7, statusCode: 302,
+    redirectUrl: 'https://app.test/cb?code=AUTHCODE-XYZ' });
+
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(!JSON.stringify(entry).includes('AUTHCODE-XYZ'),
+            `redirectedTo leaked the code: ${entry.redirectedTo}`);
+});
+
+test('an attacker-chosen key name cannot exempt a body from redaction', async () => {
+  // redactStructure built its output with `{}`, so `out["__proto__"] = x`
+  // invoked the Object.prototype setter: the subtree became the prototype,
+  // Object.keys() was empty, JSON.stringify gave "{}", no *** appeared, and
+  // the "nothing was redacted" branch handed back the ORIGINAL bytes. One key
+  // name exempted a whole body, and JSON.parse creates __proto__ as an own
+  // property so any page could reach it.
+  for (const body of [
+    '{"__proto__":{"session_token":"eyJhbGciOiJIUzI1NiJ9.leak.sig"}}',
+    '{"a":1,"__proto__":{"password":"hunter2"}}',
+    '{"constructor":{"password":"hunter2"}}'
+  ]) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      method: 'POST',
+      requestBody: { raw: [{ bytes: new TextEncoder().encode(body) }] }
+    });
+    const logged = (await command('getNetworkLogs', {}, 7)).logs[0].requestBody;
+    assert.ok(!/eyJhbGciOiJIUzI1NiJ9\.leak\.sig|hunter2/.test(logged),
+              `a credential survived under a prototype key: ${logged}`);
+  }
+});
+
 test('an HTML form login does not log the password', async () => {
   // webRequest hands an ordinary <form method=POST> over as requestBody
   // .formData, whose values are ARRAYS. Every fixture here used raw bytes, so

@@ -1360,6 +1360,27 @@
   }
 
   // Set up continuous observation of an element for changes
+  // A mutation record's previous value, masked when it is a credential's.
+  //
+  // This returned mutation.oldValue verbatim, and the observer watches
+  // attributes with attributeOldValue, so any page that rewrites the `value`
+  // ATTRIBUTE of a password or one-time-code input handed the old value
+  // straight to the agent - a server-rendered prefill being cleared by JS, a
+  // framework reflecting value, a "show password" toggle writing it back.
+  // Worse than the other read paths: browser_observe_element is classed as
+  // observation, so it is allowed in read-only mode and on a protected site
+  // with no confirmation, and the server does not attach allow_password to
+  // it, so the guard was never consulted at all.
+  function safeMutationOldValue(mutation) {
+    if (mutation.oldValue == null) return mutation.oldValue;
+    if (mutation.type !== 'attributes') return mutation.oldValue;
+    if (isConcealedValueField(mutation.target)) return '***';
+    // A credential-shaped attribute name on any element, for a component
+    // library that stores the value somewhere other than `value`.
+    if (looksLikeCredentialName(mutation.attributeName)) return '***';
+    return mutation.oldValue;
+  }
+
   function observeElement(options) {
     const targetSelector = options.selector;
     const target = document.querySelector(targetSelector);
@@ -1397,7 +1418,7 @@
           addedNodes: Array.from(mutation.addedNodes).map(n => n.tagName?.toLowerCase() || 'text').filter(Boolean),
           removedNodes: Array.from(mutation.removedNodes).map(n => n.tagName?.toLowerCase() || 'text').filter(Boolean),
           attributeName: mutation.attributeName,
-          oldValue: mutation.oldValue
+          oldValue: safeMutationOldValue(mutation)
         });
 
         // Keep only last 100 changes
@@ -1533,7 +1554,14 @@
 
         elements.push({
           tag: el.tagName.toLowerCase(),
-          text: el.textContent?.trim().substring(0, 50) || null,
+          // safeElementText, not raw textContent. This uses the same selector
+          // list as getPageInfo, which has always masked - so the same
+          // <textarea name="password"> or <div contenteditable id="otp-code">
+          // read *** from browser_get_page_info and in clear from
+          // browser_scroll_and_capture. The README claimed "one function
+          // decides this for every read path"; this was one of two readers
+          // where that was not true.
+          text: safeElementText(el, 50, {}),
           selector: generateSelector(el),
           position: {
             x: Math.round(rect.left + rect.width / 2),
