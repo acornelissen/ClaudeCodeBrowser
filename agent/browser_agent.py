@@ -37,6 +37,12 @@ _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
 
 _LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
 
+# Shortest value worth scrubbing out of a server message. A one- or
+# two-character value is indistinguishable from an ordinary word in prose, and
+# type_text('', press_enter=True) - how this client presses Enter - would match
+# at every position and blank the whole message.
+_MIN_SCRUB_LEN = 3
+
 
 def _is_loopback(url: str) -> bool:
     """True when the URL names this machine."""
@@ -47,19 +53,53 @@ def _is_loopback(url: str) -> bool:
     return host in _LOOPBACK_HOSTS or host == '127.0.0.1'
 
 
-def _redact_result(result):
-    """A log-safe copy of a tool result."""
+def _sensitive_values(arguments: dict) -> List[str]:
+    """The values a call sent that must not come back to us in the clear.
+
+    Redacting by key name cannot protect a free-text message: the extension
+    throws `Element not found with options: ${JSON.stringify(options)}`, so the
+    typed password arrives inside the 'error' string, where no key says
+    "secret". What we do know is what we just sent, so that is what we look
+    for.
+    """
+    return [value for key, value in (arguments or {}).items()
+            if key in _SENSITIVE_ARGS and isinstance(value, str)
+            and len(value) >= _MIN_SCRUB_LEN]
+
+
+def _scrub(value, secrets):
+    """Replace known sent values wherever they appear, at any depth."""
+    if isinstance(value, str):
+        for secret in secrets:
+            value = value.replace(secret, '***')
+        return value
+    if isinstance(value, dict):
+        return {k: _scrub(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(v, secrets) for v in value]
+    return value
+
+
+def _redact_result(result, secrets=()):
+    """A log-safe and history-safe copy of a tool result.
+
+    Two passes, because neither one is enough alone: the keys that are known
+    to carry secrets are masked, and the values this call sent are scrubbed
+    out of everything else - 'error' above all, which the key pass never
+    touched and which quotes the arguments back at us verbatim.
+    """
     if not isinstance(result, dict):
-        return result
+        return _scrub(result, secrets)
     safe = {}
     for key, value in result.items():
         if key in _SENSITIVE_ARGS:
             safe[key] = '***'
         elif key == 'element' and isinstance(value, dict):
-            safe[key] = {k: ('***' if k in _SENSITIVE_ARGS else v)
+            safe[key] = {k: ('***' if k in _SENSITIVE_ARGS
+                             else _scrub(v, secrets))
                          for k, v in value.items()}
         else:
-            safe[key] = value
+            safe[key] = _scrub(value, secrets)
     return safe
 
 
@@ -202,10 +242,13 @@ class BrowserAutomationAgent:
         self.log(f"Calling tool: {tool_name}")
         self.log(f"Arguments: {_redact(kwargs)}")
 
+        secrets = _sensitive_values(kwargs)
+
         result = self._make_request('/mcp/call', {
             'name': tool_name,
             'arguments': kwargs
         })
+        safe_result = _redact_result(result, secrets)
 
         action = BrowserAction(
             action_type=tool_name,
@@ -214,9 +257,12 @@ class BrowserAutomationAgent:
             # the life of the agent, in any repr() and in any traceback that
             # renders the frame.
             parameters=_redact(kwargs),
-            result=_redact_result(result),
+            result=safe_result,
             success=result.get('success', False),
-            error=result.get('error')
+            # The scrubbed copy, not result['error']: the extension's
+            # not-found error quotes the options it was given, so the raw
+            # string holds the password that was just typed.
+            error=safe_result.get('error')
         )
         self.action_history.append(action)
 
@@ -225,9 +271,9 @@ class BrowserAutomationAgent:
                 # Results can carry a credential back: browser_get_value
                 # returns a field's contents, and the extension's
                 # element-not-found error embeds the whole options dict.
-                self.log(f"Success: {_redact_result(result)}")
+                self.log(f"Success: {safe_result}")
             else:
-                self.log(f"Error: {result.get('error')}")
+                self.log(f"Error: {safe_result.get('error')}")
 
         return result
 
@@ -451,6 +497,27 @@ class BrowserAutomationAgent:
         error = result.get('error')
         return isinstance(error, str) and 'not found' in error.lower()
 
+    @staticmethod
+    def _aborted(message: str) -> Dict[str, Any]:
+        """A visible "this sequence stopped here" entry.
+
+        A caller - often an LLM - reads the last entry of a returned list as
+        the outcome, so a sequence that gave up halfway has to say so there
+        rather than ending on whatever the last attempted step reported.
+        """
+        return {'success': False, 'aborted': True, 'error': message}
+
+    @staticmethod
+    def _safe_step(result: Dict[str, Any], sent: str) -> Dict[str, Any]:
+        """A step's result with the value it typed scrubbed out of it.
+
+        The two helpers that type credentials return a list of step results,
+        and a caller prints that list. The extension's not-found error quotes
+        the options it was handed, so the raw result carries the password in
+        its 'error' string.
+        """
+        return _redact_result(result, _sensitive_values({'text': sent}))
+
     def fill_form(self, fields: Dict[str, str], submit: bool = False, submit_selector: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Fill a form with the given field values.
@@ -479,7 +546,20 @@ class BrowserAutomationAgent:
                         and self._looks_like_a_wrong_locator(result)):
                     result = self.type_text(value, placeholder=field, clear=True)
 
-            results.append(result)
+            safe = self._safe_step(result, value)
+            results.append(safe)
+
+            if not result.get('success'):
+                # Stop the sequence. The field is empty, so filling the rest
+                # and then submitting posts a form with a missing value - with
+                # a refused password field that is a real failed login
+                # attempt against the real site, repeatable until the account
+                # locks.
+                results.append(self._aborted(
+                    f'Form fill aborted: "{field}" could not be filled '
+                    f'({safe.get("error") or "refused"}). The remaining '
+                    'fields were skipped and the form was NOT submitted.'))
+                return results
 
         if submit:
             if submit_selector:
@@ -510,7 +590,9 @@ class BrowserAutomationAgent:
         # read as a successful search of nothing.
         typed = self.type_text(query, selector=search_selector, clear=True)
         if not typed.get('success'):
-            return typed
+            # Scrubbed, like the other helpers that return a step's result:
+            # the not-found error quotes the text it was asked to type.
+            return self._safe_step(typed, query)
         return self.type_text('', selector=search_selector, press_enter=True)
 
     def login(self, username: str, password: str,
@@ -519,36 +601,29 @@ class BrowserAutomationAgent:
               submit_selector: Optional[str] = None) -> List[Dict[str, Any]]:
         """Perform a login. Requires allow_password_typing in safety.json.
 
-        This used to type the username, type the password, ignore the result,
-        and then press Enter on the password field - which, with the password
-        step refused by the default policy, submitted the form with a real
-        username and an EMPTY password against the live site, and returned a
-        list whose last element said success. Repeated that way it is an
-        account-lockout generator reported as a success.
+        Every step is checked before the next one runs. Submitting after a
+        refused step is a real failed login attempt against the real site -
+        an empty username with a real password, or a real username with an
+        empty password - and repeated that way it locks the account out. An
+        earlier version checked only the password step, so a refused username
+        was still followed by typing the password and pressing Enter, and the
+        returned list ended on a step that said success.
         """
-        username_result = self.type_text(username, selector=username_selector,
-                                         clear=True)
-        results = [username_result]
-
-        password_result = self.type_text(password, selector=password_selector,
-                                         clear=True)
-        results.append(password_result)
-
-        if not password_result.get('success'):
-            # Do not submit. Credentials are refused by default precisely so
-            # they do not pass through the agent; carrying on would send an
-            # empty password to a real login form.
-            results.append({
-                'success': False,
-                'error': 'Login aborted: the password could not be entered '
-                         f'({password_result.get("error", "refused")}). The form '
-                         'was NOT submitted. Credentials are refused by default '
-                         '- use the browser\'s own password manager, or set '
-                         '"allow_password_typing": true in '
-                         '~/.claudecodebrowser/safety.json.',
-                'aborted': True,
-            })
-            return results
+        results = []
+        for step, text, selector in (('username', username, username_selector),
+                                     ('password', password, password_selector)):
+            result = self.type_text(text, selector=selector, clear=True)
+            safe = self._safe_step(result, text)
+            results.append(safe)
+            if not result.get('success'):
+                results.append(self._aborted(
+                    f'Login aborted: the {step} could not be entered '
+                    f'({safe.get("error") or "refused"}). The form was NOT '
+                    'submitted and no later step ran. Credentials are refused '
+                    "by default - use the browser's own password manager, or "
+                    'set "allow_password_typing": true in '
+                    '~/.claudecodebrowser/safety.json.'))
+                return results
 
         if submit_selector:
             results.append(self.click(selector=submit_selector))
@@ -662,7 +737,12 @@ def interactive_mode(agent: BrowserAutomationAgent):
                     print("Usage: type <text>")
                     continue
                 result = agent.type_text(args)
-                print(json.dumps(result, indent=2))
+                # The not-found error quotes the text it was asked to type, so
+                # printing the result raw echoes a typed credential into the
+                # session transcript.
+                print(json.dumps(
+                    _redact_result(result, _sensitive_values({'text': args})),
+                    indent=2))
 
             elif command == 'scroll':
                 direction = args if args else 'down'
@@ -717,7 +797,9 @@ def interactive_mode(agent: BrowserAutomationAgent):
                     print("Usage: exec <javascript>")
                     continue
                 result = agent.execute_script(args)
-                print(json.dumps(result, indent=2))
+                print(json.dumps(
+                    _redact_result(result, _sensitive_values({'script': args})),
+                    indent=2))
 
             elif command == 'help':
                 print("""
@@ -758,13 +840,22 @@ Available commands:
 
 
 # The commands --command may reach. Anything not named here is not a command,
-# however callable it happens to be.
+# however callable it happens to be. Every name must also be a method that
+# exists: 'get_text' was listed here and is not one, so '--command get_text'
+# answered with an AttributeError traceback.
 COMMAND_METHODS = frozenset({
-    'navigate', 'screenshot', 'click', 'type_text', 'get_text', 'get_page_info',
+    'navigate', 'screenshot', 'click', 'type_text', 'get_page_info',
     'scroll', 'wait_for_element', 'extract_text', 'extract_links',
     'execute_script', 'refresh', 'hard_refresh', 'reload_all',
     'reload_localhost', 'reload_dev_servers', 'search', 'check_server',
 })
+
+# Commands whose single positional argument is sent to the page under a
+# sensitive argument name, so the result may quote it back: the extension's
+# not-found error embeds the options it was given. Printing the result raw
+# puts that on stdout.
+_COMMAND_SENSITIVE_ARG = {'type_text': 'text', 'search': 'text',
+                          'execute_script': 'script'}
 
 
 def main():
@@ -847,16 +938,30 @@ def main():
             print(f"Unknown command: {cmd}")
             print(f"Try one of: {', '.join(sorted(COMMAND_METHODS))}")
         else:
-            method = getattr(agent, cmd)
             try:
+                method = getattr(agent, cmd)
                 result = method(cmd_args) if cmd_args else method()
             except TypeError as e:
                 # login(username, password) called one argument short used to
                 # escape main() as a traceback.
                 print(f"Unknown command: {cmd} does not take those arguments "
                       f"({e}).")
+            except BrowserAgentDenied as e:
+                print(f"{cmd} was refused: {e}")
+            except Exception as e:
+                # TypeError alone was too narrow: 'extract_text div' raises
+                # BrowserAgentDenied on a denial and 'reload_localhost <url>'
+                # raises ValueError from int(), and both reached the user as a
+                # traceback. Name the exception type, so a real bug in here is
+                # still identifiable instead of silently swallowed.
+                print(f"{cmd} failed: {type(e).__name__}: {e}")
             else:
-                print(json.dumps(result, indent=2))
+                # Scrub what we typed out of the printed result, for the same
+                # reason call_tool scrubs it out of its log.
+                sensitive = _COMMAND_SENSITIVE_ARG.get(cmd)
+                secrets = (_sensitive_values({sensitive: cmd_args})
+                           if sensitive else ())
+                print(json.dumps(_redact_result(result, secrets), indent=2))
 
     elif args.interactive:
         if not agent.check_server():
