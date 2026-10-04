@@ -115,9 +115,15 @@ class HeadlessBrowser:
             raise RuntimeError("Headless browser not started")
         return self._page
 
+    # Mirrors isPasswordField in extension/content.js: autocomplete is a
+    # case-insensitive token list, and one-time codes and card fields are
+    # credentials too even though they are not type=password.
     _IS_PASSWORD_JS = (
         "el => el.tagName === 'INPUT' && (el.type === 'password' || "
-        "['current-password','new-password'].includes(el.getAttribute('autocomplete')))"
+        "el.type === 'hidden' || "
+        "(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/)"
+        ".some(t => ['current-password','new-password','one-time-code',"
+        "'cc-number','cc-csc','cc-exp'].includes(t)))"
     )
 
     async def _is_password_field(self, page, selector: str) -> bool:
@@ -127,6 +133,26 @@ class HeadlessBrowser:
         except Exception:
             # Selector didn't resolve; the caller reports its own error.
             return False
+
+    async def _assert_focused_not_password(self, page, args: Dict[str, Any]):
+        """Refuse to type into a focused credential field."""
+        if args.get('allow_password') is True:
+            return
+        try:
+            is_password = await page.evaluate(
+                "() => { const el = document.activeElement; return !!el && "
+                "el.tagName === 'INPUT' && (el.type === 'password' || "
+                "(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/)"
+                ".some(t => ['current-password','new-password','one-time-code',"
+                "'cc-number','cc-csc'].includes(t))); }")
+        except Exception:
+            return
+        if is_password:
+            raise RuntimeError(
+                'Refused: the focused element is a credential field. '
+                'Credentials belong in a password manager, not automated '
+                'typing. Set "allow_password_typing": true in '
+                '~/.claudecodebrowser/safety.json to override.')
 
     async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
         """Refuse to fill password fields unless the safety config allows it."""
@@ -188,6 +214,12 @@ class HeadlessBrowser:
                 await self._assert_not_password(page, selector, args)
                 await page.fill(selector, text)
             else:
+                # Typing into the focused element bypassed the guard entirely:
+                # focus a password field with any other call, then type with
+                # no selector. Attended mode resolves document.activeElement
+                # and still checks it, so this was a headless-only hole that
+                # contradicted the documented "refused in both modes".
+                await self._assert_focused_not_password(page, args)
                 await page.keyboard.type(text)
             return {'success': True}
 
@@ -284,7 +316,7 @@ class HeadlessBrowser:
                     'success': True,
                     'value': '***',
                     'masked': True,
-                    'note': 'Password field value withheld. Set '
+                    'note': 'Credential field value withheld. Set '
                             '"allow_password_typing": true in '
                             '~/.claudecodebrowser/safety.json to read '
                             'credentials through the agent.'
@@ -401,8 +433,14 @@ class HeadlessBrowser:
                 stop_on_error = step.get('stop_on_error', True)
 
                 console_msgs = []
+                listener = None
                 if capture:
-                    page.on('console', lambda m: console_msgs.append({'type': m.type, 'text': m.text}))
+                    # Hold the listener so it can actually be removed: the old
+                    # code removed a fresh lambda, so every step leaked one and
+                    # messages accumulated into earlier steps' arrays.
+                    def listener(m, sink=console_msgs):
+                        sink.append({'type': m.type, 'text': m.text})
+                    page.on('console', listener)
 
                 try:
                     # Inject $prev into execution context
@@ -415,10 +453,20 @@ class HeadlessBrowser:
                     if stop_on_error:
                         break
                 finally:
-                    if capture:
-                        page.remove_listener('console', lambda m: None)
+                    if listener is not None:
+                        try:
+                            page.remove_listener('console', listener)
+                        except Exception:
+                            pass
 
-            return {'success': True, 'steps': results, 'final': prev}
+            # A chain whose first step threw used to report success: true with
+            # the error buried in steps[0], so a caller checking the top-level
+            # flag carried on from a false premise.
+            return {
+                'success': all(step.get('error') is None for step in results),
+                'steps': results,
+                'final': prev,
+            }
 
         elif action == 'waitAndAct':
             condition = args.get('condition', 'true')
@@ -429,11 +477,25 @@ class HeadlessBrowser:
             while elapsed < timeout_ms:
                 try:
                     ready = await page.evaluate(condition)
-                    if ready:
+                except Exception as e:
+                    # Evaluating the condition failed (page navigating, syntax
+                    # error). Report it rather than polling until timeout and
+                    # blaming the condition.
+                    return {'success': False,
+                            'error': f'Condition evaluation failed: {e}',
+                            'elapsed_ms': elapsed}
+                if ready:
+                    # Outside the try, and returned either way: the action is
+                    # allowed to run exactly once. Previously a throwing action
+                    # was swallowed and re-fired on every poll - up to 75 times
+                    # at the default timeout, so a Submit click could repeat.
+                    try:
                         result = await page.evaluate(action_script)
-                        return {'success': True, 'result': result, 'elapsed_ms': elapsed}
-                except Exception:
-                    pass
+                    except Exception as e:
+                        return {'success': False,
+                                'error': f'Action failed: {e}',
+                                'elapsed_ms': elapsed}
+                    return {'success': True, 'result': result, 'elapsed_ms': elapsed}
                 await asyncio.sleep(poll_ms / 1000)
                 elapsed += poll_ms
             return {'success': False, 'error': f'Condition not met within {timeout_ms}ms'}

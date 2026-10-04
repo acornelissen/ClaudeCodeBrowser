@@ -8,14 +8,17 @@ browser. The guard enforces, in order:
 1. URL scheme guard      - navigation is limited to http/https/about:blank;
                            file:, javascript:, data:, chrome:, resource: and
                            moz-extension: URLs are always refused.
-2. Blocklist/allowlist   - regex patterns over target URLs. An empty
-                           allowlist means "everything not blocked".
+2. Blocklist/allowlist   - regex patterns matched against the page the tool
+                           will act on (its url argument when it has one, the
+                           tracked current URL otherwise). An empty allowlist
+                           means "everything not blocked".
 3. Protected domains     - banking / payment / healthcare / government login
                            pages (configurable). State-changing actions there
-                           require an explicit two-step confirmation: the
-                           first call is refused with a confirm_token, and
-                           only repeating the same tool with that token
-                           proceeds. Read-only actions are unaffected.
+                           require an explicit confirmation: in-browser human
+                           approval, or a confirm_token bound to that exact
+                           call (tool, arguments and URL). Observation and
+                           low-risk acts (scroll, hover, highlight, focus) are
+                           unaffected.
 4. Read-only mode        - blocks every state-changing action while still
                            allowing screenshots, inspection and log reading.
 5. Script toggle         - browser_execute_script and friends can be turned
@@ -38,6 +41,7 @@ MIT License
 Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -84,6 +88,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "allowed_url_patterns": [],
     # State-changing actions on URLs matching these patterns need explicit
     # confirmation (two-step confirm_token flow). Tune to taste.
+    # Matched with re.search against the whole URL, so these are substrings
+    # unless anchored. Host-ish patterns are written to match the authority
+    # part followed by a delimiter, so "irs.gov?x=1" and "irs.gov:443/" are
+    # caught as well as "irs.gov/" - appending a query string used to switch
+    # the guard off entirely.
     "protected_url_patterns": [
         r"paypal\.com",
         r"venmo\.com",
@@ -98,7 +107,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         r"vanguard\.com",
         r"robinhood\.com",
         r"stripe\.com/dashboard",
-        r"\.gov(/|$)",
+        r"\.gov([:/?#]|$)",
         r"healthcare",
         r"mychart",
     ],
@@ -107,17 +116,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # Tools that only observe the page. Allowed in read-only mode and never
 # require protected-domain confirmation.
 OBSERVE_TOOLS = {
-    'browser_screenshot', 'browser_screenshot_all_tabs',
+    'browser_screenshot',
     'browser_get_page_info', 'browser_get_elements', 'browser_get_value',
     'browser_get_text', 'browser_get_tabs', 'browser_get_tab_info',
     'browser_find_tabs', 'browser_wait_for_element', 'browser_wait_for_change',
     'browser_wait_for_network_idle', 'browser_observe_element',
-    'browser_stop_observing', 'browser_scroll_and_capture',
+    'browser_stop_observing',
     'browser_start_logging', 'browser_stop_logging',
     'browser_get_console_logs', 'browser_get_network_logs',
-    'browser_clear_logs', 'browser_highlight', 'browser_scroll',
-    'browser_hover', 'browser_focus_tab', 'browser_safety_status',
+    'browser_clear_logs', 'browser_safety_status',
     'browser_request_approval', 'browser_audit_page', 'browser_solve_captcha',
+}
+
+# browser_screenshot_all_tabs is deliberately NOT an observe tool: it activates
+# every tab in every window in turn and photographs whatever is on screen,
+# which is the broadest reach in the tool set and nothing like reading the page
+# the agent is working on.
+
+# Tools that change something but carry little risk on their own: they move
+# the viewport or the focus, or dispatch a pointer event. They are not
+# observation (read-only mode blocks them, as it says it does) but asking for
+# protected-domain confirmation on every scroll would train the person to
+# click Approve without reading, which costs more than it buys.
+LOW_RISK_ACT_TOOLS = {
+    'browser_scroll', 'browser_hover', 'browser_highlight', 'browser_focus_tab',
+    'browser_scroll_and_capture',
 }
 
 # Tools that run arbitrary JavaScript in the page. Subject to the
@@ -136,6 +159,7 @@ _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps', 'action_scrip
 
 # How long a confirmation token stays valid, and how many can be outstanding.
 _TOKEN_TTL_SECONDS = 120
+_AUDIT_MAX_BYTES = 5 * 1024 * 1024
 _MAX_PENDING_TOKENS = 32
 
 
@@ -228,13 +252,22 @@ class SafetyGuard:
         approved this exact call (via the in-page Approve/Deny overlay), which
         satisfies the protected-domain confirmation requirement.
         """
-        if not self.config.get('enabled', True):
-            return None
-
         target_url = self._target_url(arguments)
+
+        # enabled: false turns off policy, not the scheme allowlist. Letting
+        # one config key re-enable file:// and javascript: navigation is not a
+        # policy choice anyone would make deliberately.
+        if not self.config.get('enabled', True):
+            arguments.pop('confirm_token', None)
+            if target_url is not None and not _SAFE_URL_RE.match(target_url):
+                return self._deny('blocked_scheme',
+                                  f"Navigation to {target_url!r} refused: only http://, "
+                                  f"https:// and about:blank targets are allowed.")
+            return None
         confirm_token = arguments.pop('confirm_token', None)
 
-        denial = self._check_inner(tool_name, target_url, confirm_token, human_approved)
+        denial = self._check_inner(tool_name, target_url, confirm_token,
+                                   human_approved, arguments)
         self._audit(tool_name, arguments, target_url,
                     ('allowed_by_human' if human_approved and denial is None else
                      'allowed' if denial is None else
@@ -278,7 +311,9 @@ class SafetyGuard:
 
     def _check_inner(self, tool_name: str, target_url: Optional[str],
                      confirm_token: Optional[str],
-                     human_approved: bool = False) -> Optional[Dict[str, Any]]:
+                     human_approved: bool = False,
+                     arguments: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        arguments = arguments if arguments is not None else {}
         is_observe = tool_name in OBSERVE_TOOLS
         is_script = tool_name in SCRIPT_TOOLS
 
@@ -289,18 +324,26 @@ class SafetyGuard:
                               f"{self.config.get('max_actions_per_minute')} actions in the "
                               f"last minute. Wait a few seconds and retry.")
 
-        # 2. Scheme + blocklist/allowlist guard on explicit navigation targets.
-        if target_url is not None:
-            if not _SAFE_URL_RE.match(target_url):
-                return self._deny('blocked_scheme',
-                                  f"Navigation to {target_url!r} refused: only http://, "
-                                  f"https:// and about:blank targets are allowed.")
-            if any(p.search(target_url) for p in self._blocked):
+        # 2. Scheme guard on explicit navigation targets.
+        if target_url is not None and not _SAFE_URL_RE.match(target_url):
+            return self._deny('blocked_scheme',
+                              f"Navigation to {target_url!r} refused: only http://, "
+                              f"https:// and about:blank targets are allowed.")
+
+        # 3. Blocklist/allowlist. Checked against the page the tool will act
+        #    on, not only against a url argument: no read tool takes a url, so
+        #    blocking a domain used to stop navigating there while leaving
+        #    browser_get_text and browser_screenshot free on an already-open
+        #    tab, which is the opposite of what a blocklist is for.
+        policy_url = target_url if target_url is not None else self._current_url
+        if policy_url is not None:
+            if any(p.search(policy_url) for p in self._blocked):
                 return self._deny('blocked_url',
-                                  f"URL {target_url!r} matches blocked_url_patterns in safety.json.")
-            if self._allowed and not any(p.search(target_url) for p in self._allowed):
+                                  f"URL {policy_url!r} matches blocked_url_patterns in "
+                                  f"safety.json.")
+            if self._allowed and not any(p.search(policy_url) for p in self._allowed):
                 return self._deny('not_allowlisted',
-                                  f"URL {target_url!r} does not match allowed_url_patterns "
+                                  f"URL {policy_url!r} does not match allowed_url_patterns "
                                   f"in safety.json (allowlist mode is active).")
 
         if is_observe:
@@ -321,15 +364,17 @@ class SafetyGuard:
                               f"CLAUDE_BROWSER_ALLOW_SCRIPTS=0).")
 
         # 5. Protected-domain confirmation for state-changing actions.
-        if self.config.get('confirm_protected_actions', True):
+        if (self.config.get('confirm_protected_actions', True)
+                and tool_name not in LOW_RISK_ACT_TOOLS):
             check_url = target_url if target_url is not None else self._current_url
             matched = self._matched_protected(check_url)
             if matched:
                 if human_approved:
                     return None
-                if confirm_token and self._consume_token(confirm_token, tool_name):
+                fingerprint = self._call_fingerprint(tool_name, arguments, check_url)
+                if confirm_token and self._consume_token(confirm_token, fingerprint):
                     return None
-                token = self._issue_token(tool_name)
+                token = self._issue_token(tool_name, fingerprint)
                 return {
                     'success': False,
                     'safety_decision': 'confirmation_required',
@@ -375,7 +420,26 @@ class SafetyGuard:
             self._action_times.append(now)
             return True
 
-    def _issue_token(self, tool_name: str) -> str:
+    @staticmethod
+    def _call_fingerprint(tool_name: str, arguments: Dict[str, Any],
+                          check_url: Optional[str]) -> str:
+        """Identify the exact call a token is good for.
+
+        The denial says "repeat the exact same call", and this is what makes
+        that true. Binding to the tool name alone meant a token earned by
+        clicking #help authorised a click on #transfer-submit, and a token for
+        one protected domain authorised a different one.
+        """
+        payload = {
+            'tool': tool_name,
+            'url': check_url,
+            'args': {k: v for k, v in sorted(arguments.items())
+                     if k != 'confirm_token'},
+        }
+        blob = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def _issue_token(self, tool_name: str, fingerprint: str) -> str:
         token = secrets.token_hex(8)
         now = time.monotonic()
         with self._lock:
@@ -387,17 +451,18 @@ class SafetyGuard:
             while len(self._pending_tokens) >= _MAX_PENDING_TOKENS:
                 oldest = min(self._pending_tokens, key=lambda t: self._pending_tokens[t][1])
                 del self._pending_tokens[oldest]
-            self._pending_tokens[token] = (tool_name, now)
+            self._pending_tokens[token] = (fingerprint, now)
         return token
 
-    def _consume_token(self, token: str, tool_name: str) -> bool:
+    def _consume_token(self, token: str, fingerprint: str) -> bool:
         now = time.monotonic()
         with self._lock:
             entry = self._pending_tokens.pop(token, None)
         if entry is None:
             return False
         issued_for, issued_at = entry
-        return issued_for == tool_name and now - issued_at <= _TOKEN_TTL_SECONDS
+        return (secrets.compare_digest(issued_for, fingerprint)
+                and now - issued_at <= _TOKEN_TTL_SECONDS)
 
     def _deny(self, decision: str, message: str) -> Dict[str, Any]:
         return {'success': False, 'safety_decision': decision, 'error': message}
@@ -416,6 +481,27 @@ class SafetyGuard:
         }
         try:
             _AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                _AUDIT_FILE.parent.chmod(0o700)
+            except OSError:
+                pass
+            # This file reconstructs where the agent, and so the user, went.
+            # Create it 0600 rather than at the prevailing umask.
+            if not _AUDIT_FILE.exists():
+                os.close(os.open(str(_AUDIT_FILE),
+                                 os.O_CREAT | os.O_WRONLY, 0o600))
+            elif _AUDIT_FILE.stat().st_mode & 0o077:
+                _AUDIT_FILE.chmod(0o600)
+
+            # Rotate: it had no cap of any kind.
+            if _AUDIT_FILE.stat().st_size > _AUDIT_MAX_BYTES:
+                backup = _AUDIT_FILE.with_suffix('.jsonl.1')
+                if backup.exists():
+                    backup.unlink()
+                _AUDIT_FILE.rename(backup)
+                os.close(os.open(str(_AUDIT_FILE),
+                                 os.O_CREAT | os.O_WRONLY, 0o600))
+
             with open(_AUDIT_FILE, 'a') as f:
                 f.write(json.dumps(entry, default=str) + '\n')
         except Exception as e:

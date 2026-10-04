@@ -112,7 +112,12 @@ def call_tool(name, arguments):
             data=data,
             headers=_api_headers()
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # Longer than the server's longest human-in-the-loop wait
+        # (solveCaptcha blocks for up to 200s, requestApproval 90s). At 30s
+        # the agent was told the call had failed while the person was still
+        # looking at the prompt; it then retried, and a second approval ran
+        # the state-changing action twice.
+        with urllib.request.urlopen(req, timeout=240) as resp:
             return json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         log(f"Error calling tool {name}: {e}")

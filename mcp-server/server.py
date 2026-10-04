@@ -53,15 +53,30 @@ LOG_DIR = Path.home() / '.claudecodebrowser' / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / 'mcp_server.log'
 
+# INFO with rotation. At DEBUG this file grew without bound (~18 MB/day, most
+# of it /browser/poll access lines from the 500ms poll) and the WebSocket path
+# would have written entire tool results - page text, network bodies, base64
+# screenshots - into it. CLAUDE_BROWSER_DEBUG=1 restores DEBUG.
+from logging.handlers import RotatingFileHandler
+
+_SERVER_DEBUG = os.environ.get('CLAUDE_BROWSER_DEBUG') == '1'
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG if _SERVER_DEBUG else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
+
+try:
+    LOG_DIR.chmod(0o700)
+    if LOG_FILE.exists():
+        os.chmod(LOG_FILE, 0o600)
+except OSError:
+    pass
 
 # Headless mode: CLAUDE_BROWSER_HEADLESS=1 or --headless flag
 HEADLESS_MODE = os.environ.get('CLAUDE_BROWSER_HEADLESS', '0') == '1' or '--headless' in sys.argv
@@ -83,15 +98,40 @@ _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
 
 def _load_or_create_api_token() -> str:
-    """Load existing API token or generate a new one on first run."""
+    """Load the API token, or mint one atomically on first run.
+
+    write_text() followed by chmod() created the file at the prevailing umask
+    and wrote the secret into it before tightening, leaving it briefly
+    world-readable; and an existing file was read without checking its mode,
+    so one left loose by an older version stayed that way. O_EXCL also means
+    two servers racing on first run cannot overwrite each other's token.
+    """
+    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _TOKEN_FILE.parent.chmod(0o700)
+    except OSError:
+        pass
+
     if _TOKEN_FILE.exists():
         token = _TOKEN_FILE.read_text().strip()
         if token:
+            mode = _TOKEN_FILE.stat().st_mode & 0o777
+            if mode & 0o077:
+                logger.warning(f"Tightening permissions on {_TOKEN_FILE} "
+                               f"(was {oct(mode)})")
+                _TOKEN_FILE.chmod(0o600)
             return token
+
     token = secrets.token_hex(32)
-    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _TOKEN_FILE.write_text(token)
-    _TOKEN_FILE.chmod(0o600)
+    try:
+        fd = os.open(str(_TOKEN_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        existing = _TOKEN_FILE.read_text().strip()
+        if existing:
+            return existing
+        raise
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(token)
     logger.info(f"Generated new API token saved to {_TOKEN_FILE}")
     return token
 
@@ -103,9 +143,30 @@ HOST = os.environ.get('CLAUDE_BROWSER_HOST', '127.0.0.1')
 HTTP_PORT = int(os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765'))
 WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 
+# Cap on a single request body. Nothing legitimate approaches this; without it
+# a bad Content-Length made the handler read unboundedly.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
 # Screenshots directory: ~/.claudecodebrowser/screenshots (0700), or wherever
 # CLAUDE_BROWSER_SCREENSHOTS_DIR points.
 SCREENSHOTS_DIR = resolve_screenshots_dir()
+
+
+# Argument keys whose values never reach a log. Kept in step with safety.py's
+# audit list: the application log used a shorter one, so browser_run_workflow
+# wrote every nested script and typed password into mcp_server.log while
+# audit.jsonl masked them, and 'url' was in neither, so a password-reset or
+# SSO-token URL was retained in clear.
+LOG_SENSITIVE_ARGS = {
+    'text', 'script', 'value', 'password', 'steps', 'action_script',
+    'condition', 'url',
+}
+
+
+def redact_for_log(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """A log-safe copy of a tool's arguments."""
+    return {k: ('***' if k in LOG_SENSITIVE_ARGS else v)
+            for k, v in arguments.items()}
 
 
 def camelize_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -885,7 +946,13 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
     """HTTP request handler for MCP server."""
 
     def log_message(self, format, *args):
-        logger.info(f"HTTP: {format % args}")
+        # The native host polls every 500ms; logging that line filled the file
+        # with tens of thousands of entries of nothing.
+        line = format % args
+        if '/browser/poll' in line or '/health' in line:
+            logger.debug(f"HTTP: {line}")
+        else:
+            logger.info(f"HTTP: {line}")
 
     def send_json_response(self, data: Dict[str, Any], status: int = 200):
         """Send a JSON response."""
@@ -898,7 +965,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def _check_auth(self) -> bool:
         """Validate the X-API-Key header against the server token."""
-        return self.headers.get('X-API-Key') == API_TOKEN
+        provided = self.headers.get('X-API-Key')
+        if not provided:
+            return False
+        # compare_digest, as the WebSocket handshake already uses: == leaks the
+        # position of the first differing byte.
+        return secrets.compare_digest(provided, API_TOKEN)
 
     def do_OPTIONS(self):
         """Reject CORS preflight: no cross-origin access is needed or allowed."""
@@ -947,11 +1019,14 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
         elif parsed.path == '/browser/poll':
             # Extension/native host polls for pending commands
-            pending = getattr(self.server, '_pending_commands', [])
-            if pending:
-                # Return and clear the first pending command
-                command = pending.pop(0)
-                self.send_json_response({'command': command, 'has_more': len(pending) > 0})
+            # Pop under the lock: two pollers could both pass an unguarded
+            # "if pending" and the loser would raise IndexError.
+            with _PENDING_COMMANDS_LOCK:
+                pending = getattr(self.server, '_pending_commands', [])
+                command = pending.pop(0) if pending else None
+                has_more = len(pending) > 0
+            if command is not None:
+                self.send_json_response({'command': command, 'has_more': has_more})
             else:
                 self.send_json_response({'command': None, 'has_more': False})
 
@@ -965,19 +1040,39 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else '{}'
+        try:
+            content_length = int(self.headers.get('Content-Length', 0) or 0)
+        except (TypeError, ValueError):
+            self.send_json_response({'error': 'Invalid Content-Length'}, 400)
+            return
+        if content_length < 0 or content_length > MAX_REQUEST_BYTES:
+            self.send_json_response({'error': 'Request body too large'}, 413)
+            return
+
+        try:
+            raw = self.rfile.read(content_length) if content_length > 0 else b'{}'
+            body = raw.decode('utf-8')
+        except (UnicodeDecodeError, OSError):
+            self.send_json_response({'error': 'Body must be UTF-8'}, 400)
+            return
 
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
             self.send_json_response({'error': 'Invalid JSON'}, 400)
             return
+        if not isinstance(data, dict):
+            self.send_json_response({'error': 'Body must be a JSON object'}, 400)
+            return
 
         if parsed.path == '/mcp/call':
             # Call an MCP tool
             tool_name = data.get('name')
             arguments = data.get('arguments', {})
+            if not isinstance(arguments, dict):
+                self.send_json_response(
+                    {'error': 'arguments must be a JSON object'}, 400)
+                return
 
             result = self.execute_tool(tool_name, arguments)
             self.send_json_response(result)
@@ -1007,9 +1102,8 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute an MCP tool by sending command to browser via native host."""
-        _SENSITIVE = {'text', 'script', 'value', 'password'}
-        log_args = {k: ('***' if k in _SENSITIVE else v) for k, v in arguments.items()}
-        logger.info(f"Executing tool: {tool_name} with args: {log_args}")
+        logger.info(f"Executing tool: {tool_name} with args: "
+                    f"{redact_for_log(arguments)}")
 
         # Safety guard: scheme/blocklist checks, read-only mode, script toggle,
         # protected-domain confirmation, rate limiting, audit logging.
@@ -1227,7 +1321,9 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         # No WebSocket connection — use HTTP polling with the native host.
         # ThreadingHTTPServer ensures /browser/poll and /browser/response are
         # served concurrently while this thread blocks waiting for the response.
-        request_id = str(time.time())
+        # time.time() collides for two dispatches in the same microsecond,
+        # which crossed two waiters' responses over.
+        request_id = secrets.token_hex(8)
         command_data = {
             'action': action,
             'tabId': tab_id,
@@ -1240,8 +1336,10 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         result_holder = {}
         connection_manager.http_pending_requests[request_id] = (event, result_holder)
 
-        self.server._pending_commands = getattr(self.server, '_pending_commands', [])
-        self.server._pending_commands.append(command_data)
+        with _PENDING_COMMANDS_LOCK:
+            if not hasattr(self.server, '_pending_commands'):
+                self.server._pending_commands = []
+            self.server._pending_commands.append(command_data)
 
         logger.info(f"Queued command {action} (requestId={request_id}), waiting for browser response...")
 
@@ -1344,7 +1442,11 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 break
 
         return {
-            'success': passed == len(steps),
+            # A short-circuited run has executed_steps < total_steps, so
+            # comparing against len(steps) reported failure for a run that
+            # passed everything it attempted, and an empty steps list reported
+            # success for doing nothing.
+            'success': bool(steps) and passed == len(results) == len(steps),
             'passed': passed,
             'failed': len(results) - passed,
             'total_steps': len(steps),
@@ -1470,7 +1572,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 image_data = base64.b64decode(data)
 
             filepath = SCREENSHOTS_DIR / filename
-            with open(filepath, 'wb') as f:
+            # O_NOFOLLOW: with a shared CLAUDE_BROWSER_SCREENSHOTS_DIR an
+            # attacker can pre-create a predictable timestamped name as a
+            # symlink and have an arbitrary file truncated as this user.
+            flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(str(filepath), flags, 0o600)
+            with os.fdopen(fd, 'wb') as f:
                 f.write(image_data)
 
             logger.info(f"Screenshot saved to: {filepath}")
@@ -1490,6 +1597,11 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 'error': f'Failed to save screenshot: {str(e)}',
                 'original_result': result
             }
+
+
+# Guards self.server._pending_commands, which ThreadingHTTPServer workers
+# append to and /browser/poll pops from concurrently.
+_PENDING_COMMANDS_LOCK = threading.Lock()
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1568,6 +1680,10 @@ async def run_websocket_server():
         return
 
     server = await websockets.serve(websocket_handler, HOST, WS_PORT)
+    # WebSockets are exempt from CORS, so any page the user visits can open a
+    # connection to the loopback port. The token check already refuses it, but
+    # rejecting foreign origins at the handshake avoids holding a task per
+    # attempt.
     logger.info(f"WebSocket server starting on {HOST}:{WS_PORT}")
     await server.wait_closed()
 

@@ -1184,10 +1184,21 @@ async function navigateTo(tabId, data) {
 
     // Wait for page to load
     return new Promise((resolve) => {
-      const listener = (updatedTabId, changeInfo) => {
+      const listener = async (updatedTabId, changeInfo) => {
         if (updatedTabId === tab.id && changeInfo.status === "complete") {
           browser.tabs.onUpdated.removeListener(listener);
-          resolve({ success: true, url: data.url });
+          // Report where the tab actually landed, not what was requested. A
+          // redirect meant the safety guard's URL tracker recorded the
+          // short link and not the destination, so later actions on the
+          // destination were checked against the wrong page.
+          let landedUrl = data.url;
+          try {
+            const updated = await browser.tabs.get(tab.id);
+            landedUrl = updated.url || data.url;
+          } catch (e) {
+            // Tab closed during navigation; fall back to the requested URL.
+          }
+          resolve({ success: true, url: landedUrl, requestedUrl: data.url });
         }
       };
       browser.tabs.onUpdated.addListener(listener);

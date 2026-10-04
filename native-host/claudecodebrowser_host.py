@@ -43,8 +43,15 @@ if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5 * 1024 * 1024:
         backup.unlink()
     LOG_FILE.rename(backup)
 
+# INFO, not DEBUG. At DEBUG this file was a verbatim transcript of every
+# message in both directions - page text, tab URLs and titles, typed text,
+# base64 screenshots - in cleartext, with no redaction anywhere in this file,
+# defeating the masking that server.py and safety.py apply to their own logs.
+# CLAUDE_BROWSER_HOST_DEBUG=1 restores it for debugging; see describe_message.
+_HOST_DEBUG = os.environ.get('CLAUDE_BROWSER_HOST_DEBUG') == '1'
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.DEBUG if _HOST_DEBUG else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
@@ -52,6 +59,42 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# The log lives next to the API token; keep both to this user.
+try:
+    LOG_DIR.chmod(0o700)
+    if LOG_FILE.exists():
+        LOG_FILE.stat()
+        os.chmod(LOG_FILE, 0o600)
+except OSError:
+    pass
+
+
+def describe_message(message):
+    """A log-safe summary of a native message.
+
+    Shape and size only: never the payload. A command's data can hold typed
+    text and a response's can hold page text or a screenshot, and this file is
+    not the place for either.
+    """
+    if not isinstance(message, dict):
+        return f'<{type(message).__name__}>'
+    parts = []
+    for key in ('action', 'requestId', 'tabId'):
+        if key in message:
+            parts.append(f'{key}={message[key]!r}')
+    if 'success' in message:
+        parts.append(f'success={message["success"]!r}')
+    if 'error' in message:
+        parts.append('error=yes')
+    data = message.get('data')
+    if isinstance(data, dict):
+        parts.append(f'data_keys={sorted(data.keys())}')
+    for key in ('data', 'result', 'text', 'logs', 'elements'):
+        value = message.get(key)
+        if isinstance(value, str):
+            parts.append(f'{key}_len={len(value)}')
+    return ' '.join(parts) or '<no action>' 
 
 # Configuration
 # Use 127.0.0.1 to avoid IPv6 resolution issues (localhost may resolve to ::1 first)
@@ -119,7 +162,7 @@ def send_message(message):
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
 
-        logger.debug(f"Sent message: {message}")
+        logger.debug(f"Sent message: {describe_message(message)}")
     except Exception as e:
         logger.error(f"Error sending message: {e}")
 
@@ -152,29 +195,91 @@ def forward_to_mcp_server(message):
 
 
 def check_mcp_server():
-    """Check if MCP server is running and responding."""
+    """True only if OUR MCP server is listening on the port.
+
+    The old check accepted any response containing "ok", which meant anything
+    that could bind 127.0.0.1:8765 before Firefox started was treated as the
+    server: it then received the API token on every poll and every command
+    response, and anything it returned from /browser/poll was executed in the
+    browser with safety.py never consulted, because the real server was never
+    started. So identity is now proved against the shared token, which only
+    our server can have read from the 0600 token file.
+
+    /health stays unauthenticated (it is the liveness probe); the identity
+    check is a separate authenticated request.
+    """
     import urllib.request
     import urllib.error
 
     try:
-        # First check if port is open
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
         result = sock.connect_ex((MCP_SERVER_HOST, MCP_SERVER_PORT))
         sock.close()
-
         if result != 0:
             return False
-
-        # Port is open, now verify server is actually responding
-        url = f'{MCP_SERVER_URL}/health'
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = response.read().decode('utf-8')
-            return 'ok' in data.lower()
-
     except Exception:
         return False
+
+    return _server_proves_identity()
+
+
+def _server_proves_identity():
+    """Ask the listener for something only our server can answer.
+
+    A squatter without the token gets 403 from every authenticated endpoint,
+    and one that echoes 200 for everything fails the token-mismatch probe.
+    """
+    import urllib.request
+    import urllib.error
+
+    token = _read_api_token()
+    if not token:
+        # No token file yet: nothing has started a server, so there is nothing
+        # of ours on that port to find.
+        logger.warning("No API token available; cannot verify the listener on "
+                       f"port {MCP_SERVER_PORT}")
+        return False
+
+    def status_for(api_key):
+        req = urllib.request.Request(f'{MCP_SERVER_URL}/mcp/tools')
+        if api_key is not None:
+            req.add_header('X-API-Key', api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=3) as response:
+                return response.status, response.read(4096)
+        except urllib.error.HTTPError as e:
+            return e.code, b''
+        except Exception:
+            return None, b''
+
+    # 1. The real token must be accepted and return the tool list.
+    status, body = status_for(token)
+    if status != 200 or b'browser_screenshot' not in body:
+        logger.error(f"Listener on port {MCP_SERVER_PORT} did not answer an "
+                     f"authenticated request as our MCP server would "
+                     f"(status {status}). Treating it as foreign.")
+        return False
+
+    # 2. A wrong token must be refused. An endpoint that returns 200 for
+    #    anything is not enforcing our token and is not our server.
+    status, _ = status_for('0' * 64)
+    if status == 200:
+        logger.error(f"Listener on port {MCP_SERVER_PORT} accepted an invalid "
+                     f"API key. Treating it as foreign.")
+        return False
+
+    return True
+
+
+def _read_api_token():
+    """The shared secret, or None if it does not exist yet."""
+    try:
+        if _TOKEN_FILE.exists():
+            return _TOKEN_FILE.read_text().strip() or None
+    except Exception as e:
+        logger.warning(f"Could not read the API token: {e}")
+    return None
 
 
 # Our own server is the only process this host may ever kill. Anything else
@@ -188,7 +293,7 @@ def _pids_on_port(port):
     """PIDs listening on a TCP port, or [] when they cannot be determined."""
     try:
         result = subprocess.run(
-            ['lsof', '-ti', f':{port}'],
+            [_LSOF, '-ti', f'TCP:{port}', '-sTCP:LISTEN'],
             capture_output=True,
             text=True
         )
@@ -209,11 +314,17 @@ def _pids_on_port(port):
     return pids
 
 
+# Absolute paths: these run with whatever PATH Firefox inherited, and a
+# planted lsof/ps would turn the terminate path into an arbitrary-PID killer.
+_PS = '/bin/ps'
+_LSOF = '/usr/sbin/lsof' if os.path.exists('/usr/sbin/lsof') else '/usr/bin/lsof'
+
+
 def _process_command(pid):
     """The full command line of a PID, or None when it cannot be read."""
     try:
         result = subprocess.run(
-            ['ps', '-p', str(pid), '-o', 'command='],
+            [_PS, '-p', str(pid), '-o', 'command='],
             capture_output=True,
             text=True
         )
@@ -224,16 +335,46 @@ def _process_command(pid):
     return command or None
 
 
+def _process_identity(pid):
+    """(start time, command) for a PID - enough to notice PID reuse.
+
+    SIGTERM, a 2 second wait and then SIGKILL leaves a window in which the OS
+    can recycle the PID onto an unrelated process. Re-checking identity before
+    each signal closes it.
+    """
+    try:
+        result = subprocess.run(
+            [_PS, '-p', str(pid), '-o', 'lstart=,command='],
+            capture_output=True,
+            text=True
+        )
+    except Exception:
+        return None
+    line = result.stdout.strip()
+    return line or None
+
+
 def _is_our_server(pid):
-    """True only when the PID is running our own MCP server script."""
+    """True only when the PID is running our own MCP server script.
+
+    The marker must appear as a whitespace-delimited argument, not merely
+    somewhere in the command line: a bare substring test also matched
+    "vim .../mcp-server/server.py" and "tail -f .../mcp-server/server.py".
+    """
     command = _process_command(pid)
     if not command:
         return False
-    return any(marker in command for marker in _SERVER_SCRIPT_MARKERS)
+    for argument in command.split():
+        if any(argument.endswith(marker) for marker in _SERVER_SCRIPT_MARKERS):
+            return True
+    return False
 
 
 def _terminate(pid):
-    """SIGTERM, then SIGKILL if it is still alive."""
+    """SIGTERM, then SIGKILL if it is still alive - re-verifying identity."""
+    identity = _process_identity(pid)
+    if identity is None:
+        return
     try:
         logger.info(f"Sending SIGTERM to our MCP server: PID {pid}")
         os.kill(pid, signal.SIGTERM)
@@ -244,8 +385,15 @@ def _terminate(pid):
         return
 
     time.sleep(2.0)
+
+    # The PID may have been recycled during the wait. Only escalate if it is
+    # still the same process AND still ours.
+    if _process_identity(pid) != identity or not _is_our_server(pid):
+        logger.info(f"PID {pid} is no longer the process we signalled; "
+                    f"not escalating to SIGKILL")
+        return
     try:
-        os.kill(pid, 0)  # still alive?
+        os.kill(pid, 0)
         logger.warning(f"PID {pid} still alive after SIGTERM, sending SIGKILL")
         os.kill(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -265,10 +413,13 @@ def kill_existing_server():
             _terminate(pid)
             killed = True
         else:
+            # Deliberately not logging the foreign command line: this file is
+            # readable by other local users and another process's argv can
+            # contain their credentials.
             logger.error(
                 f"Port {MCP_SERVER_PORT} is held by PID {pid}, which is not our MCP "
-                f"server ({_process_command(pid)!r}). Leaving it alone. Set "
-                f"CLAUDE_MCP_PORT to use a different port."
+                f"server. Leaving it alone. Set CLAUDE_MCP_PORT to use a "
+                f"different port."
             )
 
     if killed:
@@ -370,14 +521,17 @@ def ensure_mcp_server():
         logger.info("MCP server already running and responding")
         return True
 
-    # Check if port is in use but server not responding (stale process)
+    # The port is busy with something that did not prove it is ours: either a
+    # stale server of ours (kill it) or a foreign process (leave it, and do
+    # not hand it anything).
     if is_port_in_use():
-        logger.warning("Port in use but server not responding - clearing stale process")
+        logger.warning("Port in use but the listener did not prove it is our "
+                       "server - clearing a stale process if it is ours")
         if not kill_existing_server():
             logger.error(
-                f"Port {MCP_SERVER_PORT} is in use by something that is not our MCP "
-                f"server. Not starting a server that cannot bind. Free the port or "
-                f"set CLAUDE_MCP_PORT.")
+                f"Port {MCP_SERVER_PORT} is held by a process that is not our MCP "
+                f"server. Refusing to talk to it or to start a server that cannot "
+                f"bind. Free the port or set CLAUDE_MCP_PORT.")
             return False
 
     logger.info("MCP server not running, attempting to start...")
@@ -514,7 +668,7 @@ def input_thread():
             logger.info("Extension disconnected")
             break
 
-        logger.debug(f"Received message: {message}")
+        logger.debug(f"Received message: {describe_message(message)}")
         incoming_queue.put(message)
 
 
@@ -662,7 +816,7 @@ def main():
             logger.info("Input stream closed, exiting")
             break
 
-        logger.debug(f"Received: {message}")
+        logger.debug(f"Received: {describe_message(message)}")
 
         # Process and respond
         response = process_message(message)
