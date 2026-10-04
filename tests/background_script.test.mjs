@@ -15,14 +15,29 @@ import assert from 'node:assert/strict';
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, '..', 'extension', 'background.js'), 'utf8');
 
-/** A recordable webRequest event with addListener/removeListener. */
+/** A recordable webRequest event. Records the filter and extraInfoSpec too:
+ *  filterResponseData() is only callable from a listener registered with
+ *  "blocking", and details.requestBody / requestHeaders / responseHeaders are
+ *  only populated when the matching extraInfoSpec entry is passed. A harness
+ *  that drops those arguments cannot tell a working feature from a broken one. */
 function makeEvent() {
   const listeners = new Set();
+  const registrations = [];
   return {
     listeners,
-    addListener: (fn) => listeners.add(fn),
-    removeListener: (fn) => listeners.delete(fn),
+    registrations,
+    addListener: (fn, filter, extraInfoSpec) => {
+      listeners.add(fn);
+      registrations.push({ fn, filter, extraInfoSpec: extraInfoSpec || [] });
+    },
+    removeListener: (fn) => {
+      listeners.delete(fn);
+      const i = registrations.findIndex(r => r.fn === fn);
+      if (i >= 0) registrations.splice(i, 1);
+    },
     hasListeners: () => listeners.size > 0,
+    spec: () => (registrations[0] ? registrations[0].extraInfoSpec : null),
+    urls: () => (registrations[0] ? registrations[0].filter?.urls : null),
     fire: (details) => [...listeners].map(fn => fn(details))
   };
 }
@@ -32,6 +47,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     onBeforeRequest: makeEvent(),
     onBeforeSendHeaders: makeEvent(),
     onHeadersReceived: makeEvent(),
+    onBeforeRedirect: makeEvent(),
     onCompleted: makeEvent(),
     onErrorOccurred: makeEvent()
   };
@@ -482,6 +498,262 @@ test('network logging survives a content script that is not reachable', async ()
   fireRequest(webRequest);
   const logs = await command('getNetworkLogs', {}, 7);
   assert.equal(logs.logs.length, 1);
+});
+
+// --------------------------------------------------------------------------
+// The registration contract. details.requestBody / requestHeaders /
+// responseHeaders are only populated when the matching extraInfoSpec entry is
+// passed, and filterResponseData() is only callable from a "blocking"
+// listener. Stripping these silently disables the feature in real Firefox.
+
+test('listeners are registered with the extraInfoSpec the feature needs', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  assert.ok(webRequest.onBeforeRequest.spec().includes('requestBody'),
+    'onBeforeRequest needs "requestBody" or details.requestBody is undefined');
+  assert.ok(webRequest.onBeforeSendHeaders.spec().includes('requestHeaders'),
+    'onBeforeSendHeaders needs "requestHeaders" or headers cannot be redacted');
+  assert.ok(webRequest.onHeadersReceived.spec().includes('responseHeaders'),
+    'onHeadersReceived needs "responseHeaders" or status/headers are undefined');
+  assert.ok(webRequest.onHeadersReceived.spec().includes('blocking'),
+    'onHeadersReceived needs "blocking" or filterResponseData() cannot be called');
+  assert.deepEqual(Array.from(webRequest.onBeforeRequest.urls()), ['<all_urls>']);
+});
+
+// --------------------------------------------------------------------------
+// The filter must always hand the stream back
+
+test('the filter disconnects on error instead of holding the response open', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+
+  const filter = filters[0];
+  filter.error = 'NS_ERROR_ABORT';
+  filter.onerror();
+
+  assert.equal(filter.disconnected, true,
+    'onerror must disconnect; Firefox keeps the response alive forever otherwise');
+});
+
+test('a failing write hands the stream back rather than truncating it', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+
+  const filter = filters[0];
+  filter.write = () => { throw new Error('not transferring data'); };
+  filter.ondata({ data: new TextEncoder().encode('{"a":1}') });
+
+  assert.equal(filter.disconnected, true,
+    'a dropped chunk would truncate the page response; disconnect instead');
+});
+
+test('a filter is released exactly once', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { complete: false });
+
+  const filter = filters[0];
+  let closes = 0;
+  filter.close = () => { closes++; };
+  filter.onstop();
+  filter.onstop();
+  filter.onerror();
+
+  assert.equal(closes, 1, 'close must not be called twice');
+});
+
+test('an unfilterable request degrades without throwing', async () => {
+  const { command, webRequest } = loadBackground();
+  webRequest.filterResponseData = () => { throw new Error('no permission'); };
+  await command('startLogging', {}, 7);
+
+  fireRequest(webRequest);
+
+  const result = await command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs.length, 1, 'metadata must still be captured');
+  assert.match(result.logs[0].responseBody, /unavailable/);
+});
+
+// --------------------------------------------------------------------------
+// Redaction, in full
+
+test('every credential header in the list is redacted', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  const names = [
+    'Authorization', 'Proxy-Authorization', 'Cookie', 'X-API-Key',
+    'X-Auth-Token', 'X-CSRF-Token', 'X-XSRF-Token', 'API-Key',
+    'Auth-Token', 'X-Session-Token', 'X-Access-Token'
+  ];
+  fireRequest(webRequest, {
+    requestHeaders: names.map((name, i) => ({ name, value: `secret-value-${i}` })),
+    responseHeaders: [
+      { name: 'content-type', value: 'application/json' },
+      { name: 'Set-Cookie', value: 'secret-cookie' }
+    ]
+  });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  const entry = result.logs[0];
+  for (const name of names) {
+    assert.equal(entry.requestHeaders[name], '***', `${name} must be redacted`);
+  }
+  assert.equal(entry.responseHeaders['Set-Cookie'], '***');
+  assert.ok(!JSON.stringify(result).includes('secret-value'),
+    'no redacted header value may survive anywhere in the result');
+});
+
+test('credential-shaped values inside bodies are scrubbed', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  const body = new TextEncoder().encode(
+    '{"username":"albert","password":"hunter2","note":"keep"}');
+  fireRequest(webRequest, { method: 'POST', requestBody: { raw: [{ bytes: body }] },
+                            complete: false });
+
+  filters[0].ondata({ data: new TextEncoder().encode(
+    '{"access_token":"ey-secret","expires_in":3600}') });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  const entry = result.logs[0];
+  assert.ok(!entry.requestBody.includes('hunter2'), 'request password must be scrubbed');
+  assert.ok(entry.requestBody.includes('albert'), 'non-secret fields stay readable');
+  assert.ok(!entry.responseBody.includes('ey-secret'), 'response token must be scrubbed');
+  assert.ok(entry.responseBody.includes('expires_in'), 'the rest of the body stays');
+});
+
+test('capture_bodies: false suppresses request bodies too, not just responses', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', { captureBodies: false }, 7);
+
+  const body = new TextEncoder().encode('{"password":"hunter2"}');
+  fireRequest(webRequest, { method: 'POST', requestBody: { raw: [{ bytes: body }] } });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs[0].requestBody, undefined,
+    'capture_bodies: false must mean no bodies in either direction');
+  assert.ok(!JSON.stringify(result).includes('hunter2'));
+});
+
+// --------------------------------------------------------------------------
+// State that used to survive a detach
+
+test('wait_for_network_idle still works after a detach left requests in flight', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  // Two requests start and never finish, then logging stops.
+  webRequest.onBeforeRequest.fire({ requestId: 'a', tabId: 7, type: 'xmlhttprequest',
+                                    method: 'GET', url: 'http://stub.test/a' });
+  webRequest.onBeforeRequest.fire({ requestId: 'b', tabId: 7, type: 'xmlhttprequest',
+                                    method: 'GET', url: 'http://stub.test/b' });
+  await command('stopLogging', {}, 7);
+
+  const result = await command('waitForNetworkIdle', { idleTime: 50, timeout: 600 }, 7);
+  assert.equal(result.idle, true,
+    'stale in-flight ids must not poison the tab forever');
+});
+
+test('a persistent channel stops blocking idle once it is clearly long-lived', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  // A WebSocket that never closes: onCompleted will not fire until the page
+  // tears it down, so counting it forever makes the tool useless on any SPA.
+  webRequest.onBeforeRequest.fire({ requestId: 'ws', tabId: 7, type: 'websocket',
+                                    method: 'GET', url: 'wss://stub.test/live' });
+  await new Promise(resolve => setTimeout(resolve, 80));
+
+  const result = await command(
+    'waitForNetworkIdle', { idleTime: 30, timeout: 600, persistentAfter: 40 }, 7);
+  assert.equal(result.idle, true,
+    'a request older than persistentAfter must stop blocking idle');
+  assert.equal(result.pendingRequests, 0);
+});
+
+test('a request younger than the threshold still blocks idle', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  webRequest.onBeforeRequest.fire({ requestId: 'fresh', tabId: 7,
+                                    type: 'xmlhttprequest', method: 'GET',
+                                    url: 'http://stub.test/slow' });
+
+  const result = await command(
+    'waitForNetworkIdle', { idleTime: 30, timeout: 300, persistentAfter: 10000 }, 7);
+  assert.equal(result.timedOut, true, 'an in-flight request must still be waited for');
+  assert.equal(result.pendingRequests, 1);
+});
+
+// --------------------------------------------------------------------------
+// Redirects
+
+test('each redirect hop is kept as its own log entry', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  webRequest.onBeforeRequest.fire({ requestId: 'r', tabId: 7, type: 'xmlhttprequest',
+                                    method: 'POST', url: 'http://api.stub.test/login',
+                                    requestBody: null });
+  webRequest.onHeadersReceived.fire({ requestId: 'r', tabId: 7, statusCode: 302,
+                                      responseHeaders: [], statusLine: 'HTTP/1.1 302' });
+  webRequest.onBeforeRedirect.fire({ requestId: 'r', tabId: 7, statusCode: 302,
+                                     redirectUrl: 'http://api.stub.test/session' });
+  // The target hop reuses the same requestId.
+  webRequest.onBeforeRequest.fire({ requestId: 'r', tabId: 7, type: 'xmlhttprequest',
+                                    method: 'GET', url: 'http://api.stub.test/session',
+                                    requestBody: null });
+  webRequest.onCompleted.fire({ requestId: 'r', tabId: 7, statusCode: 200 });
+
+  const result = await command('getNetworkLogs', {}, 7);
+  assert.equal(result.logs.length, 2, 'the first hop must not be overwritten');
+  assert.equal(result.logs[0].url, 'http://api.stub.test/login');
+  assert.equal(result.logs[0].method, 'POST');
+  assert.equal(result.logs[0].redirectedTo, 'http://api.stub.test/session');
+  assert.equal(result.logs[1].url, 'http://api.stub.test/session');
+});
+
+test('a redirect does not attach two filters to one channel', async () => {
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  const html = [{ name: 'content-type', value: 'text/html' }];
+  webRequest.onBeforeRequest.fire({ requestId: 'r', tabId: 7, type: 'xmlhttprequest',
+                                    method: 'GET', url: 'http://a.test/' });
+  webRequest.onHeadersReceived.fire({ requestId: 'r', tabId: 7, statusCode: 200,
+                                      responseHeaders: html, statusLine: 'ok' });
+  webRequest.onHeadersReceived.fire({ requestId: 'r', tabId: 7, statusCode: 200,
+                                      responseHeaders: html, statusLine: 'ok' });
+
+  assert.equal(filters.length, 1,
+    'two filters on one request would race over the captured body');
+});
+
+// --------------------------------------------------------------------------
+// Eviction
+
+test('an evicted in-flight request is logged rather than silently dropped', async () => {
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  // Fill the pending map past its cap with requests that never finish.
+  for (let i = 0; i < 302; i++) {
+    webRequest.onBeforeRequest.fire({ requestId: `p${i}`, tabId: 7,
+                                      type: 'xmlhttprequest', method: 'GET',
+                                      url: `http://stub.test/${i}` });
+  }
+
+  const result = await command('getNetworkLogs', { limit: 500 }, 7);
+  const dropped = result.logs.filter(l => /dropped/.test(l.error || ''));
+  assert.ok(dropped.length > 0, 'eviction must leave a marker in the log');
+  assert.equal(dropped[0].url, 'http://stub.test/0', 'the oldest is the one evicted');
 });
 
 // --------------------------------------------------------------------------

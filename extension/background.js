@@ -63,7 +63,13 @@ const pendingNetworkRequests = new Map();
 // in-flight requests needs the same listeners logging does, so the two share
 // them and whoever leaves last takes them down.
 const idleWatchers = new Map();
-// tabId -> { requests: Set<requestId>, lastActivity: timestamp }
+// A request still open after this long is treated as a persistent channel
+// (WebSocket, SSE, long-poll) and no longer counts against network idle: it
+// will not complete until the page closes it, so waiting for it is waiting
+// forever. It stays in the log; it just stops blocking idle.
+const PERSISTENT_REQUEST_MS = 10000;
+
+// tabId -> { requests: Map<requestId, startedAt>, lastActivity: timestamp }
 const inFlightByTab = new Map();
 let webRequestListenersAttached = false;
 
@@ -82,7 +88,7 @@ function shouldLogRequest(details) {
 
 function inFlightFor(tabId) {
   if (!inFlightByTab.has(tabId)) {
-    inFlightByTab.set(tabId, { requests: new Set(), lastActivity: Date.now() });
+    inFlightByTab.set(tabId, { requests: new Map(), lastActivity: Date.now() });
   }
   return inFlightByTab.get(tabId);
 }
@@ -91,8 +97,19 @@ function inFlightFor(tabId) {
 // worth logging: a page is not quiet while it is still pulling images.
 function noteRequestStarted(details) {
   const state = inFlightFor(details.tabId);
-  state.requests.add(details.requestId);
+  state.requests.set(details.requestId, Date.now());
   state.lastActivity = Date.now();
+}
+
+// Requests that are still young enough to be worth waiting for.
+function pendingRequestCount(tabId, persistentAfter = PERSISTENT_REQUEST_MS) {
+  const state = inFlightFor(tabId);
+  const now = Date.now();
+  let count = 0;
+  for (const startedAt of state.requests.values()) {
+    if (now - startedAt < persistentAfter) count++;
+  }
+  return count;
 }
 
 function noteRequestFinished(details) {
@@ -112,19 +129,44 @@ function redactHeaderList(headers) {
   return out;
 }
 
+// Best-effort scrub of credential-shaped values inside a captured body. The
+// header allowlist is worthless if the body that mints the token is logged
+// verbatim one request earlier. This cannot be complete - a body is arbitrary
+// data - so bodies stay off by default for anything but textual responses and
+// can be disabled entirely with capture_bodies: false.
+const SECRET_KEY_RE =
+  /(pass(word|wd)?|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number)/i;
+
+function redactSecretsInBody(text) {
+  if (!text) return text;
+  try {
+    // JSON-ish: "key": "value"
+    let out = text.replace(
+      /("(?:[^"\\]|\\.)*"\s*:\s*)"(?:[^"\\]|\\.)*"/g,
+      (match, keyPart) => (SECRET_KEY_RE.test(keyPart) ? `${keyPart}"***"` : match));
+    // Form-encoded: key=value
+    out = out.replace(/([^&=?\s]+)=([^&\s]*)/g,
+      (match, key) => (SECRET_KEY_RE.test(key) ? `${key}=***` : match));
+    return out;
+  } catch (e) {
+    return "[redaction failed; body withheld]";
+  }
+}
+
 // webRequest hands request bodies over as form fields or raw byte buffers.
 function describeRequestBody(requestBody) {
   if (!requestBody) return null;
   try {
     if (requestBody.formData) {
-      return JSON.stringify(requestBody.formData).substring(0, 1000);
+      return redactSecretsInBody(
+        JSON.stringify(requestBody.formData)).substring(0, 1000);
     }
     if (requestBody.raw && requestBody.raw.length) {
       const decoder = new TextDecoder("utf-8");
       const text = requestBody.raw
         .map(chunk => (chunk.bytes ? decoder.decode(chunk.bytes) : ""))
         .join("");
-      return text.substring(0, 1000);
+      return redactSecretsInBody(text).substring(0, 1000);
     }
   } catch (e) {
     return "[could not decode request body]";
@@ -161,18 +203,29 @@ const onBeforeRequestListener = (details) => {
 
   if (!shouldLogRequest(details)) return;
 
-  // A runaway page must not grow this map without bound.
+  // A runaway page must not grow this map without bound. The oldest entry is
+  // usually a persistent channel that will not complete; record that it was
+  // dropped rather than losing it silently.
   if (pendingNetworkRequests.size >= MAX_PENDING_REQUESTS) {
-    const oldest = pendingNetworkRequests.keys().next().value;
-    pendingNetworkRequests.delete(oldest);
+    const oldestId = pendingNetworkRequests.keys().next().value;
+    const oldest = pendingNetworkRequests.get(oldestId);
+    pendingNetworkRequests.delete(oldestId);
+    if (oldest) {
+      oldest.error = "[dropped: too many requests in flight to track]";
+      storeNetworkEntry(oldest.tabId, oldest);
+    }
   }
 
+  // capture_bodies: false means no bodies at all, request or response.
+  const options = loggedTabs.get(details.tabId);
   pendingNetworkRequests.set(details.requestId, {
     type: details.type,
     method: details.method,
     url: details.url,
     tabId: details.tabId,
-    requestBody: describeRequestBody(details.requestBody),
+    requestBody: (options && options.captureBodies)
+      ? describeRequestBody(details.requestBody)
+      : undefined,
     startTime: new Date().toISOString(),
     startedAt: Date.now()
   });
@@ -186,6 +239,16 @@ const onBeforeSendHeadersListener = (details) => {
 };
 
 const onHeadersReceivedListener = (details) => {
+  try {
+    captureResponseHeaders(details);
+  } catch (e) {
+    // This listener is registered as "blocking"; an exception escaping it
+    // must never be able to interfere with the response.
+    console.error("[ClaudeCodeBrowser] header capture failed:", e);
+  }
+};
+
+function captureResponseHeaders(details) {
   const entry = pendingNetworkRequests.get(details.requestId);
   if (!entry) return;
 
@@ -203,49 +266,113 @@ const onHeadersReceivedListener = (details) => {
     return;
   }
 
+  // onBeforeRequest fires again for a redirect target under the same
+  // requestId, so without this guard a 30x could attach a second filter to
+  // the same channel and the two would race over entry.responseBody.
+  if (entry.filterAttached) return;
+  entry.filterAttached = true;
   attachResponseBodyReader(details.requestId, entry);
-};
+}
 
-// Read-only stream filter. Every chunk is written back byte for byte and the
-// stream is always closed, so the page receives exactly what it would have
-// without us. Anything unexpected disconnects the filter, which hands the
-// remainder of the response straight through untouched.
+// Read-only stream filter.
+//
+// Firefox suspends the response inside the filter until the extension calls
+// close() or disconnect(); if neither happens the response is kept alive
+// forever and the page's request never completes. So every exit path here ends
+// in one of the two, including the paths that are "impossible": a filter that
+// neither stops nor errors is released by a watchdog, and any unexpected throw
+// disconnects, which hands the rest of the response to Firefox untouched.
+//
+// Every chunk is written back byte for byte, so what the page receives is
+// exactly what it would have received without us.
+const FILTER_WATCHDOG_MS = 120000;
+
 function attachResponseBodyReader(requestId, entry) {
   let filter;
   try {
     filter = browser.webRequest.filterResponseData(requestId);
   } catch (e) {
+    // No webRequestBlocking permission, or the request is not filterable.
     entry.responseBody = "[not captured: response filtering unavailable]";
     return;
   }
 
   const decoder = new TextDecoder("utf-8");
   let collected = "";
+  let released = false;
+
+  // Hand the stream back exactly once, whichever way we got here.
+  const release = (how) => {
+    if (released) return;
+    released = true;
+    clearTimeout(watchdog);
+    try {
+      if (how === "close") {
+        filter.close();
+      } else {
+        // disconnect() lets Firefox deliver whatever is left, unfiltered.
+        filter.disconnect();
+      }
+    } catch (e) {
+      // Already closed or disconnected by the browser.
+    }
+  };
+
+  // Belt and braces: a channel that is cancelled or redirected may deliver
+  // neither onstop nor onerror, and a suspended filter would stall the page.
+  const watchdog = setTimeout(() => {
+    if (!released) {
+      entry.responseBody = "[not captured: response filter timed out]";
+      release("disconnect");
+    }
+  }, FILTER_WATCHDOG_MS);
 
   filter.ondata = (event) => {
+    // Collect first, but never let collection stop the pass-through.
     try {
       if (collected.length < MAX_BODY_CHARS) {
         collected += decoder.decode(event.data, { stream: true });
       }
     } catch (e) {
-      // Undecodable chunk: keep passing data through regardless.
+      // Undecodable chunk (wrong charset, still-compressed bytes): skip it.
     }
-    filter.write(event.data);
+    try {
+      filter.write(event.data);
+    } catch (e) {
+      // write() throws if the filter is no longer transferring data. Dropping
+      // the chunk would truncate what the page sees, so give the stream back
+      // and let Firefox finish the job.
+      entry.responseBody = "[not captured: response filter write failed]";
+      release("disconnect");
+    }
   };
 
   filter.onstop = () => {
-    entry.responseBody = collected.substring(0, MAX_BODY_CHARS);
-    try {
-      filter.close();
-    } catch (e) {
-      // Already closed.
-    }
+    entry.responseBody = redactSecretsInBody(collected.substring(0, MAX_BODY_CHARS));
+    release("close");
   };
 
   filter.onerror = () => {
     entry.responseBody = `[not captured: ${filter.error || "stream error"}]`;
+    release("disconnect");
   };
 }
+
+// A redirect ends this hop. Store it under its own URL so the first hop's
+// method, URL and body are not overwritten by the target's.
+const onBeforeRedirectListener = (details) => {
+  const entry = pendingNetworkRequests.get(details.requestId);
+  if (!entry) return;
+  pendingNetworkRequests.delete(details.requestId);
+  entry.redirectedTo = details.redirectUrl;
+  entry.status = details.statusCode;
+  if (entry.startedAt) {
+    entry.duration = Date.now() - entry.startedAt;
+    delete entry.startedAt;
+  }
+  delete entry.filterAttached;
+  storeNetworkEntry(entry.tabId, entry);
+};
 
 const onCompletedListener = (details) => {
   noteRequestFinished(details);
@@ -268,8 +395,13 @@ function attachWebRequestListeners() {
       onBeforeRequestListener, filter, ["requestBody"]);
     browser.webRequest.onBeforeSendHeaders.addListener(
       onBeforeSendHeadersListener, filter, ["requestHeaders"]);
+    // "blocking" is required for filterResponseData() to be callable from
+    // this listener; without it the filter is never created and response
+    // bodies are silently never captured. The listener returns nothing, so
+    // it does not actually alter or delay the response.
     browser.webRequest.onHeadersReceived.addListener(
-      onHeadersReceivedListener, filter, ["responseHeaders"]);
+      onHeadersReceivedListener, filter, ["responseHeaders", "blocking"]);
+    browser.webRequest.onBeforeRedirect.addListener(onBeforeRedirectListener, filter);
     browser.webRequest.onCompleted.addListener(onCompletedListener, filter);
     browser.webRequest.onErrorOccurred.addListener(onErrorOccurredListener, filter);
     webRequestListenersAttached = true;
@@ -286,6 +418,7 @@ function detachWebRequestListeners() {
     browser.webRequest.onBeforeRequest.removeListener(onBeforeRequestListener);
     browser.webRequest.onBeforeSendHeaders.removeListener(onBeforeSendHeadersListener);
     browser.webRequest.onHeadersReceived.removeListener(onHeadersReceivedListener);
+    browser.webRequest.onBeforeRedirect.removeListener(onBeforeRedirectListener);
     browser.webRequest.onCompleted.removeListener(onCompletedListener);
     browser.webRequest.onErrorOccurred.removeListener(onErrorOccurredListener);
   } catch (e) {
@@ -293,6 +426,10 @@ function detachWebRequestListeners() {
   }
   webRequestListenersAttached = false;
   pendingNetworkRequests.clear();
+  // Request ids are only removed from inFlightByTab by noteRequestFinished,
+  // which cannot run once the listeners are gone. Leaving them behind made
+  // every later wait_for_network_idle on that tab time out forever.
+  inFlightByTab.clear();
 }
 
 function startNetworkLogging(tabId, options = {}) {
@@ -325,6 +462,7 @@ function stopNetworkLogging(tabId) {
 async function waitForNetworkIdleOnTab(tabId, options = {}) {
   const timeout = options.timeout || 10000;
   const idleTime = options.idleTime || 500;
+  const persistentAfter = options.persistentAfter || PERSISTENT_REQUEST_MS;
   const startedAt = Date.now();
 
   idleWatchers.set(tabId, (idleWatchers.get(tabId) || 0) + 1);
@@ -341,7 +479,7 @@ async function waitForNetworkIdleOnTab(tabId, options = {}) {
   try {
     while (Date.now() - startedAt < timeout) {
       const state = inFlightFor(tabId);
-      const pending = state.requests.size;
+      const pending = pendingRequestCount(tabId, persistentAfter);
       if (pending === 0 && Date.now() - state.lastActivity >= idleTime) {
         return { success: true, idle: true, waitedMs: Date.now() - startedAt,
                  pendingRequests: 0 };
@@ -354,7 +492,7 @@ async function waitForNetworkIdleOnTab(tabId, options = {}) {
       idle: false,
       timedOut: true,
       waitedMs: Date.now() - startedAt,
-      pendingRequests: inFlightFor(tabId).requests.size
+      pendingRequests: pendingRequestCount(tabId, persistentAfter)
     };
   } finally {
     const remaining = (idleWatchers.get(tabId) || 1) - 1;
