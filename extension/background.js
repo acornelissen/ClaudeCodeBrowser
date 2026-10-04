@@ -253,19 +253,36 @@ function redactHeaderList(headers) {
 // can be disabled entirely with capture_bodies: false.
 // Names that mark a value as a credential. One list, mirrored in
 // extension/content.js's CREDENTIAL_NAME_RE - change one, change the other,
-// and a test pins them together.
+// and a test pins them together. Match through looksLikeCredentialName(),
+// never directly: it handles camelCase boundaries, which this pattern cannot.
 //
-// Deliberately loose, because over-redacting a log costs nothing and
-// under-redacting one costs a credential - but the short and
-// prefix-ambiguous ones are anchored, because they were matching words that
-// cannot name a credential: `auth` hid every `author` object in every
-// captured API response, `session` hid `sessionCount` and `sessionStorage`,
-// `pass` hid `passed` and `bypassCache`, and `otp` hid `notPublished`.
-// Anchoring them loses no credential name: `authorization`, `auth_token`,
-// `session_id`, `JSESSIONID`, `password`, `passphrase` and a bare `auth`,
-// `session`, `pass`, `otp` or `pin` all still match.
+// Deliberately loose, because over-redacting a log costs less than
+// under-redacting one - but the short and prefix-ambiguous entries are
+// anchored, because unanchored they matched words that cannot name a
+// credential: `auth` hid every `author` object in a captured API response,
+// `ssn` hid `className` (cla-ssn-ame) and `businessName`, `pass` hid `passed`
+// and `bypassCache`, `otp` hid `notPublished`.
 const SECRET_KEY_RE =
-  /(pass(?:word|wd|phrase|code)|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|authorization|authenticat|auth[-_]?(?:token|key|code|header|secret)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])ssn(?:[^a-z]|$)|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+
+// A credential-shaped NAME, from a JSON key, a form field name or an id.
+//
+// Tested against a copy with camelCase boundaries turned into separators,
+// because the anchors below only recognise a non-letter as a boundary. Without
+// that step, anchoring `auth` to stop it matching `author` also stopped
+// `otpCode`, `sessionValue`, `authData` and `pinCode` matching at all - names
+// the unanchored version did catch. So the anchoring that fixed over-redaction
+// silently introduced ten under-redactions, which is the worse direction.
+// Compound lowercase names have no boundary to find, so the credential ones
+// are listed explicitly: passkey, userpass, authz, authn, oauth.
+function normaliseNameForMatching(name) {
+  return String(name == null ? '' : name)
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+}
+
+function looksLikeCredentialName(name) {
+  return SECRET_KEY_RE.test(normaliseNameForMatching(name));
+}
 
 // Markup carries credentials in attributes, not just in JSON keys: a
 // server-rendered form with a prefilled password puts it in value="...",
@@ -281,7 +298,7 @@ function redactHtmlInputValues(text) {
   // looks like a credential field. Regex over HTML is crude, but this is
   // best-effort redaction of a log, not parsing.
   return text.replace(/<input\b[^>]*>/gi, (tag) => {
-    const looksSecret = SECRET_INPUT_RE.test(tag) || SECRET_KEY_RE.test(
+    const looksSecret = SECRET_INPUT_RE.test(tag) || looksLikeCredentialName(
       (tag.match(/(?:name|id)\s*=\s*["']?([^"'\s>]*)/i) || [])[1] || '');
     if (!looksSecret) return tag;
     return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
@@ -299,7 +316,13 @@ function redactHtmlInputValues(text) {
 const MAX_REDACT_DEPTH = 12;
 
 function redactStructure(value, depth = 0) {
-  if (depth > MAX_REDACT_DEPTH) return value;
+  if (depth > MAX_REDACT_DEPTH) {
+    // Fail CLOSED. This returned the raw subtree, so a credential nested
+    // deeper than the limit was logged in clear - and the old flat regex,
+    // which this replaced, scrubbed one at any depth. Depth 13 is ordinary
+    // in GraphQL and paginated API responses, so this was not a corner case.
+    return '[nested too deep; withheld]';
+  }
   if (typeof value === "string") {
     // A JSON string can itself hold a rendered form with a prefilled
     // password, so the text passes still have to run over it. Without this,
@@ -314,7 +337,7 @@ function redactStructure(value, depth = 0) {
     const out = {};
     for (const key of Object.keys(value)) {
       // A secret key hides its whole subtree, whatever shape it is.
-      out[key] = SECRET_KEY_RE.test(key)
+      out[key] = looksLikeCredentialName(key)
         ? "***"
         : redactStructure(value[key], depth + 1);
     }
@@ -330,7 +353,7 @@ function redactMultipartFields(text) {
   return text.replace(
     /(name\s*=\s*"([^"]*)"[^\r\n]*\r?\n(?:[^\r\n]+\r?\n)*\r?\n)([\s\S]*?)(?=\r?\n--|$)/g,
     (match, head, name, body) =>
-      (SECRET_KEY_RE.test(name) ? `${head}***` : match));
+      (looksLikeCredentialName(name) ? `${head}***` : match));
 }
 
 // The text passes, for a body that is not wholly JSON and for the strings
@@ -341,11 +364,11 @@ function redactTextPasses(text) {
   let out = text.replace(
     /([A-Za-z0-9_\-\[\]."]+)(\s*[:=]\s*)(["'])(?:(?!\3)[^\\]|\\.)*\3/g,
     (match, key, sep, quote) =>
-      (SECRET_KEY_RE.test(key) ? `${key}${sep}${quote}***${quote}` : match));
+      (looksLikeCredentialName(key) ? `${key}${sep}${quote}***${quote}` : match));
   // Unquoted JSON values: "otp": 654321, "verified": true.
   out = out.replace(
     /("(?:[^"\\]|\\.)*"\s*:\s*)(-?\d[\d.eE+-]*|true|false|null)/g,
-    (match, keyPart) => (SECRET_KEY_RE.test(keyPart) ? `${keyPart}"***"` : match));
+    (match, keyPart) => (looksLikeCredentialName(keyPart) ? `${keyPart}"***"` : match));
   out = redactMultipartFields(out);
   out = redactHtmlInputValues(out);
   // Form-encoded: key=value, anchored to a real pair separator and stopping
@@ -356,7 +379,7 @@ function redactTextPasses(text) {
   // leaking. The (?!=) guard keeps it off JS comparisons.
   out = out.replace(
     /(^|[&?;\s])([A-Za-z0-9_\-\[\].]+)=(?!=)([^&\s<>"';]*)/g,
-    (match, lead, key) => (SECRET_KEY_RE.test(key) ? `${lead}${key}=***` : match));
+    (match, lead, key) => (looksLikeCredentialName(key) ? `${lead}${key}=***` : match));
   return out;
 }
 
@@ -368,7 +391,20 @@ function redactSecretsInBody(text) {
     const trimmed = text.trim();
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
-        return JSON.stringify(redactStructure(JSON.parse(trimmed)));
+        const scrubbed = JSON.stringify(redactStructure(JSON.parse(trimmed)));
+        // Re-serialising is lossy: JSON.stringify(JSON.parse(x)) turns
+        // 12345678901234567890 into 12345678901234567000, 1e400 into null and
+        // 1.0 into 1. A Snowflake- or Twitter-style id in a captured body
+        // came back silently wrong. So only hand back the rebuilt text when
+        // rebuilding it actually removed something; otherwise the original
+        // bytes are both safe and exact. When something WAS removed the body
+        // is rewritten and a large id may lose precision - the *** says so,
+        // and redacting a credential is worth more than an exact id.
+        if (scrubbed.includes('***') ||
+            scrubbed.includes('[nested too deep; withheld]')) {
+          return scrubbed;
+        }
+        return text;
       } catch (e) {
         // Not valid JSON (or truncated); fall through to the text passes.
       }
@@ -1227,9 +1263,27 @@ async function takeScreenshot(tabId, options = {}) {
     // Compared on the resolved tab, not the raw argument: `tabId &&` was
     // falsy for tab id 0, and a numeric string never equalled the id.
     const needsFocus = targetTab && targetTab.id !== currentTab?.id;
+    const mayFocus = parseFlag(options.allowFocus, true);
     let originalActiveTab = null;
 
-    if (needsFocus && parseFlag(options.allowFocus, true)) {
+    // captureVisibleTab photographs the window's ACTIVE tab, so without
+    // focusing first there is no way to capture a background one. This used
+    // to return the active tab's image labelled with the REQUESTED tab's id,
+    // url and title, and wasFocused: true - so a screenshot of the user's
+    // open mail was filed on disk as a screenshot of some other page. Refuse
+    // instead: a wrong image presented as the right one is worse than an
+    // error, and allow_focus exists to say "do not disturb my browsing".
+    if (needsFocus && !mayFocus) {
+      return {
+        success: false,
+        error: `Cannot screenshot tab ${targetTab.id} without focusing it: ` +
+               'Firefox captures the active tab of a window, so the image ' +
+               'would be of whichever tab is in front. Either allow focus, ' +
+               'or focus the tab yourself first with browser_focus_tab.'
+      };
+    }
+
+    if (needsFocus && mayFocus) {
       // Store original active tab to restore later
       originalActiveTab = currentTab;
 

@@ -374,7 +374,16 @@
   // hands a credential to the agent in clear, which is worse than masking a
   // field that happens to be called "author".
   const CREDENTIAL_NAME_RE =
-    /(pass(?:word|wd|phrase|code)|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|authorization|authenticat|auth[-_]?(?:token|key|code|header|secret)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+    /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|(?:^|[^a-z])otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|(?:^|[^a-z])auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|(?:^|[^a-z])session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|(?:^|[^a-z])ssn(?:[^a-z]|$)|(?:^|[^a-z])pin(?:[^a-z]|$))/i;
+
+  // Matched through this, never directly: the anchors in the pattern only see
+  // a non-letter as a boundary, so without normalising camelCase first,
+  // otpCode, sessionValue, authData and pinCode do not match at all - and a
+  // field the DOM guard misses hands a credential to the agent in clear.
+  function looksLikeCredentialName(name) {
+    return CREDENTIAL_NAME_RE.test(
+      String(name == null ? '' : name).replace(/([a-z0-9])([A-Z])/g, '$1_$2'));
+  }
 
   function attributeOf(element, name) {
     if (!element || typeof element.getAttribute !== 'function') return null;
@@ -407,7 +416,7 @@
     // credential, so this is a substring match rather than an equality test.
     const name = element.name || attributeOf(element, 'name') || '';
     const id = element.id || attributeOf(element, 'id') || '';
-    return CREDENTIAL_NAME_RE.test(name) || CREDENTIAL_NAME_RE.test(id);
+    return looksLikeCredentialName(name) || looksLikeCredentialName(id);
   }
 
   function holdsEnteredValue(element) {
@@ -1730,12 +1739,38 @@
       element.value = options.value;
     } else if (element.isContentEditable) {
       element.textContent = options.value;
+    } else if (holdsEnteredValue(element)) {
+      // A custom element - <sl-input>, <ion-input>, <vaadin-text-field> -
+      // exposes a value property, and it is the element an agent must target
+      // because the real input is inside a shadow root. Assigning it is the
+      // honest attempt; verifying it is what stops a lie.
+      element.value = options.value;
+    } else {
+      // Everything else fell through to an unconditional {set: true}, so
+      // browser_set_value on a <div> reported success having changed nothing.
+      throw new Error(
+        `Cannot set a value on <${(element.tagName || '?').toLowerCase()}>: ` +
+        'it is not an input, textarea, select, contenteditable or ' +
+        'value-bearing custom element. Nothing was changed.');
     }
 
     element.dispatchEvent(new Event('input', { bubbles: true }));
     element.dispatchEvent(new Event('change', { bubbles: true }));
 
-    return { set: true, element: getElementInfo(element) };
+    // Read it back. A custom element may ignore the assignment entirely, and
+    // reporting set: true for an assignment the element dropped is the same
+    // lie in a different costume.
+    const readBack = element.isContentEditable
+      ? element.textContent
+      : element.value;
+    if (String(readBack) !== String(options.value)) {
+      throw new Error(
+        `The value did not take: asked for ${JSON.stringify(options.value)}, ` +
+        `the element now reads ${JSON.stringify(String(readBack))}. ` +
+        'The element may be controlled by a framework that overwrote it.');
+    }
+
+    return { set: true, value: options.value, element: getElementInfo(element) };
   }
 
   // Get attribute
@@ -1892,26 +1927,42 @@
     if (!text || passwordAllowed(options)) return { text, masked: 0 };
     let candidates;
     try {
+      // Filter FIRST, then cap. Capping the raw [contenteditable] list meant
+      // a Notion- or CMS-style page with 50 ordinary editable cells followed
+      // by one credential field never reached the credential field at all -
+      // so the exact leak this function exists to stop came back on any busy
+      // page. The cap is on how many credentials we mask, not on how many
+      // elements we look at.
       candidates = root.querySelectorAll
-        ? Array.from(root.querySelectorAll('[contenteditable]')).slice(
-            0, MAX_SCRUBBED_FIELDS)
+        ? Array.from(root.querySelectorAll('[contenteditable]'))
+            .filter(el => el !== root && isPasswordField(el))
+            .slice(0, MAX_SCRUBBED_FIELDS)
         : [];
     } catch (e) {
       candidates = [];
     }
 
-    let out = text;
-    let masked = 0;
+    const secrets = [];
     for (const field of candidates) {
-      if (field === root) continue;      // already handled above
-      if (!isPasswordField(field)) continue;
       const own = typeof field.innerText === 'string'
         ? field.innerText
         : (field.textContent || '');
       const secret = own.trim();
       // A one- or two-character "secret" is not worth masking every
       // occurrence of across a whole page.
-      if (secret.length < 3) continue;
+      if (secret.length >= 3) secrets.push(secret);
+    }
+
+    // Longest first. In document order, masking a shorter secret that is a
+    // PREFIX of a longer one destroys the longer one's text and leaves its
+    // tail behind: two fields holding "SSS1" and "SSS10" came out as
+    // "*** ***0", so a fragment of the second credential survived and it was
+    // not even counted as masked.
+    secrets.sort((a, b) => b.length - a.length);
+
+    let out = text;
+    let masked = 0;
+    for (const secret of secrets) {
       if (!out.includes(secret)) continue;
       out = out.split(secret).join('***');
       masked++;

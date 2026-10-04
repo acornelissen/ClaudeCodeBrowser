@@ -233,6 +233,21 @@ function fireRequest(webRequest, {
   }
 }
 
+// The real matcher, lifted from the source: the pattern alone is not the
+// decision - looksLikeCredentialName normalises camelCase first, and testing
+// the pattern directly is what let a regression through.
+function loadNameMatcher() {
+  const parts = [
+    SOURCE.match(/const SECRET_KEY_RE =\n  \/.*\/i;/),
+    SOURCE.match(/function normaliseNameForMatching[\s\S]*?\n\}/),
+    SOURCE.match(/function looksLikeCredentialName[\s\S]*?\n\}/)
+  ];
+  for (const [i, m] of parts.entries()) {
+    assert.ok(m, `could not lift credential-name part ${i} from background.js`);
+  }
+  return eval(parts.map(m => m[0]).join('\n') + '\nlooksLikeCredentialName');
+}
+
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
@@ -740,43 +755,84 @@ test('credential-shaped values inside bodies are scrubbed', async () => {
 });
 
 test('the credential-name list matches credentials and not ordinary words', () => {
-  // The short, prefix-ambiguous entries are anchored. Unanchored they matched
-  // words that cannot name a credential, and the cost is real in both
-  // directions: `auth` hid every `author` object in every captured API
-  // response, while missing a name hands over a secret.
-  const SECRET_KEY_RE = new RegExp(
-    SOURCE.match(/const SECRET_KEY_RE =\n  \/(.*)\/i;/)[1], 'i');
+  // These lists are derived from names real systems use - WebAuthn, OAuth,
+  // React, the DOM - NOT from reading the pattern. An earlier version of this
+  // test was fitted to the implementation: it listed the camelCase names that
+  // happened to pass and omitted every one that failed, so it certified a
+  // regex that had silently stopped matching passkey, otpCode, sessionValue,
+  // authData, authz, authn and oauth_verifier.
+  const matches = loadNameMatcher();
 
   const credentials = [
-    'password', 'passwd', 'passphrase', 'passcode', 'pass', 'user[password]',
-    'pwd', 'secret', 'client_secret', 'token', 'access_token',
-    'refresh_token', 'credential', 'one-time-code', 'otp', 'otp_code',
-    'authorization', 'Authorization', 'authentication', 'auth_token',
-    'authToken', 'x-auth', 'auth', 'api_key', 'apiKey', 'private_key',
-    'session', 'session_id', 'sessionToken', 'JSESSIONID', 'PHPSESSID',
-    'cvv', 'cvc', 'card_number', 'jwt', 'bearer', 'signature', 'ssn',
-    'pin', 'PIN'
+    // Passwords, in the spellings forms actually use.
+    'password', 'passwd', 'passphrase', 'passcode', 'pass', 'pwd',
+    'user[password]', 'userpass',
+    // WebAuthn.
+    'passkey', 'passKey',
+    // One-time codes.
+    'one-time-code', 'otp', 'otp_code', 'otpCode', 'otpValue',
+    // OAuth and HTTP auth.
+    'authorization', 'Authorization', 'authentication', 'auth', 'x-auth',
+    'auth_token', 'authToken', 'authData', 'authz', 'authn',
+    'oauth', 'oauth_verifier',
+    // Keys and tokens.
+    'secret', 'client_secret', 'token', 'access_token', 'refresh_token',
+    'credential', 'api_key', 'apiKey', 'private_key', 'jwt', 'bearer',
+    'signature',
+    // Sessions, including the servlet and PHP cookie names.
+    'session', 'session_id', 'sessionToken', 'sessionValue',
+    'JSESSIONID', 'PHPSESSID',
+    // Card and identity.
+    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode'
   ];
   for (const name of credentials) {
-    assert.ok(SECRET_KEY_RE.test(name), `${name} must be treated as a credential`);
+    assert.ok(matches(name), `${name} must be treated as a credential`);
   }
 
   const ordinary = [
+    // The ones anchoring was introduced to stop masking.
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
-    'bypassCache', 'compass', 'sessionCount', 'sessionStorage',
-    'notPublished', 'shipping', 'mapping', 'spinner', 'pinned', 'email',
-    'username', 'title', 'views', 'published', 'tags', 'id', 'name'
+    'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
+    'spinner', 'pinned',
+    // cla-SSN-ame: the single most common key in a React-shaped payload.
+    'className', 'classNames', 'businessName', 'addressName', 'witnessName',
+    'accessName', 'guessNumber',
+    // Ordinary payload fields.
+    'email', 'username', 'title', 'views', 'published', 'tags', 'id', 'name'
   ];
   for (const name of ordinary) {
-    assert.ok(!SECRET_KEY_RE.test(name),
+    assert.ok(!matches(name),
               `${name} is not a credential and must stay readable`);
   }
 
-  // Accepted over-redaction: a bare `session` followed by a delimiter is what
-  // catches `session=abcdef` in a cookie-shaped body, and that rule cannot
-  // tell `session_duration` from `session_id`. Redacting a duration costs
-  // nothing; missing a session token costs the session.
-  assert.ok(SECRET_KEY_RE.test('session_duration'));
+  // Accepted over-redaction, recorded so it is a decision rather than a bug.
+  // A bare `session` followed by a separator is what catches `session=abcdef`
+  // in a cookie-shaped body, and once camelCase is normalised to a separator
+  // that rule cannot tell `sessionCount` from `sessionValue`. Masking a count
+  // in a log costs little; missing a session token costs the session. Neither
+  // appears in captured JavaScript, because the text passes need a `:` or `=`
+  // straight after the name, so `sessionStorage.setItem(...)` is untouched.
+  for (const name of ['session_duration', 'sessionCount', 'sessionStorage']) {
+    assert.ok(matches(name), `${name} is expected to be over-redacted`);
+  }
+});
+
+test('anchoring a name rule never loses a name the loose version caught', () => {
+  // The regression guard for what actually went wrong: anchoring `auth` so it
+  // would stop matching `author` also stopped `otpCode` and friends matching
+  // at all, because the anchors only recognise a non-letter as a boundary.
+  // Nothing the original unanchored pattern treated as a credential may be
+  // dropped by a later tightening.
+  const matches = loadNameMatcher();
+  const ORIGINAL = /(pass(word|wd)?|pwd|secret|token|otp|one[-_]?time[-_]?code|auth|credential|api[-_]?key|private[-_]?key|session|cvv|card[-_]?number|ssn)/i;
+  const names = [
+    'passkey', 'passKey', 'userpass', 'otpCode', 'otpValue', 'oauth_verifier',
+    'authz', 'authn', 'sessionValue', 'authData', 'pinCode', 'cardNumber',
+    'password', 'api_key', 'private_key', 'JSESSIONID'
+  ];
+  const lost = names.filter(n => ORIGINAL.test(n) && !matches(n));
+  assert.deepEqual(lost, [],
+    `tightening dropped credential names the loose pattern caught: ${lost}`);
 });
 
 test('the DOM guard and the body scrubber use the same name list', () => {
@@ -789,6 +845,60 @@ test('the DOM guard and the body scrubber use the same name list', () => {
     /const CREDENTIAL_NAME_RE =\n    \/(.*)\/i;/)[1];
   assert.equal(fromContent, fromBackground,
     'content.js CREDENTIAL_NAME_RE has drifted from background.js SECRET_KEY_RE');
+
+  // The pattern alone is not the decision: both sides must also normalise
+  // camelCase before testing, or the anchors silently stop matching otpCode,
+  // sessionValue and authData - which is exactly what happened once.
+  for (const [where, src] of [['background.js', SOURCE],
+                              ['content.js', contentSource]]) {
+    assert.match(src, /replace\(\/\(\[a-z0-9\]\)\(\[A-Z\]\)\/g, '\$1_\$2'\)/,
+      `${where} must normalise camelCase before matching a credential name`);
+  }
+});
+
+test('a credential nested deeper than the walk limit is not logged', async () => {
+  // The structural walk returned the raw subtree past MAX_REDACT_DEPTH, so a
+  // credential nested deeper than 12 was logged verbatim - and the flat regex
+  // this replaced scrubbed one at any depth. Depth 13 is ordinary in GraphQL
+  // and paginated responses.
+  const deep = (n) => {
+    let o = { password: 'hunter2' };
+    for (let i = 0; i < n; i++) o = { a: o };
+    return JSON.stringify(o);
+  };
+  for (const depth of [5, 12, 13, 31]) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      method: 'POST',
+      requestBody: { raw: [{ bytes: new TextEncoder().encode(deep(depth)) }] }
+    });
+    const body = (await command('getNetworkLogs', {}, 7)).logs[0].requestBody;
+    assert.ok(!body.includes('hunter2'),
+              `a credential at depth ${depth} was logged: ${body.slice(0, 120)}`);
+  }
+});
+
+test('a captured body keeps its numbers exactly when nothing is redacted', async () => {
+  // Redaction re-serialised every JSON body, and JSON.stringify(JSON.parse(x))
+  // turns 12345678901234567890 into 12345678901234567000, 1e400 into null and
+  // 1.0 into 1 - so a Snowflake- or Twitter-style id in a captured body came
+  // back silently wrong, which is the kind of thing you capture a body to look
+  // at in the first place.
+  const cases = ['{"orderId": 12345678901234567890}', '{"big": 1e400}',
+                 '{"amount": 1.0}'];
+  for (const raw of cases) {
+    const { command, webRequest, filters } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, { complete: false });
+    filters[0].ondata({ data: new TextEncoder().encode(raw) });
+    filters[0].onstop();
+    webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.equal(entry.responseBody, raw,
+      `the body was rewritten although nothing needed redacting: ${raw}`);
+  }
 });
 
 test('an HTML form login does not log the password', async () => {
@@ -1478,6 +1588,31 @@ test('a private tab is refused when we cannot tell whether it is private', async
 
   assert.equal(result.success, false,
     'a privacy gate that cannot answer must refuse');
+});
+
+test('a background tab cannot be screenshotted without focusing it', async () => {
+  // captureVisibleTab photographs the window's ACTIVE tab, so with
+  // allow_focus false this returned the active tab's image labelled with the
+  // requested tab's id, url and title, and wasFocused: true - a screenshot of
+  // the user's open mail, filed as a screenshot of some other page.
+  const ctx = loadBackground();
+  const updates = [];
+  ctx.context.browser.tabs.update = async (id, opts) => { updates.push(id); };
+
+  const result = await ctx.command('screenshot',
+                                   { allowFocus: false }, 9);
+
+  assert.equal(result.success, false,
+    'a wrong image presented as the right one is worse than an error');
+  assert.match(result.error, /focus/i);
+  assert.deepEqual(updates, [], 'allow_focus: false must not focus anything');
+});
+
+test('allow_focus as the string "false" is honoured, not ignored', async () => {
+  const ctx = loadBackground();
+  const result = await ctx.command('screenshot',
+                                   { allowFocus: 'false' }, 9);
+  assert.equal(result.success, false);
 });
 
 test('a bulk screenshot sweep skips private windows', async () => {

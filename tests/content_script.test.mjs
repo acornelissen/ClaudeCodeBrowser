@@ -861,6 +861,49 @@ test('whole-page get_text does not return a contenteditable credential', async (
             'the rest of the page stays readable');
 });
 
+test('a credential field past the 50th editable element is still masked', async () => {
+  // The cap was applied to ALL contenteditable elements before the credential
+  // filter ran, so a Notion- or CMS-style page with 50 ordinary editable
+  // cells followed by one credential field never reached the credential -
+  // the exact leak this function exists to stop, back on any busy page.
+  const cells = Array.from({ length: 60 }, (_, i) =>
+    Object.assign(makeElement('div', { id: 'cell-' + i,
+                                       textContent: 'note ' + i }),
+                  { isContentEditable: true }));
+  const otp = Object.assign(
+    makeElement('div', { id: 'otp-code', textContent: '483920' }),
+    { isContentEditable: true });
+  const ctx = loadContentScript({ '[contenteditable]': [...cells, otp] });
+  ctx.document.body.innerText = 'note 0 note 1 483920 done';
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.ok(!result.text.includes('483920'),
+            `the OTP leaked from behind 60 ordinary cells: ${result.text}`);
+  assert.equal(result.maskedFields, 1);
+});
+
+test('a credential whose text starts with another is fully masked', async () => {
+  // In document order, masking a shorter secret that is a PREFIX of a longer
+  // one destroys the longer one's text and leaves its tail behind: two OTP
+  // fields holding "4839" and "48391" came out as "*** ***1", so a digit of
+  // the second credential survived and it was not counted as masked.
+  const a = makeElement('div', { id: 'otp-a', textContent: '4839' });
+  const b = makeElement('div', { id: 'otp-b', textContent: '48391' });
+  a.isContentEditable = true;
+  b.isContentEditable = true;
+  const ctx = loadContentScript({ '[contenteditable]': [a, b] });
+  ctx.document.body.innerText = 'codes 4839 and 48391 ok';
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.ok(!/4839/.test(result.text),
+            `a fragment of a credential survived: ${result.text}`);
+  assert.equal(result.maskedFields, 2);
+  assert.ok(result.text.includes('codes') && result.text.includes('ok'),
+            'the surrounding page stays readable');
+});
+
 test('whole-page get_text leaves ordinary contenteditable text alone', async () => {
   const notes = makeElement('div', { id: 'notes', textContent: 'Buy milk' });
   notes.isContentEditable = true;
@@ -872,6 +915,45 @@ test('whole-page get_text leaves ordinary contenteditable text alone', async () 
   assert.ok(result.text.includes('Buy milk'),
             'an ordinary editable field is not a credential');
   assert.equal(result.maskedFields, undefined);
+});
+
+test('set_value refuses an element it cannot set, instead of claiming success', async () => {
+  // Everything that was not INPUT/TEXTAREA/SELECT/contenteditable fell
+  // through to an unconditional {set: true}, so browser_set_value on a <div>
+  // reported success having changed nothing.
+  const div = makeElement('div', { id: 'q', textContent: 'old' });
+  const ctx = loadContentScript({ '#q': div });
+
+  const result = await ctx.send({ action: 'setValue', selector: '#q',
+                                  value: 'new' });
+
+  assert.equal(result.success, false, 'nothing was changed, so not success');
+  assert.match(result.error, /not an input|cannot set/i);
+  assert.equal(div.textContent, 'old');
+});
+
+test('set_value on a custom element verifies the value took', async () => {
+  // <sl-input> is the element an agent must target on Shoelace/Ionic/Vaadin
+  // pages, because the real input is inside a shadow root - the credential
+  // guard in this same file treats it that way. Assigning is the honest
+  // attempt; reading it back is what stops a lie when a framework overwrites.
+  const ok = makeElement('sl-input', { id: 'a', value: 'old' });
+  let ctx = loadContentScript({ '#a': ok });
+  let result = await ctx.send({ action: 'setValue', selector: '#a',
+                                value: 'new' });
+  assert.equal(result.set, true);
+  assert.equal(ok.value, 'new');
+
+  // One that ignores the assignment, as a controlled component does.
+  const stubborn = makeElement('sl-input', { id: 'b', value: 'old' });
+  Object.defineProperty(stubborn, 'value',
+                        { get: () => 'old', set: () => {} });
+  ctx = loadContentScript({ '#b': stubborn });
+  result = await ctx.send({ action: 'setValue', selector: '#b',
+                            value: 'new' });
+  assert.equal(result.success, false,
+    'an assignment the element dropped must not report set: true');
+  assert.match(result.error, /did not take/i);
 });
 
 // --------------------------------------------------------------------------
