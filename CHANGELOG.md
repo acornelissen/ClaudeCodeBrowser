@@ -9,6 +9,26 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.7.2]
+
+### Fixed
+- **Credential values in captured HTML bodies.** With `include_all_types`,
+  document bodies are captured, and the body scrubber only understood JSON
+  keys and form-encoded pairs — so a server-rendered form was logged as
+  `<input type="password" value="SuperSecret123!">` while
+  `browser_get_page_info` was correctly masking the same field. Credential-
+  looking `<input>` tags now have their `value` attribute blanked, in quoted
+  and unquoted forms. Ordinary fields, links and markup are untouched.
+- **Queued commands no longer replay.** A command the caller has already
+  timed out on sat in the queue indefinitely and executed whenever the browser
+  next reconnected — harmless for a read, an unrequested action for a click or
+  a type. Commands now expire after `COMMAND_QUEUE_TTL` (240s, above the
+  longest human-approval wait).
+
+Both were found by live testing, and neither could have been caught by the
+suite as written: the fixtures used well-formed JSON and clean booleans while
+the browser sends markup and strings.
+
 ## [1.7.1]
 
 ### Fixed
