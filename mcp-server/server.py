@@ -21,6 +21,7 @@ Author: dre@ligandal.com
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import math
@@ -338,6 +339,11 @@ class MCPTool:
 # Tools implemented only by the Playwright backend. In attended Firefox they
 # return "Unknown action", which is a confusing way to learn a tool does not
 # apply; browser_safety_status reports this list.
+# How long a single headless call may take before it is cancelled. Longer
+# than the 30s cap on browser_wait_and_act, so a legitimately slow wait
+# finishes rather than being cut off by this.
+HEADLESS_CALL_TIMEOUT = 35
+
 HEADLESS_ONLY_TOOLS = {
     'browser_eval_chain', 'browser_wait_and_act', 'browser_inject_observer',
 }
@@ -870,7 +876,7 @@ MCP_TOOLS: List[MCPTool] = [
                 "condition": {"type": "string", "description": "JS expression that returns truthy when ready."},
                 "action_script": {"type": "string", "description": "JS to run once condition is met."},
                 "poll_interval_ms": {"type": "integer", "default": 200, "description": "How often to check condition."},
-                "timeout_ms": {"type": "integer", "default": 15000, "description": "Max wait time before giving up."},
+                "timeout_ms": {"type": "integer", "default": 15000, "maximum": 30000, "description": "Max wait time before giving up. Values above 30000 are capped, and the result says so with timeout_capped."},
                 "tab_id": {"type": "integer", "description": "Optional tab ID."}
             }
         }
@@ -1550,9 +1556,25 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 future = asyncio.run_coroutine_threadsafe(
                     headless.execute(action, tab_id, arguments), loop
                 )
-                result = future.result(timeout=35)
+                result = future.result(timeout=HEADLESS_CALL_TIMEOUT)
                 guard.note_url(result)
                 return result
+            except concurrent.futures.TimeoutError:
+                # Cancel, do not just give up. Giving up left the coroutine
+                # running on the loop holding HeadlessBrowser's lock, so every
+                # later headless tool blocked for the life of the process -
+                # one slow call wedged the whole backend. The arguments are
+                # capped so this should not be reachable, which is exactly why
+                # it needs handling rather than hoping.
+                future.cancel()
+                logger.error(f"Headless {action} exceeded "
+                             f"{HEADLESS_CALL_TIMEOUT}s; cancelled")
+                return {
+                    'success': False,
+                    'error': f'The headless browser did not finish {action} '
+                             f'within {HEADLESS_CALL_TIMEOUT}s. The call was '
+                             'cancelled, so the backend is still usable.'
+                }
             except Exception as e:
                 logger.error(f"Headless backend failed: {e}")
                 return {'success': False, 'error': f'Headless execution failed: {e}'}

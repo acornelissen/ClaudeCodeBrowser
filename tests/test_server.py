@@ -7,6 +7,7 @@ Run: python3 -m unittest discover -s tests -v
 
 import asyncio
 import base64
+import inspect
 import os
 import re
 import sys
@@ -167,6 +168,36 @@ class CommandQueueTests(unittest.TestCase):
         """A captcha prompt blocks for 200s; dropping that command would make
         the guard's own flow unusable."""
         self.assertGreater(server.COMMAND_QUEUE_TTL, 200)
+
+
+class HeadlessDeadlineTests(unittest.TestCase):
+    """A headless call that outran its deadline was abandoned, not cancelled,
+    so the coroutine kept HeadlessBrowser's lock and every later headless tool
+    blocked for the life of the process - one slow call wedged the backend."""
+
+    def test_an_overrunning_call_is_cancelled_not_just_abandoned(self):
+        source = inspect.getsource(server.MCPHTTPHandler._dispatch_action)
+        self.assertIn('future.cancel()', source,
+                      'the future must be cancelled, or its coroutine keeps '
+                      'the headless lock for ever')
+        self.assertIn('concurrent.futures.TimeoutError', source,
+                      'the timeout has to be caught specifically to cancel it')
+
+    def test_the_deadline_outlasts_the_wait_and_act_cap(self):
+        """A legitimately slow browser_wait_and_act must finish rather than be
+        cut off by the dispatch deadline."""
+        import headless_backend
+        self.assertGreater(server.HEADLESS_CALL_TIMEOUT * 1000,
+                           headless_backend.MAX_WAIT_AND_ACT_TIMEOUT_MS)
+
+    def test_the_schema_states_the_cap_it_enforces(self):
+        tool = next(t for t in server.MCP_TOOLS
+                    if t.name == 'browser_wait_and_act')
+        schema = tool.input_schema['properties']['timeout_ms']
+        import headless_backend
+        self.assertEqual(schema['maximum'],
+                         headless_backend.MAX_WAIT_AND_ACT_TIMEOUT_MS,
+                         'the schema must advertise the cap the backend applies')
 
 
 class RetentionConfigTests(unittest.TestCase):
