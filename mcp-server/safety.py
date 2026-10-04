@@ -61,6 +61,14 @@ _CONFIG_FILE = Path(os.environ.get(
 ))
 _AUDIT_FILE = Path.home() / '.claudecodebrowser' / 'logs' / 'audit.jsonl'
 
+# An audit log written by an older version is world-readable; tighten it on
+# import rather than waiting for the next entry.
+try:
+    if _AUDIT_FILE.exists() and _AUDIT_FILE.stat().st_mode & 0o077:
+        _AUDIT_FILE.chmod(0o600)
+except OSError:
+    pass
+
 # Schemes a navigation target may use. Anything else (file:, javascript:,
 # data:, chrome:, resource:, moz-extension:, about:config ...) is refused.
 _SAFE_URL_RE = re.compile(r'^(https?://|about:blank$)', re.IGNORECASE)

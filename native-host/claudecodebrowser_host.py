@@ -51,24 +51,33 @@ if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5 * 1024 * 1024:
 # CLAUDE_BROWSER_HOST_DEBUG=1 restores it for debugging; see describe_message.
 _HOST_DEBUG = os.environ.get('CLAUDE_BROWSER_HOST_DEBUG') == '1'
 
-logging.basicConfig(
-    level=logging.DEBUG if _HOST_DEBUG else logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stderr)
-    ]
-)
-logger = logging.getLogger(__name__)
+class _PrivateFileHandler(logging.FileHandler):
+    """File handler that keeps its file to this user, including on re-open."""
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
+        return stream
+
 
 # The log lives next to the API token; keep both to this user.
 try:
     LOG_DIR.chmod(0o700)
-    if LOG_FILE.exists():
-        LOG_FILE.stat()
-        os.chmod(LOG_FILE, 0o600)
 except OSError:
     pass
+
+logging.basicConfig(
+    level=logging.DEBUG if _HOST_DEBUG else logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        _PrivateFileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stderr)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 def describe_message(message):

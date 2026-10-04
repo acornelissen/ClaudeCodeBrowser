@@ -61,22 +61,39 @@ from logging.handlers import RotatingFileHandler
 
 _SERVER_DEBUG = os.environ.get('CLAUDE_BROWSER_DEBUG') == '1'
 
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """Rotating handler that keeps every file it creates to this user.
+
+    chmod'ing the log once at startup is not enough: rotation creates a fresh
+    file at the prevailing umask, so the current log drifts back to 0644 the
+    first time it rolls over.
+    """
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
+        return stream
+
+
+try:
+    LOG_DIR.chmod(0o700)
+except OSError:
+    pass
+
 logging.basicConfig(
     level=logging.DEBUG if _SERVER_DEBUG else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3),
+        _PrivateRotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024,
+                                    backupCount=3),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
-
-try:
-    LOG_DIR.chmod(0o700)
-    if LOG_FILE.exists():
-        os.chmod(LOG_FILE, 0o600)
-except OSError:
-    pass
 
 # Headless mode: CLAUDE_BROWSER_HEADLESS=1 or --headless flag
 HEADLESS_MODE = os.environ.get('CLAUDE_BROWSER_HEADLESS', '0') == '1' or '--headless' in sys.argv
