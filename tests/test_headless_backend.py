@@ -25,10 +25,16 @@ Run: python3 -m unittest tests.test_headless_backend -v
 """
 
 import asyncio
+import base64
 import inspect
 import json
 import logging
+import os
 import re
+import pwd
+import shutil
+import stat
+import subprocess
 import sys
 import types
 import unittest
@@ -56,10 +62,17 @@ SECRET = 'hunter2-correct-horse'
 # --------------------------------------------------------------------------
 # Interpreting the production credential-guard JS against a fake element.
 #
-# There is no JS engine here, so the conditions are read back out of the
-# real source strings. That keeps these tests honest: if the production
-# token list or type checks change, what the fake answers changes with it,
-# rather than the fake quietly encoding what the guard ought to say.
+# Playwright is not installed, so the fake page below answers the guard
+# probes in Python, by reading the conditions back out of the real source
+# strings. That is fast enough to use on every probe in the suite, but it
+# cannot catch a predicate that parses and then decides wrongly: sabotaging
+# _credential_js to return "(<real predicate>) && false" - which lets EVERY
+# credential be filled - left the whole suite green.
+#
+# So the real JavaScript is also run, by node, in
+# RealCredentialPredicateTests below, and PredicateFakeParityTests pins the
+# Python interpretation above against node's answers for the same elements.
+# That is what keeps the fake honest.
 # --------------------------------------------------------------------------
 
 _TOKEN_LIST_RE = re.compile(r"\[([^\]]+)\]\s*\.includes\(t\)")
@@ -91,9 +104,19 @@ class Element:
         self.autocomplete = autocomplete
         self.value = value
 
+    def spec(self):
+        """This element as the literal the node harness builds from."""
+        return {'tag': self.tag, 'type': self.input_type,
+                'autocomplete': self.autocomplete}
+
 
 def eval_field_predicate(script: str, el) -> bool:
-    """Evaluate a credential-guard script against a fake element."""
+    """Evaluate a credential-guard script against a fake element.
+
+    A Python reading of the production JS, not the JS itself. Kept in step
+    with it by PredicateFakeParityTests, which runs both over the same
+    elements and compares.
+    """
     if el is None:
         return False
     if "tagName === 'INPUT'" in script and el.tag != 'INPUT':
@@ -108,6 +131,111 @@ def eval_field_predicate(script: str, el) -> bool:
 
 def is_guard_probe(script: str) -> bool:
     return '.includes(t)' in script and 'tagName' in script
+
+
+# --------------------------------------------------------------------------
+# Running the production credential-guard JS for real, in node.
+# --------------------------------------------------------------------------
+
+NODE = shutil.which('node')
+
+# tests/__init__.py points HOME at a temp directory, and a version manager
+# shimming node (mise here, but nvm and asdf behave the same) keeps its state
+# under the real home - so the shim fails before node ever starts. pwd gives
+# this account's home whatever HOME says, which is what node is run with.
+# Everything else in the environment is left alone.
+_REAL_HOME = pwd.getpwuid(os.getuid()).pw_dir
+_NODE_ENV = dict(os.environ, HOME=_REAL_HOME)
+
+
+def _node_runs() -> bool:
+    """True when the node on PATH actually starts.
+
+    Probed rather than assumed: `node` existing on PATH is not the same as
+    node running, and a guard test that errors out on its own tooling is
+    noise, while one that silently passes is worse.
+    """
+    if NODE is None:
+        return False
+    try:
+        probe = subprocess.run([NODE, '-e', 'process.stdout.write("ok")'],
+                               capture_output=True, text=True, timeout=60,
+                               env=_NODE_ENV)
+    except OSError:
+        return False
+    return probe.returncode == 0 and probe.stdout.strip() == 'ok'
+
+# Reads {"script", "mode", "elements"} on stdin and writes the predicate's
+# answer for each element as a JSON array of booleans.
+#
+# mode 'element' evaluates the probe headless_backend hands to
+# eval_on_selector, which takes the element as its argument. mode 'focused'
+# evaluates the whole string the focused-element path builds, which takes no
+# argument and reads document.activeElement - so document is stubbed.
+_PREDICATE_HARNESS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const compiled = eval('(' + input.script + ')');
+
+// Playwright evaluates the string as an expression and calls the result
+// only when it is a function; anything else is taken as the value itself.
+// Mirroring that matters: a predicate mangled into "(el => ...) && false"
+// evaluates to the boolean false, which Playwright reports as "not a
+// credential" for every element. Calling it blindly would instead throw,
+// and read as a broken harness rather than a broken guard.
+function apply(el, focused) {
+  if (typeof compiled !== 'function') return !!compiled;
+  return focused ? !!compiled() : !!compiled(el);
+}
+
+function element(spec) {
+  if (spec === null) return null;
+  return {
+    tagName: spec.tag,
+    // HTMLInputElement.type is normalised to lower case by the DOM, so
+    // type="PASSWORD" in the markup still reads back as 'password'. The
+    // autocomplete attribute is NOT normalised: getAttribute returns it
+    // verbatim, which is why the guard lower-cases it itself.
+    type: (spec.type || '').toLowerCase(),
+    // The guard reads autocomplete through getAttribute, which gives null
+    // for an absent attribute, not ''.
+    getAttribute: (name) =>
+      (name === 'autocomplete' ? spec.autocomplete : null),
+  };
+}
+
+const answers = input.elements.map((spec) => {
+  const el = element(spec);
+  const focused = input.mode === 'focused';
+  if (focused) global.document = { activeElement: el };
+  return apply(el, focused);
+});
+process.stdout.write(JSON.stringify(answers));
+"""
+
+
+def run_predicate_in_node(script: str, specs, mode='element'):
+    """The real predicate's answers for each element spec, from node."""
+    payload = json.dumps({'script': script, 'mode': mode,
+                          'elements': list(specs)})
+    proc = subprocess.run([NODE, '-e', _PREDICATE_HARNESS],
+                          input=payload, capture_output=True, text=True,
+                          timeout=60, env=_NODE_ENV)
+    if proc.returncode != 0:
+        raise AssertionError(
+            f'node could not evaluate the guard predicate: {proc.stderr}')
+    return json.loads(proc.stdout)
+
+
+def spec(tag='INPUT', input_type='text', autocomplete=None):
+    return {'tag': tag, 'type': input_type, 'autocomplete': autocomplete}
+
+
+# A credential guard that cannot be executed is not a tested guard, so the
+# skip is loud about what is no longer covered.
+requires_node = unittest.skipUnless(
+    _node_runs(),
+    'node does not run here, so the real credential-guard JS cannot be '
+    'executed')
 
 
 # --------------------------------------------------------------------------
@@ -273,10 +401,18 @@ class FakePage:
             listener()
 
     async def screenshot(self, path=None, full_page=False):
+        """Playwright returns the PNG bytes when no path is given.
+
+        path is still recorded so a test can pin that the backend does NOT
+        pass one: Playwright's own write follows symlinks and uses umask
+        permissions.
+        """
         self.calls.append(('screenshot', path, full_page))
         self.screenshot_paths.append(path)
-        with open(path, 'wb') as fh:
-            fh.write(b'\x89PNG fake')
+        if path is not None:
+            with open(path, 'wb') as fh:
+                fh.write(b'\x89PNG fake')
+        return b'\x89PNG fake'
 
     async def evaluate(self, script):
         self.evaluate_count += 1
@@ -561,12 +697,78 @@ class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Refused', str(ctx.exception))
         self.assertEqual(calls_named(page, 'keyboard.press'), [])
 
+    # Regression test. Was: headless_backend.py:677 - the guard asked
+    # `len(key) == 1 and key.isprintable()`. Playwright's keyboard.press
+    # also takes 'KeyA', 'Digit1', 'Space', 'Minus' and 'Shift+a'; every one
+    # of them inserts a character and not one of them is a single character,
+    # so the guard that is supposed to stop a credential being entered one
+    # keystroke at a time never looked at them.
+    async def test_press_key_refuses_playwright_key_codes(self):
+        for key in ('KeyA', 'KeyZ', 'Digit1', 'Space', 'Minus', 'Equal',
+                    'Backquote', 'Backslash', 'Semicolon', 'Quote', 'Period',
+                    'Slash', 'Numpad5', 'NumpadEnter', 'Shift+a',
+                    'Shift+KeyA', 'Control+v'):
+            with self.subTest(key=key):
+                browser, page = make_browser(
+                    elements={'#pw': Element(input_type='password')})
+                with self.assertRaises(RuntimeError) as ctx:
+                    await browser._dispatch('pressKey', None,
+                                            {'selector': '#pw', 'key': key})
+                self.assertIn('Refused', str(ctx.exception))
+                self.assertEqual(calls_named(page, 'keyboard.press'), [],
+                                 f'{key} reached the keyboard')
+
+    async def test_press_key_refuses_a_key_code_into_a_focused_credential(self):
+        """The no-selector path types into document.activeElement, which is
+        how the original credential bypass worked."""
+        browser, page = make_browser(
+            active=Element(input_type='password'))
+        with self.assertRaises(RuntimeError) as ctx:
+            await browser._dispatch('pressKey', None, {'key': 'KeyA'})
+        self.assertIn('Refused', str(ctx.exception))
+        self.assertEqual(calls_named(page, 'keyboard.press'), [])
+
     async def test_press_key_allows_navigation_keys(self):
         browser, page = make_browser(elements={'#q': Element()})
         result = await browser._dispatch(
             'pressKey', None, {'selector': '#q', 'key': 'Enter', 'ctrl': True})
         self.assertTrue(result['success'])
         self.assertEqual(result['key'], 'Control+Enter')
+
+    async def test_press_key_allows_keys_that_cannot_type_into_a_credential(self):
+        """Moving around and clearing a credential field is not entering
+        one, so the allowlist has to stay usable."""
+        for key in ('Enter', 'Tab', 'Escape', 'Backspace', 'Delete',
+                    'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+                    'Home', 'End', 'PageUp', 'PageDown', 'Insert',
+                    'F5', 'F12', 'Shift', 'Control', 'Alt', 'Meta',
+                    'CapsLock'):
+            with self.subTest(key=key):
+                browser, page = make_browser(
+                    elements={'#pw': Element(input_type='password')})
+                result = await browser._dispatch(
+                    'pressKey', None, {'selector': '#pw', 'key': key})
+                self.assertTrue(result['success'], result)
+                self.assertEqual(result['key'], key)
+
+    async def test_press_key_into_an_ordinary_field_is_not_guarded(self):
+        browser, page = make_browser(elements={'#q': Element()})
+        for key in ('a', 'KeyA', 'Space', 'Shift+a'):
+            with self.subTest(key=key):
+                result = await browser._dispatch('pressKey', None,
+                                                 {'selector': '#q',
+                                                  'key': key})
+                self.assertTrue(result['success'], result)
+
+    async def test_allow_password_lets_a_key_code_through(self):
+        browser, page = make_browser(
+            elements={'#pw': Element(input_type='password')})
+        result = await browser._dispatch('pressKey', None,
+                                         {'selector': '#pw', 'key': 'KeyA',
+                                          'allow_password': True})
+        self.assertTrue(result['success'], result)
+        self.assertEqual(calls_named(page, 'keyboard.press'),
+                         [('keyboard.press', 'KeyA')])
 
     async def test_press_key_requires_a_key(self):
         browser, page = make_browser()
@@ -710,20 +912,146 @@ class GuardDefinitionParityTests(unittest.TestCase):
         for name, script in self.scripts().items():
             with self.subTest(predicate=name):
                 self.assertTrue(baseline <= credential_tokens(script))
-                self.assertIn("el.type === 'password'", script)
 
-    def test_tokens_are_lowercased_and_split_on_whitespace(self):
-        for name, script in self.scripts().items():
+
+def predicates():
+    """Both predicates the module builds: write guard and read mask."""
+    return {'write': HeadlessBrowser._credential_js(include_hidden=False),
+            'read': HeadlessBrowser._credential_js(include_hidden=True)}
+
+
+@requires_node
+class RealCredentialPredicateTests(unittest.TestCase):
+    """The production credential predicate, executed by node.
+
+    Everything else in this file answers the guard probes from a Python
+    reading of the predicate's source text, so a predicate that parses but
+    decides wrongly passed unnoticed: making _credential_js return
+    "(<real predicate>) && false" - every credential fillable - left the
+    suite green. These tests run the string the backend actually sends into
+    the page, so a predicate that answers wrongly fails here.
+    """
+
+    def answers(self, script, specs, mode='element'):
+        return run_predicate_in_node(script, specs, mode)
+
+    def test_a_password_input_is_a_credential_to_both_predicates(self):
+        for name, script in predicates().items():
             with self.subTest(predicate=name):
-                self.assertIn('.toLowerCase()', script)
-                self.assertIn('split(/\\s+/)', script)
+                self.assertEqual(
+                    self.answers(script, [spec(input_type='password')]),
+                    [True])
+
+    def test_every_token_in_the_tuple_is_a_credential(self):
+        tokens = list(HeadlessBrowser.CREDENTIAL_AUTOCOMPLETE_TOKENS)
+        specs = [spec(autocomplete=t) for t in tokens]
+        for name, script in predicates().items():
+            with self.subTest(predicate=name):
+                self.assertEqual(self.answers(script, specs),
+                                 [True] * len(tokens),
+                                 f'tokens: {tokens}')
+
+    def test_tokens_are_matched_case_insensitively(self):
+        specs = [spec(autocomplete='Current-Password'),
+                 spec(autocomplete='CC-NUMBER')]
+        for name, script in predicates().items():
+            with self.subTest(predicate=name):
+                self.assertEqual(self.answers(script, specs), [True, True])
+
+    def test_a_token_inside_a_whitespace_list_is_found(self):
+        specs = [spec(autocomplete='section-login current-password'),
+                 spec(autocomplete='  billing\tcc-csc\n'),
+                 spec(autocomplete='shipping cc-exp-month')]
+        for name, script in predicates().items():
+            with self.subTest(predicate=name):
+                self.assertEqual(self.answers(script, specs),
+                                 [True, True, True])
+
+    def test_an_ordinary_field_is_not_a_credential(self):
+        specs = [spec(),
+                 spec(input_type='text', autocomplete='username'),
+                 spec(input_type='email', autocomplete='email'),
+                 spec(input_type='text', autocomplete='name'),
+                 # A near miss must not match: the guard splits on
+                 # whitespace rather than looking for a substring.
+                 spec(autocomplete='not-current-password'),
+                 spec(autocomplete='cc-number-confirm'),
+                 None]
+        for name, script in predicates().items():
+            with self.subTest(predicate=name):
+                self.assertEqual(self.answers(script, specs),
+                                 [False] * len(specs))
+
+    def test_only_a_real_input_counts(self):
+        """The predicate requires tagName INPUT, so a textarea or a div
+        carrying a credential autocomplete is not treated as one."""
+        specs = [spec(tag='TEXTAREA', autocomplete='current-password'),
+                 spec(tag='DIV', autocomplete='cc-number'),
+                 spec(tag='SELECT', autocomplete='cc-exp-month')]
+        for name, script in predicates().items():
+            with self.subTest(predicate=name):
+                self.assertEqual(self.answers(script, specs),
+                                 [False, False, False])
 
     def test_only_the_read_mask_treats_hidden_inputs_as_credentials(self):
         """Hidden inputs carry CSRF and session tokens, so their values are
         masked on read - but writing to one is legitimate, and refusing it
         broke ordinary form fills."""
-        self.assertIn("el.type === 'hidden'", self.scripts()['read'])
-        self.assertNotIn("el.type === 'hidden'", self.scripts()['write'])
+        hidden = [spec(input_type='hidden')]
+        self.assertEqual(self.answers(predicates()['read'], hidden), [True])
+        self.assertEqual(self.answers(predicates()['write'], hidden), [False])
+
+    def test_the_focused_path_script_runs_and_reads_activeelement(self):
+        """The focused path wraps the predicate in its own script and sends
+        that whole string into the page; this runs it as written."""
+        script = (
+            "() => { const el = document.activeElement; "
+            f"return ({HeadlessBrowser._credential_js(include_hidden=False)})"
+            "(el); }")
+        self.assertEqual(
+            run_predicate_in_node(script, [spec(input_type='password'),
+                                           spec(autocomplete='one-time-code'),
+                                           spec(),
+                                           None], mode='focused'),
+            [True, True, False, False])
+
+
+@requires_node
+class PredicateFakeParityTests(unittest.TestCase):
+    """eval_field_predicate answers the guard probes for the rest of this
+    file. It is a Python reading of the production JS, so it can drift from
+    it - and while it does, every other credential test is testing the fake.
+    These compare the two over the same elements."""
+
+    def cases(self):
+        specs = [None, spec(), spec(input_type='password'),
+                 spec(input_type='hidden'),
+                 spec(input_type='PASSWORD'),
+                 spec(tag='TEXTAREA', autocomplete='current-password'),
+                 spec(tag='DIV'),
+                 spec(autocomplete='username'),
+                 spec(autocomplete='not-current-password'),
+                 spec(autocomplete='Current-Password'),
+                 spec(autocomplete='section-login current-password')]
+        specs += [spec(autocomplete=t)
+                  for t in HeadlessBrowser.CREDENTIAL_AUTOCOMPLETE_TOKENS]
+        return specs
+
+    def test_the_python_fake_agrees_with_node(self):
+        specs = self.cases()
+        for name, script in predicates().items():
+            real = run_predicate_in_node(script, specs)
+            fake = [eval_field_predicate(
+                script, Element(input_type=s['type'],
+                                autocomplete=s['autocomplete'],
+                                tag=s['tag']) if s is not None else None)
+                for s in specs]
+            for one, expected, got in zip(specs, real, fake):
+                with self.subTest(predicate=name, element=one):
+                    self.assertEqual(
+                        got, expected,
+                        'the Python stand-in for the guard disagrees with '
+                        'the real JavaScript')
 # ==========================================================================
 # 2. evalChain
 # ==========================================================================
@@ -973,6 +1301,58 @@ class WaitAndActTests(unittest.IsolatedAsyncioTestCase):
             'condition': 'COND', 'action_script': 'ACT', 'timeout_ms': 0})
         self.assertTrue(result['success'])
 
+    # Regression test. Was: headless_backend.py:790 - poll_interval_ms got a
+    # floor but timeout_ms stayed unbounded, and browser_wait_and_act's
+    # schema declares no maximum. timeout_ms = 10**12 holds
+    # HeadlessBrowser._lock for about 31 years, and server.py abandons the
+    # future at 35s without cancelling the coroutine - so every later
+    # headless tool blocks for ever. That is exactly the wedge the comment
+    # above the poll floor claims is fixed.
+    async def test_an_enormous_timeout_is_capped(self):
+        with unittest.mock.patch.object(
+                headless_backend, 'MAX_WAIT_AND_ACT_TIMEOUT_MS', 50):
+            browser, page = self._browser([False] * 50)
+            # Bounded, because an uncapped timeout_ms would hang the run
+            # instead of failing it.
+            result = await asyncio.wait_for(
+                browser._dispatch('waitAndAct', None, {
+                    'condition': 'COND', 'action_script': 'ACT',
+                    'poll_interval_ms': 50, 'timeout_ms': 10 ** 12}),
+                timeout=5)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['timeout_ms'], 50)
+        self.assertTrue(result['timeout_capped'],
+                        'the caller asked for 10**12ms and got 50; the result '
+                        'has to say so')
+        self.assertIn('50ms', result['error'])
+
+    async def test_a_capped_call_that_succeeds_also_reports_the_cap(self):
+        with unittest.mock.patch.object(
+                headless_backend, 'MAX_WAIT_AND_ACT_TIMEOUT_MS', 50):
+            browser, page = self._browser([True], action_result='ok')
+            result = await browser._dispatch('waitAndAct', None, {
+                'condition': 'COND', 'action_script': 'ACT',
+                'timeout_ms': 10 ** 12})
+        self.assertTrue(result['success'])
+        self.assertTrue(result['timeout_capped'])
+        self.assertEqual(result['timeout_ms'], 50)
+
+    async def test_a_timeout_under_the_cap_is_left_alone(self):
+        browser, page = self._browser([False] * 20)
+        result = await browser._dispatch('waitAndAct', None, {
+            'condition': 'COND', 'action_script': 'ACT',
+            'poll_interval_ms': 1, 'timeout_ms': 5})
+        self.assertNotIn('timeout_capped', result,
+                         'a timeout that was honoured must not be reported '
+                         'as capped')
+
+    def test_the_cap_leaves_room_before_the_future_is_abandoned(self):
+        """server.py gives a headless call 35s (future.result(timeout=35))
+        and does not cancel the coroutine when it gives up, so a call that
+        outlives that deadline keeps HeadlessBrowser._lock and blocks every
+        later headless tool. The cap has to come first."""
+        self.assertLess(headless_backend.MAX_WAIT_AND_ACT_TIMEOUT_MS, 35000)
+
 
 # ==========================================================================
 # 4. solveCaptcha
@@ -1100,12 +1480,99 @@ class ScreenshotTests(unittest.IsolatedAsyncioTestCase):
                 browser, page = make_browser()
                 result = await browser._dispatch('screenshot', None,
                                                  {'filename': hostile})
-                written = Path(page.screenshot_paths[-1]).resolve()
+                written = Path(result['filepath']).resolve()
                 self.assertEqual(written.parent,
                                  headless_backend.SCREENSHOTS_DIR.resolve())
                 self.assertEqual(result['filename'], 'evil.png')
                 self.assertTrue(result['success'])
                 self.assertEqual(result['size'], len(b'\x89PNG fake'))
+
+    # Regression test. Was: headless_backend.py:415 - the headless branch
+    # handed the path to Playwright, which writes it with a plain
+    # open(path, 'wb'). That followed a symlink and used umask permissions.
+    # The attended path and the native host were both hardened to
+    # O_CREAT|O_WRONLY|O_TRUNC|O_NOFOLLOW at 0600 and this one was missed,
+    # and server.py returns the headless result without passing it through
+    # _save_screenshot, so nothing downstream made up for it.
+    async def test_the_file_is_private_to_this_user(self):
+        browser, page = make_browser()
+        result = await browser.execute('screenshot', None,
+                                       {'filename': 'private.png'})
+        self.assertTrue(result['success'], result)
+        mode = stat.S_IMODE(os.stat(result['filepath']).st_mode)
+        self.assertEqual(mode, 0o600, oct(mode))
+
+    async def test_a_symlink_at_the_target_name_is_not_followed(self):
+        """Someone who can write the screenshots directory pre-creates the
+        name as a symlink; the capture then truncated the link's target as
+        this user."""
+        victim = self.shots_dir / 'victim.txt'
+        victim.write_text('do not truncate me')
+        link = self.shots_dir / 'shot.png'
+        os.symlink(victim, link)
+        self.addCleanup(link.unlink, missing_ok=True)
+
+        browser, page = make_browser()
+        result = await browser.execute('screenshot', None,
+                                       {'filename': 'shot.png'})
+
+        self.assertFalse(result['success'], result)
+        self.assertEqual(victim.read_text(), 'do not truncate me')
+
+    async def test_playwright_is_not_asked_to_write_the_file(self):
+        """The capture comes back as bytes so this file can do the write
+        itself; passing path= hands the write to Playwright's plain open()."""
+        browser, page = make_browser()
+        await browser._dispatch('screenshot', None, {'filename': 'a.png'})
+        self.assertEqual(page.screenshot_paths, [None])
+
+    # Regression test. Was: headless_backend.py:401-428 - save_to_file is
+    # declared by browser_screenshot's schema and honoured by the attended
+    # path, and the string does not appear in headless_backend at all. A
+    # caller that explicitly declined a disk copy got one anyway, and got no
+    # image data back either, so there was no way to take a screenshot
+    # without leaving it on disk.
+    async def test_save_to_file_false_writes_nothing(self):
+        before = set(self.shots_dir.iterdir())
+        browser, page = make_browser()
+        result = await browser._dispatch('screenshot', None,
+                                         {'filename': 'nope.png',
+                                          'save_to_file': False})
+        self.assertTrue(result['success'], result)
+        self.assertFalse(result['saved'])
+        self.assertNotIn('filepath', result)
+        self.assertEqual(set(self.shots_dir.iterdir()), before,
+                         'nothing may be written when save_to_file is false')
+
+    async def test_save_to_file_false_returns_the_image_instead(self):
+        browser, page = make_browser()
+        result = await browser._dispatch('screenshot', None,
+                                         {'save_to_file': False})
+        self.assertTrue(result['data'].startswith('data:image/png;base64,'))
+        self.assertEqual(
+            base64.b64decode(result['data'].split(',', 1)[1]),
+            b'\x89PNG fake',
+            'declining the disk copy must still hand back the capture')
+        self.assertEqual(result['size'], len(b'\x89PNG fake'))
+
+    async def test_save_to_file_false_as_a_string_still_declines(self):
+        """bool("false") is True, which is why the attended path coerces."""
+        before = set(self.shots_dir.iterdir())
+        browser, page = make_browser()
+        result = await browser._dispatch('screenshot', None,
+                                         {'save_to_file': 'false'})
+        self.assertFalse(result['saved'])
+        self.assertEqual(set(self.shots_dir.iterdir()), before)
+
+    async def test_save_to_file_defaults_to_writing_the_file(self):
+        browser, page = make_browser()
+        result = await browser._dispatch('screenshot', None,
+                                         {'filename': 'default.png'})
+        self.assertTrue(result['saved'])
+        self.assertTrue(Path(result['filepath']).is_file())
+        self.assertNotIn('data', result,
+                         'the saved path already reports the file; the image '
+                         'does not need to be inlined as well')
 
     async def test_generated_filename_when_none_given(self):
         browser, page = make_browser()
@@ -1130,16 +1597,24 @@ class ScreenshotTests(unittest.IsolatedAsyncioTestCase):
     # target path becomes the screenshots directory itself. Nothing escapes
     # the directory, but the write fails with an unrelated IsADirectoryError
     # instead of the filename being rejected or replaced.
-    async def test_dot_dot_filename_is_rejected_or_replaced(self):
+    #
+    # This used to accept either outcome - a generated name OR a refusal
+    # naming the filename - which meant two contradictory behaviours both
+    # passed and neither was pinned. The generated name is the intended one:
+    # it is what the attended path (server.py's _save_screenshot) and the
+    # native host both do, and test_a_directory_only_filename_falls_back_to_
+    # a_generated_name in tests/test_native_host.py pins the same thing.
+    async def test_a_directory_only_filename_falls_back_to_a_generated_name(self):
         for hostile in ('..', '.', '../', 'foo/..'):
             with self.subTest(filename=hostile):
                 browser, page = make_browser()
                 result = await browser.execute('screenshot', None,
                                                {'filename': hostile})
-                if result['success']:
-                    self.assertNotEqual(Path(result['filepath']).name, '')
-                else:
-                    self.assertIn('filename', result['error'].lower())
+                self.assertTrue(result['success'], result)
+                self.assertTrue(result['filename'].startswith('screenshot_'),
+                                result['filename'])
+                self.assertEqual(Path(result['filepath']).parent.resolve(),
+                                 headless_backend.SCREENSHOTS_DIR.resolve())
 
 
 # ==========================================================================

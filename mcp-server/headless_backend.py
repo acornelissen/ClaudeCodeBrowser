@@ -32,6 +32,16 @@ SCREENSHOTS_DIR = resolve_screenshots_dir()
 # negative values turned the poll loop into an infinite one.
 MIN_POLL_INTERVAL_MS = 10
 
+# Ceiling for waitAndAct's timeout, in ms. The poll floor above fixed half
+# the wedge and left the other half: timeout_ms stayed unbounded and
+# browser_wait_and_act's schema declares no maximum, so timeout_ms = 10**12
+# (about 31 years) held HeadlessBrowser._lock for the life of the server.
+# server.py abandons the future at 35s but does not cancel the coroutine, so
+# the lock stayed held and every later headless tool blocked for ever. Kept
+# under that 35s deadline so the call always finishes before the caller
+# stops waiting for it.
+MAX_WAIT_AND_ACT_TIMEOUT_MS = 30000
+
 # Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
 BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
 
@@ -307,6 +317,37 @@ class HeadlessBrowser:
                 'to override.'
             )
 
+    # Keys that cannot put a character into a field, in Playwright's
+    # keyboard.press naming: navigation, editing, function and modifier keys.
+    #
+    # An allowlist, because the predicate it replaces tried to spot the keys
+    # that DO type and missed almost all of them: `len(key) == 1 and
+    # key.isprintable()` saw 'a', but Playwright also accepts 'KeyA',
+    # 'Digit1', 'Space', 'Minus', 'Numpad5' and 'Shift+a', every one of which
+    # inserts a character and none of which is one character long. Anything
+    # not listed here is assumed to type, so a key name Playwright adds later
+    # is guarded by default instead of waved through.
+    _KEYS_THAT_CANNOT_TYPE = frozenset((
+        'arrowleft', 'arrowright', 'arrowup', 'arrowdown',
+        'home', 'end', 'pageup', 'pagedown',
+        'backspace', 'delete', 'escape', 'esc', 'tab', 'enter', 'insert',
+        'shift', 'control', 'alt', 'meta', 'controlormeta',
+        'shiftleft', 'shiftright', 'controlleft', 'controlright',
+        'altleft', 'altright', 'metaleft', 'metaright', 'altgraph',
+        'capslock', 'numlock', 'scrolllock', 'pause', 'printscreen',
+        'contextmenu', 'help', 'clear',
+    )) | frozenset(f'f{n}' for n in range(1, 25))
+
+    @classmethod
+    def _key_can_type(cls, key: str) -> bool:
+        """True when pressing this key could enter a character."""
+        # 'Shift+a' and 'Control+KeyO' name modifiers before the key itself,
+        # and only the last part can type. 'Control++' ends in a literal '+'.
+        # A modifier in front does not make the key safe - Control+v pastes -
+        # so the modifiers are dropped rather than trusted.
+        actual = key.split('+')[-1].strip() or '+'
+        return actual.lower() not in cls._KEYS_THAT_CANNOT_TYPE
+
     # The directions browser_scroll's schema allows.
     _RELATIVE_DIRECTIONS = {'up': (0, -1), 'down': (0, 1),
                             'left': (-1, 0), 'right': (1, 0)}
@@ -411,20 +452,53 @@ class HeadlessBrowser:
             filename = Path(args.get('filename') or generated).name
             if filename in ('', '.', '..'):
                 filename = generated
-            filepath = SCREENSHOTS_DIR / filename
-            await page.screenshot(
-                path=str(filepath),
+            # Captured into memory, not written by Playwright. Handing
+            # Playwright a path= made it write the file with a plain
+            # open(path, 'wb'): umask permissions (0644) and symlinks
+            # followed, so with a shared CLAUDE_BROWSER_SCREENSHOTS_DIR
+            # someone could pre-create a predictable name as a symlink and
+            # have another of this user's files truncated. The attended path
+            # (_save_screenshot in server.py) and the native host were both
+            # hardened to O_NOFOLLOW at 0600; this branch was missed, and
+            # server.py returns the headless result without passing it
+            # through _save_screenshot, so nothing downstream covered for it.
+            image = await page.screenshot(
                 full_page=parse_flag(args.get('full_page'), False))
-            data = filepath.read_bytes()
-            # The headless path writes through Playwright rather than
+
+            # save_to_file is in browser_screenshot's schema and the attended
+            # path honours it; this branch did not mention it at all, so a
+            # caller that explicitly declined a disk copy got one anyway -
+            # and no image either, because the bytes were never returned.
+            # parse_flag for the same reason _save_screenshot uses it:
+            # bool("false") is True.
+            if not parse_flag(args.get('save_to_file'), True):
+                return {
+                    'success': True,
+                    'saved': False,
+                    'filename': filename,
+                    'size': len(image),
+                    'data': 'data:image/png;base64,'
+                            + base64.b64encode(image).decode('ascii'),
+                    'message': 'Screenshot not written to disk: save_to_file '
+                               'was false. The image is in this response only.'
+                }
+
+            filepath = SCREENSHOTS_DIR / filename
+            flags = (os.O_CREAT | os.O_WRONLY | os.O_TRUNC |
+                     getattr(os, 'O_NOFOLLOW', 0))
+            fd = os.open(str(filepath), flags, 0o600)
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(image)
+            # The headless path does its own write rather than going through
             # server.py's _save_screenshot, so without this the retention
             # policy simply did not exist in headless mode.
             prune_screenshots(SCREENSHOTS_DIR)
             return {
                 'success': True,
+                'saved': True,
                 'filepath': str(filepath),
                 'filename': filename,
-                'size': len(data),
+                'size': len(image),
                 'message': f'Screenshot saved to {filepath}'
             }
 
@@ -671,11 +745,12 @@ class HeadlessBrowser:
             # which are untrusted and have no default action, so it cannot
             # enter text. Playwright's keyboard.press REALLY types - so this
             # path could enter a credential one character at a time, which is
-            # the historical bypass in a different costume. A printable key
-            # into a credential field is refused; navigation and editing keys
-            # stay allowed.
-            printable = len(key) == 1 and key.isprintable()
-            if printable and args.get('allow_password') is not True:
+            # the historical bypass in a different costume. A key that could
+            # type is refused on a credential field; navigation and editing
+            # keys stay allowed. See _KEYS_THAT_CANNOT_TYPE for why this is
+            # an allowlist.
+            if self._key_can_type(key) and \
+                    args.get('allow_password') is not True:
                 if selector:
                     if await self._is_password_field(page, selector,
                                                      include_hidden=False):
@@ -787,7 +862,13 @@ class HeadlessBrowser:
             # also keeps a tiny interval from becoming a busy spin.
             poll_ms = max(parse_int(args.get('poll_interval_ms'), 200),
                           MIN_POLL_INTERVAL_MS)
-            timeout_ms = parse_int(args.get('timeout_ms'), 15000)
+            requested_ms = parse_int(args.get('timeout_ms'), 15000)
+            timeout_ms = min(requested_ms, MAX_WAIT_AND_ACT_TIMEOUT_MS)
+            # Reported back, because a call that waited 30s when it asked for
+            # 31 years otherwise looks like the page never settled. Only when
+            # the cap actually bit, so an honoured timeout stays quiet.
+            capped = ({'timeout_ms': timeout_ms, 'timeout_capped': True}
+                      if timeout_ms != requested_ms else {})
             elapsed = 0
             # Tested after the body, not before it: `while elapsed < timeout_ms`
             # skipped the body entirely on timeout_ms=0, so an already-true
@@ -801,7 +882,7 @@ class HeadlessBrowser:
                     # blaming the condition.
                     return {'success': False,
                             'error': f'Condition evaluation failed: {e}',
-                            'elapsed_ms': elapsed}
+                            'elapsed_ms': elapsed, **capped}
                 if ready:
                     # Outside the try, and returned either way: the action is
                     # allowed to run exactly once. Previously a throwing action
@@ -812,15 +893,16 @@ class HeadlessBrowser:
                     except Exception as e:
                         return {'success': False,
                                 'error': f'Action failed: {e}',
-                                'elapsed_ms': elapsed}
-                    return {'success': True, 'result': result, 'elapsed_ms': elapsed}
+                                'elapsed_ms': elapsed, **capped}
+                    return {'success': True, 'result': result,
+                            'elapsed_ms': elapsed, **capped}
                 if elapsed + poll_ms >= timeout_ms:
                     break
                 await asyncio.sleep(poll_ms / 1000)
                 elapsed += poll_ms
             return {'success': False,
                     'error': f'Condition not met within {timeout_ms}ms',
-                    'elapsed_ms': elapsed}
+                    'elapsed_ms': elapsed, **capped}
 
         elif action == 'injectObserver':
             selector = args.get('selector', 'body')

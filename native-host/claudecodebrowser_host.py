@@ -231,9 +231,19 @@ def read_message(stream=None):
 
     payload = _read_exactly(stream, message_length)
     try:
-        return json.loads(payload.decode('utf-8'))
+        message = json.loads(payload.decode('utf-8'))
     except (UnicodeDecodeError, ValueError) as e:
         raise MessageDecodeError(str(e)) from e
+    if not isinstance(message, dict):
+        # `5`, `"hi"`, `[1,2,3]` and `true` are all valid JSON, so they used
+        # to come straight back and reach message.get() in main() as an
+        # AttributeError - logged as "Fatal error", then sys.exit(1). A frame
+        # of `null` was worse: it returned None, which main() cannot tell
+        # from Firefox closing the pipe. The frame was read in full, so the
+        # stream is still aligned: one bad message, not a dead stream.
+        raise MessageDecodeError(
+            f'expected a JSON object, got {type(message).__name__}')
+    return message
 
 
 def send_message(message, stream=None):
@@ -262,6 +272,22 @@ def send_message(message, stream=None):
             if isinstance(message, dict) and message.get('requestId') is not None:
                 replacement['requestId'] = message['requestId']
             encoded = json.dumps(replacement).encode('utf-8')
+
+            if len(encoded) > MAX_OUTGOING_MESSAGE_BYTES:
+                # The requestId is copied straight out of the message that
+                # did not fit, so it can be the reason it did not fit: a
+                # 2 MB requestId made the replacement break the same limit,
+                # and Firefox drops THAT and tears the port down - the exact
+                # outcome this replacement exists to prevent. Drop the
+                # correlation id rather than the port. Whoever was waiting
+                # on it waits out its timeout, but the connection survives
+                # and every later command still works.
+                logger.error(
+                    f"The replacement failure is {len(encoded)} bytes too, "
+                    f"because the requestId itself is oversized; sending it "
+                    f"without the requestId")
+                replacement.pop('requestId', None)
+                encoded = json.dumps(replacement).encode('utf-8')
 
         stream.write(struct.pack(NATIVE_LENGTH_FORMAT, len(encoded)))
         stream.write(encoded)
@@ -566,8 +592,15 @@ def kill_existing_server():
 # thread (through start_mcp_server), from the main thread and from the signal
 # handler (through shutdown). Rebuilding it unlocked could drop a child that
 # another thread had just appended - exactly the one it was meant to reap.
+#
+# RLock, not Lock, precisely because of that signal handler. Python runs
+# handlers on the main thread, so SIGTERM can land while the main thread is
+# already inside _reap_finished_children: the handler calls shutdown(), which
+# reaps again, and a non-reentrant lock made that a self-deadlock. The host
+# then ignored SIGTERM and SIGINT and needed SIGKILL - and Firefox SIGTERMs
+# native hosts when the port closes, so they accumulated.
 _spawned_children = []
-_spawned_children_lock = threading.Lock()
+_spawned_children_lock = threading.RLock()
 
 
 def _reap_finished_children():

@@ -325,6 +325,51 @@ class ChildReapingTests(unittest.TestCase):
         self.assertTrue(appended.wait(1), 'the appending thread never ran')
         self.assertEqual(host._spawned_children, [late])
 
+    # Regression test. Was: claudecodebrowser_host.py:580 - the list is
+    # guarded by a plain threading.Lock, and the comment above it says the
+    # list is touched "from the signal handler (through shutdown)". Python
+    # runs signal handlers on the main thread, so a SIGTERM landing while
+    # that thread is already inside _reap_finished_children re-enters the
+    # lock and self-deadlocks. The host then ignores SIGTERM and SIGINT and
+    # only dies to SIGKILL - and Firefox SIGTERMs native hosts when the port
+    # closes, so they pile up.
+    def test_a_signal_arriving_mid_reap_can_still_shut_down(self):
+        self.addCleanup(setattr, host, 'health_monitor_running',
+                        host.health_monitor_running)
+        host.health_monitor_running = True
+        reentered = []
+
+        class SignalDuringPoll:
+            """Stands in for the handler, which runs on this same thread."""
+
+            def __init__(self):
+                self.signalled = False
+
+            def poll(self):
+                if not self.signalled:
+                    self.signalled = True
+                    # The lock is probed with a timeout before shutdown() is
+                    # called for real: a non-reentrant lock would block here
+                    # for the life of the process, hanging the whole test run
+                    # instead of failing this one, and would stay held for
+                    # every test after it.
+                    taken = host._spawned_children_lock.acquire(timeout=1)
+                    reentered.append(taken)
+                    if taken:
+                        host._spawned_children_lock.release()
+                        host.shutdown()
+                return 0
+
+        host._spawned_children[:] = [SignalDuringPoll()]
+        host._reap_finished_children()
+
+        self.assertEqual(reentered, [True],
+                         'the reaper lock must be reentrant, or a signal '
+                         'landing mid-reap deadlocks the host')
+        self.assertFalse(host.health_monitor_running,
+                         'the handler has to get through shutdown()')
+        self.assertEqual(host._spawned_children, [])
+
     def test_the_health_monitor_reaps_without_restarting(self):
         """Reaping used to happen only inside the next start_mcp_server(),
         which does not run during backoff and never runs again after
@@ -370,8 +415,24 @@ class FramingTests(unittest.TestCase):
 
     def test_the_length_prefix_is_native_byte_order(self):
         """Firefox documents the prefix as native byte order, so '<I' would
-        be wrong on a big-endian host, not more portable."""
-        self.assertEqual(host.NATIVE_LENGTH_FORMAT, '@I')
+        be wrong on a big-endian host rather than more portable.
+
+        Asserted through the framing. This used to compare the format
+        literal with the same literal, which cannot fail whatever the host
+        does with it.
+        """
+        payload = b'{"action": "ping"}'
+        self.assertEqual(
+            host.read_message(io.BytesIO(
+                struct.pack('=I', len(payload)) + payload)),
+            {'action': 'ping'})
+        # The same length written the other way round reads as hundreds of
+        # megabytes, so it is refused rather than silently mis-framed. True
+        # on either endianness: each order looks huge read as the other.
+        other_order = '>I' if sys.byteorder == 'little' else '<I'
+        with self.assertRaises(host.FramingError):
+            host.read_message(io.BytesIO(
+                struct.pack(other_order, len(payload)) + payload))
 
     def test_a_valid_frame_round_trips(self):
         message = {'action': 'ping', 'requestId': 'abc'}
@@ -452,6 +513,34 @@ class FramingTests(unittest.TestCase):
         with self.assertRaises(host.MessageDecodeError):
             host.read_message(io.BytesIO(framed(b'\xff\xfe')))
 
+    # Regression test. Was: claudecodebrowser_host.py:234 - read_message
+    # returned whatever json.loads produced without checking it is an
+    # object. A frame of `5`, `"hi"` or `[1,2,3]` is valid JSON, so it came
+    # straight back and reached message.get() in main() as an
+    # AttributeError, which the top-level handler logs as "Fatal error"
+    # before sys.exit(1): one malformed frame shut the host down.
+    def test_a_frame_that_is_not_an_object_is_one_bad_message(self):
+        for payload in (b'5', b'"hi"', b'[1,2,3]', b'true', b'3.5'):
+            with self.subTest(payload=payload):
+                stream = io.BytesIO(framed(payload)
+                                    + framed(b'{"action": "ping"}'))
+                with self.assertRaises(host.MessageDecodeError):
+                    host.read_message(stream)
+                self.assertEqual(host.read_message(stream),
+                                 {'action': 'ping'},
+                                 'the frame was read in full, so the stream '
+                                 'is still aligned')
+
+    def test_a_null_frame_is_not_mistaken_for_end_of_stream(self):
+        """`null` is valid JSON and came back as None - indistinguishable
+        from Firefox closing the pipe, so a frame of `null` made main() log
+        a clean disconnect and exit. That defeated the three-outcome
+        distinction the rest of this class pins."""
+        stream = io.BytesIO(framed(b'null') + framed(b'{"action": "ping"}'))
+        with self.assertRaises(host.MessageDecodeError):
+            host.read_message(stream)
+        self.assertEqual(host.read_message(stream), {'action': 'ping'})
+
 
 class SendMessageTests(unittest.TestCase):
 
@@ -479,6 +568,38 @@ class SendMessageTests(unittest.TestCase):
         self.assertIn('limit', sent['error'])
         self.assertNotIn('xxxx', sent['error'],
                          'the dropped payload must not be echoed back')
+
+    # Regression test. Was: claudecodebrowser_host.py:246-266 - the
+    # replacement copies requestId verbatim and is never re-measured, so an
+    # oversized requestId produced an oversized replacement. Firefox drops
+    # that one too AND tears the port down, which is the exact outcome the
+    # replacement exists to prevent. The test above asserts the bound but
+    # its fixture uses requestId 'abc', so the bound was never exercised.
+    def test_an_oversized_request_id_does_not_make_an_oversized_failure(self):
+        out = io.BytesIO()
+        huge_id = 'r' * (host.MAX_OUTGOING_MESSAGE_BYTES + 1)
+        host.send_message({'requestId': huge_id, 'success': True,
+                           'data': 'small'}, out)
+
+        self.assertLessEqual(len(out.getvalue()),
+                             host.MAX_OUTGOING_MESSAGE_BYTES)
+        sent = host.read_message(io.BytesIO(out.getvalue()))
+        self.assertFalse(sent['success'])
+        self.assertIn('limit', sent['error'])
+        self.assertNotIn('rrrr', json.dumps(sent),
+                         'an id that does not fit must be dropped, not '
+                         'echoed back')
+
+    def test_a_non_dict_message_is_still_framed_within_the_limit(self):
+        """send_message is also reachable with a non-dict (a list response
+        forwarded from the MCP server), and the oversize path reads
+        requestId off it."""
+        out = io.BytesIO()
+        host.send_message(['x' * (host.MAX_OUTGOING_MESSAGE_BYTES + 1)], out)
+        self.assertLessEqual(len(out.getvalue()),
+                             host.MAX_OUTGOING_MESSAGE_BYTES)
+        self.assertFalse(host.read_message(
+            io.BytesIO(out.getvalue()))['success'])
 
 
 if __name__ == '__main__':
