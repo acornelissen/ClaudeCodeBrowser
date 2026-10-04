@@ -19,7 +19,8 @@ os.environ['HOME'] = _TMP_HOME
 os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
 os.environ.pop('CLAUDE_BROWSER_SAFETY_CONFIG', None)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'mcp-server'))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'mcp-server'))
 
 import safety  # noqa: E402
 import server  # noqa: E402
@@ -58,7 +59,13 @@ class CredentialGuardPlumbingTests(unittest.TestCase):
         'browser_set_value',
         'browser_get_value',
         'browser_get_elements',
+        'browser_get_page_info',
     )
+
+    # browser_get_attribute is deliberately absent: it is not in
+    # tool_action_map, so it is not an exposed MCP tool and the agent cannot
+    # call it. content.js still guards the handler as defence in depth for the
+    # extension-internal message path.
 
     def _prepared_arguments(self, tool_name):
         """Run a tool through the server's argument preparation and return the
@@ -95,11 +102,22 @@ class CredentialGuardPlumbingTests(unittest.TestCase):
         finally:
             guard.config['allow_password_typing'] = original
 
-    def test_page_info_masks_password_values(self):
-        """getPageInfo's own masking is the precedent the read guard follows."""
-        content_js = (Path(__file__).resolve().parent.parent
-                      / 'extension' / 'content.js').read_text()
-        self.assertIn("el.type === 'password' ? '***'", content_js)
+    def test_every_value_returning_path_uses_the_shared_guard(self):
+        """A grep for one branch's masking string is what let the
+        getPageInfo leak through: forms[] masked, interactiveElements[] did
+        not, and the test passed. Assert instead that no reader builds its own
+        value expression -- behaviour is covered by the content-script suite,
+        which drives the real code."""
+        content_js = (ROOT / 'extension' / 'content.js').read_text()
+
+        self.assertIn('function safeElementValue(', content_js,
+                      'there should be one place that decides what a value looks like')
+
+        # No path may slice a raw .value into a result any more.
+        offenders = [line.strip() for line in content_js.splitlines()
+                     if 'value:' in line and '.value?.substring' in line]
+        self.assertEqual(offenders, [],
+                         f'these read paths bypass safeElementValue: {offenders}')
 
 
 class SafetyGuardTests(unittest.TestCase):

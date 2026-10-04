@@ -184,7 +184,7 @@
       case "scroll":
         return performScroll(message);
       case "getPageInfo":
-        return getPageInfo();
+        return getPageInfo(message);
       case "getElements":
         return getElements(message);
       case "highlight":
@@ -246,11 +246,45 @@
   // Credential guard: credentials never pass through the AI — neither written
   // into a password field nor read back out of one — unless the safety config
   // explicitly allows it. They belong in the browser's own password manager.
+  // autocomplete is a space-separated token list and is case-insensitive, so
+  // "Current-Password", "current-password " and the spec-legal
+  // "section-login current-password" all have to match. Beyond passwords,
+  // one-time codes and card fields are credentials too: they are not
+  // type=password, so nothing else in here would have protected them.
+  const CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set([
+    'current-password', 'new-password', 'one-time-code',
+    'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'
+  ]);
+
   function isPasswordField(element) {
-    return element.tagName === 'INPUT' &&
-      (element.type === 'password' ||
-       element.getAttribute('autocomplete') === 'current-password' ||
-       element.getAttribute('autocomplete') === 'new-password');
+    if (!element || element.tagName !== 'INPUT') return false;
+    if (element.type === 'password') return true;
+    const autocomplete = element.getAttribute('autocomplete');
+    if (!autocomplete) return false;
+    return autocomplete
+      .toLowerCase()
+      .split(/\s+/)
+      .some(token => CREDENTIAL_AUTOCOMPLETE_TOKENS.has(token));
+  }
+
+  // Hidden inputs routinely carry CSRF tokens, session ids and order ids.
+  // They are never something the agent needs the value of.
+  function isConcealedValueField(element) {
+    return isPasswordField(element) ||
+      (element && element.tagName === 'INPUT' && element.type === 'hidden');
+  }
+
+  // The single place that decides what an element's value looks like to the
+  // agent. Every reader goes through this so a new reader cannot reintroduce
+  // the getPageInfo leak.
+  function safeElementValue(element, limit, options) {
+    if (element && isPasswordField(element) && !passwordAllowed(options)) {
+      return element.value ? '***' : null;
+    }
+    if (element && isConcealedValueField(element) && !passwordAllowed(options)) {
+      return element.value ? '***' : null;
+    }
+    return element?.value?.substring(0, limit) || null;
   }
 
   // The server sets allow_password, but camelize_args() in server.py rewrites
@@ -272,15 +306,57 @@
     }
   }
 
+  // Both prompts are rendered inside a closed shadow root on a host element
+  // whose own styles are set with !important. The page can still cover the
+  // viewport, so this is not a trustworthy channel in the strong sense -- the
+  // only trustworthy place for a decision is browser chrome -- but it stops
+  // the page reading the prompt, restyling it away, or finding its buttons.
+  function createPromptRoot(hostId) {
+    const existing = document.getElementById(hostId);
+    if (existing) existing.remove();
+
+    const host = document.createElement('div');
+    host.id = hostId;
+    host.setAttribute('style', [
+      'all: initial !important',
+      'position: fixed !important',
+      'top: 0 !important',
+      'left: 0 !important',
+      'right: 0 !important',
+      'z-index: 2147483647 !important',
+      'display: block !important',
+      'visibility: visible !important',
+      'opacity: 1 !important',
+      'pointer-events: auto !important',
+      'transform: none !important'
+    ].join(';'));
+
+    // A closed root: page script cannot reach into it via host.shadowRoot.
+    const root = host.attachShadow ? host.attachShadow({ mode: 'closed' }) : host;
+    (document.body || document.documentElement).appendChild(host);
+    return { host, root };
+  }
+
+  // A decision is only a decision if a person made it. Synthetic clicks from
+  // page script carry isTrusted === false, which is the difference between a
+  // human approving and the site approving on its own behalf.
+  function onHumanClick(element, handler) {
+    element.addEventListener('click', (event) => {
+      if (!event.isTrusted) {
+        console.warn('[ClaudeCodeBrowser] ignoring untrusted click on prompt');
+        return;
+      }
+      handler();
+    });
+  }
+
   // Human approval banner: Approve/Deny prompt rendered on the page,
   // resolved by a real click from the person at the browser
   function requestApproval(options) {
     return new Promise((resolve) => {
-      const existing = document.getElementById('__ccb_approval_banner');
-      if (existing) existing.remove();
+      const { host, root } = createPromptRoot('__ccb_approval_host');
 
       const banner = document.createElement('div');
-      banner.id = '__ccb_approval_banner';
       banner.style.cssText = [
         'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
         'background:#1a1a2e', 'color:#fff', 'padding:14px 20px',
@@ -315,14 +391,14 @@
       banner.appendChild(textWrap);
       banner.appendChild(approveBtn);
       banner.appendChild(denyBtn);
-      (document.body || document.documentElement).appendChild(banner);
+      root.appendChild(banner);
 
       const timeoutMs = options.timeout || 60000;
       let settled = false;
       function finish(approved, timedOut) {
         if (settled) return;
         settled = true;
-        banner.remove();
+        host.remove();
         resolve({
           success: true,
           approved: approved,
@@ -331,8 +407,8 @@
         });
       }
 
-      approveBtn.addEventListener('click', () => finish(true, false));
-      denyBtn.addEventListener('click', () => finish(false, false));
+      onHumanClick(approveBtn, () => finish(true, false));
+      onHumanClick(denyBtn, () => finish(false, false));
       setTimeout(() => finish(false, true), timeoutMs);
     });
   }
@@ -384,17 +460,18 @@
       return { success: true, present: false, message: 'No captcha detected on the page.' };
     }
     if (detection.widgets.every(w => w.solved === true)) {
-      return { success: true, present: true, solved: true,
-               message: 'Captcha already solved.', widgets: detection.widgets };
+      return { success: true, present: true, solved: true, humanVerified: false,
+               message: 'Captcha reports itself already solved. The response ' +
+                        'token is page-writable, so this is not proof a human ' +
+                        'solved it.',
+               widgets: detection.widgets };
     }
 
     return new Promise((resolve) => {
-      const existing = document.getElementById('__ccb_captcha_banner');
-      if (existing) existing.remove();
+      const { host, root } = createPromptRoot('__ccb_captcha_host');
 
       const types = detection.widgets.map(w => w.type).join(', ');
       const banner = document.createElement('div');
-      banner.id = '__ccb_captcha_banner';
       banner.style.cssText = [
         'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
         'background:#0f3460', 'color:#fff', 'padding:14px 20px',
@@ -426,7 +503,7 @@
       banner.appendChild(textWrap);
       banner.appendChild(doneBtn);
       banner.appendChild(cancelBtn);
-      (document.body || document.documentElement).appendChild(banner);
+      root.appendChild(banner);
 
       const timeoutMs = options.timeout || 180000;
       const start = Date.now();
@@ -436,7 +513,7 @@
         if (settled) return;
         settled = true;
         clearInterval(poll);
-        banner.remove();
+        host.remove();
         resolve({ success: true, present: true, elapsedMs: Date.now() - start, ...payload });
       }
 
@@ -445,17 +522,31 @@
         const now = detectCaptcha();
         const tokened = now.widgets.filter(w => w.solved !== null);
         if (tokened.length && tokened.every(w => w.solved === true)) {
-          finish({ solved: true, resolvedBy: 'token', widgets: now.widgets });
+          // The response token is a page-writable DOM value, so this is
+          // evidence the challenge completed, not proof a human acted.
+          finish({ solved: true, resolvedBy: 'token', humanVerified: false,
+                   widgets: now.widgets });
         } else if (Date.now() - start > timeoutMs) {
           finish({ solved: false, timedOut: true, widgets: now.widgets });
         }
       }, 1000);
 
-      doneBtn.addEventListener('click', () =>
+      onHumanClick(doneBtn, () =>
         finish({ solved: true, resolvedBy: 'human', widgets: detectCaptcha().widgets }));
-      cancelBtn.addEventListener('click', () =>
+      onHumanClick(cancelBtn, () =>
         finish({ solved: false, cancelled: true }));
     });
+  }
+
+  // XPath 1.0 has no escape syntax, so a string containing both quote
+  // characters has to be built with concat().
+  function xpathLiteral(value) {
+    const text = String(value);
+    if (!text.includes('"')) return `"${text}"`;
+    if (!text.includes("'")) return `'${text}'`;
+    return 'concat(' + text.split('"')
+      .map(part => `"${part}"`)
+      .join(', \'"\', ') + ')';
   }
 
   // Find element by various selectors
@@ -474,8 +565,11 @@
       );
       element = result.singleNodeValue;
     } else if (options.text) {
-      // Find by text content
-      const xpath = `//*[contains(text(), "${options.text}")]`;
+      // Find by text content. The needle is quoted with concat() so a label
+      // containing a quote cannot close the literal and graft on a predicate
+      // of its own -- a page could otherwise choose which element the agent
+      // "clicked by text" actually hits.
+      const xpath = `//*[contains(text(), ${xpathLiteral(options.text)})]`;
       const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
       element = result.singleNodeValue;
     } else if (options.x !== undefined && options.y !== undefined) {
@@ -502,6 +596,8 @@
     if (!element) {
       throw new Error(`Element not found with options: ${JSON.stringify(options)}`);
     }
+
+    let defaultPrevented = null;
 
     // Scroll element into view
     element.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -558,16 +654,19 @@
       element.dispatchEvent(mouseDown);
       await sleep(50);
       element.dispatchEvent(mouseUp);
-      element.dispatchEvent(click);
-
-      // Also try native click for form elements
-      if (element.click) {
-        element.click();
-      }
+      // One click only. Dispatching the synthetic event and then calling
+      // element.click() delivered two click events per browser_click, so any
+      // non-idempotent handler ran twice -- two items added, two submits.
+      defaultPrevented = !element.dispatchEvent(click);
     }
 
     return {
       clicked: true,
+      // "clicked" means the events were dispatched to a matching element, not
+      // that the UI responded. These let the caller tell the difference.
+      defaultPrevented: defaultPrevented,
+      disabled: element.disabled === true,
+      visible: isVisible(element),
       element: getElementInfo(element),
       position: { x, y }
     };
@@ -679,13 +778,20 @@
 
     if (options.selector || options.xpath || options.id) {
       element = findElement(options);
-      if (element) {
-        target = element;
+      if (!element) {
+        // Silently scrolling the window instead of the element the caller
+        // named, and reporting success, is worse than failing.
+        throw new Error(
+          `Scroll container not found: ${options.selector || options.xpath || options.id}`);
       }
+      target = element;
     }
 
     if (options.toElement) {
       const targetElement = findElement({ selector: options.toElement });
+      if (!targetElement) {
+        throw new Error(`Scroll target not found: ${options.toElement}`);
+      }
       if (targetElement) {
         targetElement.scrollIntoView({
           behavior: options.smooth !== false ? 'smooth' : 'auto',
@@ -746,7 +852,7 @@
   }
 
   // Get page information
-  function getPageInfo() {
+  function getPageInfo(options = {}) {
     const interactiveElements = [];
 
     // Find all interactive elements
@@ -767,7 +873,7 @@
             name: el.name || null,
             text: el.textContent?.trim().substring(0, 100) || null,
             href: el.href || null,
-            value: el.value?.substring(0, 100) || null,
+            value: safeElementValue(el, 100, options),
             placeholder: el.placeholder || null,
             ariaLabel: el.getAttribute('aria-label'),
             position: {
@@ -783,9 +889,12 @@
       }
     });
 
+    const allInteractive = document.querySelectorAll(selectors.join(', ')).length;
     return {
       url: window.location.href,
       title: document.title,
+      interactiveElementCount: allInteractive,
+      interactiveElementsTruncated: allInteractive > 100,
       documentHeight: document.documentElement.scrollHeight,
       documentWidth: document.documentElement.scrollWidth,
       viewportHeight: window.innerHeight,
@@ -804,7 +913,7 @@
           id: el.id,
           placeholder: el.placeholder,
           required: el.required,
-          value: el.type === 'password' ? '***' : el.value?.substring(0, 50)
+          value: safeElementValue(el, 50, options)
         }))
       })),
       headings: Array.from(document.querySelectorAll('h1, h2, h3')).slice(0, 20).map(h => ({
@@ -990,7 +1099,10 @@
       throw new Error(`Element not found: ${targetSelector}`);
     }
 
-    const observerId = options.observerId || `obs_${Date.now()}`;
+    // Date.now() alone collides for two calls in the same millisecond, which
+    // silently disconnected the first observer and lost its changes.
+    const observerId = options.observerId ||
+      `obs_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     // Stop existing observer with same ID
     if (activeObservers.has(observerId)) {
@@ -1231,7 +1343,14 @@
 
   // Inspect element at position
   function inspectElement(options) {
-    const element = document.elementFromPoint(options.x, options.y);
+    // The context menu reports page (document) coordinates; elementFromPoint
+    // takes viewport coordinates, so on any scrolled page the wrong element
+    // was inspected.
+    const viewportX = options.viewport === true
+      ? options.x : options.x - window.scrollX;
+    const viewportY = options.viewport === true
+      ? options.y : options.y - window.scrollY;
+    const element = document.elementFromPoint(viewportX, viewportY);
     if (!element) {
       return { found: false };
     }
@@ -1255,11 +1374,12 @@
     // surely as typing one would, so the same guard applies. Masking rather
     // than refusing keeps the tool useful: you can still see whether the
     // field is filled.
-    if (isPasswordField(element) && !passwordAllowed(options)) {
+    if (isConcealedValueField(element) && !passwordAllowed(options)) {
       return {
         value: '***',
         masked: true,
-        note: 'Password field value withheld. Set "allow_password_typing": true in ' +
+        note: 'Credential field value withheld (password, one-time code, card ' +
+              'or hidden field). Set "allow_password_typing": true in ' +
               '~/.claudecodebrowser/safety.json to read credentials through the agent.',
         element: getElementInfo(element)
       };
@@ -1303,7 +1423,22 @@
     const element = findElement(options);
     if (!element) throw new Error('Element not found');
 
-    const value = element.getAttribute(options.attribute);
+    // The value attribute of a credential field is the credential whenever it
+    // is server-rendered or set with setAttribute, so this path needs the same
+    // guard as getValue.
+    const attribute = String(options.attribute || '');
+    if (attribute.toLowerCase() === 'value' &&
+        isConcealedValueField(element) && !passwordAllowed(options)) {
+      return {
+        value: element.getAttribute(attribute) ? '***' : null,
+        masked: true,
+        note: 'Credential field value withheld. See allow_password_typing in ' +
+              '~/.claudecodebrowser/safety.json.',
+        element: getElementInfo(element)
+      };
+    }
+
+    const value = element.getAttribute(attribute);
     return { value, element: getElementInfo(element) };
   }
 
@@ -1483,12 +1618,9 @@
   function getElementInfo(element) {
     const rect = element.getBoundingClientRect();
     // Element metadata is incidental to every tool that returns it, so a
-    // password value is always masked here — as getPageInfo already does.
-    // browser_get_value is the one deliberate way to read a credential, and
-    // only with the safety config's permission.
-    const value = isPasswordField(element)
-      ? (element.value ? '***' : null)
-      : (element.value?.substring(0, 200) || null);
+    // credential value is always masked here, with no override.
+    // browser_get_value is the one deliberate way to read one.
+    const value = safeElementValue(element, 200, {});
     return {
       tag: element.tagName.toLowerCase(),
       id: element.id || null,

@@ -1109,11 +1109,18 @@ async function clearLogs(tabId, data = {}) {
   return { success: true, message: "Logs cleared", tabId: resolved };
 }
 
-// Generic helper to send message to content script
-async function sendToContentScript(tabId, message) {
+// Generic helper to send message to content script.
+//
+// Targets the top frame. The content script runs in every frame
+// (all_frames: true), and tabs.sendMessage with no frameId delivers to all of
+// them and resolves with whichever answers first -- so an ad or payment iframe
+// could answer getText, getPageInfo, or an approval prompt on the page's
+// behalf. Pass allFrames: true to opt into the old broadcast.
+async function sendToContentScript(tabId, message, { allFrames = false } = {}) {
   try {
     const tab = tabId ? await browser.tabs.get(tabId) : (await browser.tabs.query({ active: true, currentWindow: true }))[0];
-    const result = await browser.tabs.sendMessage(tab.id, message);
+    const options = allFrames ? undefined : { frameId: 0 };
+    const result = await browser.tabs.sendMessage(tab.id, message, options);
     return { success: true, ...result };
   } catch (error) {
     return { success: false, error: error.message };
@@ -1128,7 +1135,7 @@ async function performClick(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "click",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1144,7 +1151,7 @@ async function performType(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "type",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1160,7 +1167,7 @@ async function performScroll(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "scroll",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1203,7 +1210,7 @@ async function getPageInfo(tabId) {
 
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "getPageInfo"
-    });
+    }, { frameId: 0 });
 
     return {
       success: true,
@@ -1223,7 +1230,7 @@ async function getElements(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "getElements",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1254,7 +1261,7 @@ async function highlightElement(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "highlight",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1270,7 +1277,7 @@ async function waitForElement(tabId, data) {
     const result = await browser.tabs.sendMessage(tab.id, {
       action: "waitForElement",
       ...data
-    });
+    }, { frameId: 0 });
 
     return { success: true, ...result };
   } catch (error) {
@@ -1285,9 +1292,15 @@ async function getAllTabs(options = {}) {
     // window/tab in the user's browser. With dozens of tabs open, querying
     // {} and returning full metadata per tab blows past response size
     // limits. Opt into the wider view explicitly when needed.
-    const currentWindowOnly = options.current_window_only !== false;
-    const includeFavicon = options.include_favicon === true;
-    const urlPattern = options.url_pattern ? new RegExp(options.url_pattern) : null;
+    // The server's camelize_args() rewrites these keys before dispatch, so
+    // both spellings have to be accepted or the options are silently dropped.
+    const currentWindowOnlyOpt = options.currentWindowOnly !== undefined
+      ? options.currentWindowOnly : options.current_window_only;
+    const currentWindowOnly = currentWindowOnlyOpt !== false;
+    const includeFavicon =
+      (options.includeFavicon === true) || (options.include_favicon === true);
+    const rawPattern = options.urlPattern || options.url_pattern;
+    const urlPattern = rawPattern ? new RegExp(rawPattern) : null;
     const limit = Number.isInteger(options.limit) ? options.limit : 50;
 
     const queryOpts = currentWindowOnly ? { currentWindow: true } : {};
@@ -1351,7 +1364,8 @@ async function getTabInfo(tabId) {
     // Try to get page info from content script
     let pageInfo = null;
     try {
-      pageInfo = await browser.tabs.sendMessage(tabId, { action: "getPageInfo" });
+      pageInfo = await browser.tabs.sendMessage(tabId, { action: "getPageInfo" },
+                                                { frameId: 0 });
     } catch (e) {
       // Content script may not be loaded
       pageInfo = { error: "Content script not available" };

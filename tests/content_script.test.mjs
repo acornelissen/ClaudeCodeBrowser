@@ -25,6 +25,7 @@ function makeElement(tag, props = {}) {
     className: props.className || '',
     classList: props.className ? props.className.split(/\s+/) : [],
     textContent: props.textContent || '',
+    style: { cssText: '' },
     isContentEditable: false,
     disabled: false,
     checked: false,
@@ -37,6 +38,22 @@ function makeElement(tag, props = {}) {
       return Object.prototype.hasOwnProperty.call(this._attributes, name)
         ? this._attributes[name]
         : null;
+    },
+    setAttribute(name, value) { this._attributes[name] = value; },
+    attachShadow() {
+      this._shadow = { children: [], appendChild(c) { this.children.push(c); } };
+      return this._shadow;
+    },
+    appendChild(child) { this.children.push(child); return child; },
+    remove() { this._removed = true; },
+    _listeners: {},
+    addEventListener(type, fn) {
+      (this._listeners[type] = this._listeners[type] || []).push(fn);
+    },
+    /** Deliver an event the way page script would (isTrusted false) or the
+     *  way a real user click arrives (isTrusted true). */
+    emit(type, isTrusted) {
+      (this._listeners[type] || []).forEach(fn => fn({ type, isTrusted }));
     },
     getBoundingClientRect: () => ({
       left: 0, top: 0, width: 10, height: 10,
@@ -69,17 +86,29 @@ function loadContentScript(registry) {
   };
   const originalConsoleLog = consoleStub.log;
 
+  const createdElements = [];
   const document = {
     title: 'stub page',
     body,
+    forms: registry.__forms__ || [],
     documentElement: { scrollHeight: 1000, scrollWidth: 800, lang: 'en' },
-    forms: [],
     activeElement: null,
     querySelector: resolveOne,
-    querySelectorAll: (sel) => all.get(sel) || [],
+    querySelectorAll: (sel) => {
+      if (all.has(sel)) return all.get(sel);
+      // getPageInfo builds one long interactive-element selector; route it to
+      // an explicit registry key rather than trying to parse CSS here.
+      if (sel.includes('a[href]')) return all.get('__interactive__') || [];
+      if (sel.startsWith('h1')) return all.get('__headings__') || [];
+      return [];
+    },
     getElementById: (id) => resolveOne(`#${id}`),
     evaluate: () => ({ singleNodeValue: null }),
-    createElement: (tag) => makeElement(tag),
+    createElement: (tag) => {
+      const el = makeElement(tag);
+      createdElements.push(el);
+      return el;
+    },
     elementFromPoint: () => null,
     execCommand: () => true,
     addEventListener() {},
@@ -152,7 +181,7 @@ function loadContentScript(registry) {
     setTimeout(() => reject(new Error(`no response for ${message.action}`)), 2000);
   });
 
-  return { send, window, consoleStub, XMLHttpRequestStub,
+  return { send, window, consoleStub, XMLHttpRequestStub, createdElements,
            pristine: {
              fetch: fetchStub,
              consoleLog: originalConsoleLog,
@@ -346,6 +375,188 @@ test('the content script no longer answers getNetworkLogs', async () => {
 
   assert.equal(result.success, false);
   assert.match(result.error, /Unknown action/);
+});
+
+// --------------------------------------------------------------------------
+// The leak that survived the first fix: get_page_info masked passwords in its
+// forms[] branch but not in interactiveElements[], and the test that
+// "covered" it was a grep for the forms[] string.
+
+test('browser_get_page_info masks password values in interactiveElements', async () => {
+  const pw = makeElement('input', { id: 'pw', type: 'password', value: 'SuperSecret123!' });
+  const user = makeElement('input', { id: 'user', type: 'text', value: 'albert' });
+  const { send } = loadContentScript({ __interactive__: [pw, user] });
+
+  const result = await send({ action: 'getPageInfo' });
+
+  const values = result.interactiveElements.map(e => e.value);
+  assert.ok(values.includes('albert'), 'ordinary values still come through');
+  assert.ok(!values.includes('SuperSecret123!'), 'the password must not be returned');
+  assert.ok(!JSON.stringify(result).includes('SuperSecret123!'),
+    'the plaintext password must not appear anywhere in the response');
+});
+
+test('browser_get_page_info masks credential values in forms[] too', async () => {
+  const pw = makeElement('input', { id: 'pw', type: 'password', value: 'SuperSecret123!' });
+  const csrf = makeElement('input', { id: 'csrf', type: 'hidden', value: 'csrf-token-abc' });
+  const form = { id: 'f', name: 'f', action: '/login', method: 'post',
+                 elements: [pw, csrf] };
+  const { send } = loadContentScript({ __forms__: [form] });
+
+  const result = await send({ action: 'getPageInfo' });
+
+  const serialized = JSON.stringify(result);
+  assert.ok(!serialized.includes('SuperSecret123!'));
+  assert.ok(!serialized.includes('csrf-token-abc'),
+    'hidden inputs carry CSRF and session tokens; they are not needed in clear');
+});
+
+test('hidden input values are masked by get_value as well', async () => {
+  const csrf = makeElement('input', { id: 'csrf', type: 'hidden', value: 'csrf-token-abc' });
+  const { send } = loadContentScript({ '#csrf': csrf });
+
+  const result = await send({ action: 'getValue', selector: '#csrf' });
+
+  assert.equal(result.value, '***');
+  assert.equal(result.masked, true);
+});
+
+// --------------------------------------------------------------------------
+// The credential predicate itself
+
+test('isPasswordField accepts the spec-legal autocomplete forms', async () => {
+  const cases = [
+    ['Current-Password', 'mixed case'],
+    ['current-password ', 'trailing whitespace'],
+    ['section-login current-password', 'token list'],
+    ['new-password', 'signup form'],
+    ['one-time-code', '2FA code'],
+    ['cc-number', 'card number'],
+    ['cc-csc', 'card security code']
+  ];
+  for (const [value, why] of cases) {
+    const el = makeElement('input', {
+      id: 'f', type: 'text', value: 'SECRET', attributes: { autocomplete: value }
+    });
+    const { send } = loadContentScript({ '#f': el });
+    const result = await send({ action: 'getValue', selector: '#f' });
+    assert.equal(result.value, '***', `autocomplete="${value}" (${why}) must be guarded`);
+  }
+});
+
+test('the allow_password override is strictly boolean true', async () => {
+  // A fail-closed guard must not be unlocked by any truthy value.
+  for (const sneaky of ['false', 'true', 1, 0.1, {}, [], 'yes']) {
+    const pw = makeElement('input', { id: 'pw', type: 'password', value: 'SECRET' });
+    const { send } = loadContentScript({ '#pw': pw });
+    const result = await send({
+      action: 'getValue', selector: '#pw', allow_password: sneaky
+    });
+    assert.equal(result.value, '***',
+      `allow_password: ${JSON.stringify(sneaky)} must not unlock the guard`);
+  }
+});
+
+test('browser_get_attribute cannot read a password out of the value attribute', async () => {
+  const pw = makeElement('input', {
+    id: 'pw', type: 'password', value: 'SECRET', attributes: { value: 'SECRET' }
+  });
+  const { send } = loadContentScript({ '#pw': pw });
+
+  const result = await send({ action: 'getAttribute', selector: '#pw', attribute: 'value' });
+
+  assert.equal(result.value, '***');
+  assert.equal(result.masked, true);
+});
+
+test('browser_set_value refuses a password field', async () => {
+  const pw = makeElement('input', { id: 'pw', type: 'password', value: '' });
+  const { send } = loadContentScript({ '#pw': pw });
+
+  const result = await send({ action: 'setValue', selector: '#pw', value: 'nope' });
+
+  assert.equal(result.success, false);
+  assert.match(result.error, /password field/i);
+  assert.equal(pw.value, '');
+});
+
+// --------------------------------------------------------------------------
+// The approval prompt must require a human
+
+test('a page-dispatched click cannot approve a protected action', async () => {
+  const ctx = loadContentScript({});
+  const pending = ctx.send({ action: 'requestApproval', message: 'do a thing',
+                             timeout: 400 });
+
+  // The banner lives in a closed shadow root; find the Approve button among
+  // the elements the content script created and click it as page script would.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const approve = ctx.createdElements.find(e => e.textContent === 'Approve');
+  assert.ok(approve, 'the prompt should have rendered an Approve button');
+  approve.emit('click', false);   // isTrusted: false, i.e. element.click()
+
+  const result = await pending;
+  assert.equal(result.approved, false,
+    'an untrusted click must not count as human approval');
+  assert.equal(result.timedOut, true, 'it should fall through to the timeout');
+});
+
+test('a real click does approve', async () => {
+  const ctx = loadContentScript({});
+  const pending = ctx.send({ action: 'requestApproval', message: 'do a thing',
+                             timeout: 2000 });
+
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const approve = ctx.createdElements.find(e => e.textContent === 'Approve');
+  approve.emit('click', true);    // isTrusted: true, i.e. a person clicked
+
+  const result = await pending;
+  assert.equal(result.approved, true);
+  assert.notEqual(result.timedOut, true);
+});
+
+test('the prompt is rendered in a closed shadow root', async () => {
+  const ctx = loadContentScript({});
+  ctx.send({ action: 'requestApproval', message: 'x', timeout: 200 });
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  const host = ctx.createdElements.find(e => e.id === '__ccb_approval_host');
+  assert.ok(host, 'the prompt needs its own host element');
+  assert.ok(host._shadow, 'the banner must live in a shadow root, not the page DOM');
+  assert.match(host.getAttribute('style') || '', /!important/,
+    'host styling must resist a page !important rule');
+});
+
+// --------------------------------------------------------------------------
+// Click semantics
+
+test('browser_click dispatches exactly one click', async () => {
+  let clicks = 0;
+  const button = makeElement('button', { id: 'go', textContent: 'Go' });
+  button.dispatchEvent = (event) => {
+    if (event.type === 'click') clicks++;
+    return true;
+  };
+  button.click = () => { clicks++; };
+  const { send } = loadContentScript({ '#go': button });
+
+  await send({ action: 'click', selector: '#go' });
+
+  assert.equal(clicks, 1, 'a second click would re-trigger non-idempotent handlers');
+});
+
+test('a text selector containing a quote cannot graft on an XPath predicate', async () => {
+  const ctx = loadContentScript({});
+  let seen = null;
+  // Capture what findElement asks XPath for.
+  await ctx.send({ action: 'getText', selector: 'body' }).catch(() => {});
+  const evil = 'Accept")]|//a[@id="transfer-all"][contains(text(),"';
+  await ctx.send({ action: 'click', text: evil }).catch(() => {});
+  // The expression is built with concat() so the needle stays a single literal.
+  assert.ok(!SOURCE.includes('contains(text(), "${options.text}")'),
+    'the raw interpolation must be gone');
+  assert.ok(SOURCE.includes('xpathLiteral('),
+    'the text needle must be quoted through xpathLiteral');
 });
 
 // --------------------------------------------------------------------------

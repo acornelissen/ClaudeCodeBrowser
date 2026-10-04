@@ -1024,7 +1024,8 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         if (denial is not None and denial.get('confirmation_required')
                 and denial.get('approval_mode', 'auto') in ('auto', 'human')
                 and not HEADLESS_MODE):
-            approval = self._request_human_approval(tool_name, arguments, denial)
+            approval = self._request_human_approval(
+                tool_name, arguments, denial, tab_id=arguments.get('tab_id'))
             if approval.get('success') and approval.get('approved'):
                 denial = guard.check(tool_name, dict(arguments), human_approved=True)
             elif approval.get('success') and approval.get('approved') is False:
@@ -1032,9 +1033,23 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                         'safety_decision': 'human_denied',
                         'error': f'The user denied {tool_name} via the in-browser '
                                  f'approval prompt. Do not retry without asking them why.'}
-            # Approval prompt could not be delivered (no browser connected,
-            # timeout): fall through and return the token-based denial so the
-            # agent can still use the confirm_token flow.
+            else:
+                # The prompt could not be shown or was not answered. Falling
+                # through to the token denial would hand the agent a token and
+                # tell it to re-send the call itself, which is not a human in
+                # the loop at all. In a mode that promises a human decision,
+                # no decision means no.
+                return {
+                    'success': False,
+                    'safety_decision': 'approval_undeliverable',
+                    'protected_url': denial.get('protected_url'),
+                    'error': (
+                        f'{tool_name} targets a protected site and the in-browser '
+                        f'approval prompt could not be completed '
+                        f'({approval.get("error", "no response")}). Refused. Ask the '
+                        f'person to confirm what they want and to check the '
+                        f'extension is connected; do not retry automatically.'),
+                }
 
         if denial is not None:
             logger.warning(f"Safety guard blocked {tool_name}: {denial.get('safety_decision')}")
@@ -1115,7 +1130,8 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         # visible. Reads are masked rather than refused, so inspection tools
         # still report whether a field is filled.
         if tool_name in ('browser_type', 'browser_set_value',
-                         'browser_get_value', 'browser_get_elements'):
+                         'browser_get_value', 'browser_get_elements',
+                         'browser_get_page_info'):
             arguments['allow_password'] = bool(
                 get_safety_guard().config.get('allow_password_typing', False))
 
@@ -1246,13 +1262,28 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             }
 
     def _request_human_approval(self, tool_name: str, arguments: Dict[str, Any],
-                                denial: Dict[str, Any]) -> Dict[str, Any]:
-        """Show the in-browser Approve/Deny prompt for a protected action."""
-        _SENSITIVE = {'text', 'script', 'value', 'password'}
-        shown_args = {k: ('***' if k in _SENSITIVE else v) for k, v in arguments.items()
-                      if k != 'tab_id'}
+                                denial: Dict[str, Any],
+                                tab_id: Optional[int] = None) -> Dict[str, Any]:
+        """Show the in-browser Approve/Deny prompt for a protected action.
+
+        The person is asked to approve a specific action, so they have to be
+        able to see what it is: redacting the script or the text here left them
+        approving {"script": "***"}, which is the only part that matters. The
+        audit log still masks these; this is the human-facing copy.
+        """
+        _PREVIEW = {'text', 'script', 'value', 'password'}
+
+        def shown(key, value):
+            if key not in _PREVIEW:
+                return value
+            text = value if isinstance(value, str) else json.dumps(value, default=str)
+            return text if len(text) <= 300 else text[:300] + '…'
+
+        shown_args = {k: shown(k, v) for k, v in arguments.items() if k != 'tab_id'}
         try:
-            return self._dispatch_action('requestApproval', None, {
+            # Send to the tab the action will actually run on, not whichever
+            # tab happens to be focused.
+            return self._dispatch_action('requestApproval', tab_id, {
                 'message': f"Claude wants to run {tool_name} on a protected site "
                            f"({denial.get('protected_url', 'unknown URL')}).",
                 'detail': json.dumps(shown_args)[:500],
