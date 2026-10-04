@@ -72,6 +72,18 @@ ClaudeCodeBrowser uses a **dual-server architecture** for maximum reliability an
 - **HTTP (8765)**: Primary communication channel. Claude Code's MCP client sends tool requests here. The browser extension polls this server every 500ms for pending commands.
 - **WebSocket (8766)**: Reserved for real-time bidirectional communication when instant responses are needed.
 
+The WebSocket handshake refuses a browser `Origin` outright. WebSockets are
+exempt from CORS, so any page you visit could otherwise open a connection to
+the loopback port — the API token refused it, but only after the handshake
+had completed. A local client sending no `Origin` header still connects and
+is still token-checked. Override with `CLAUDE_BROWSER_WS_ORIGINS`:
+
+| Value | Effect |
+|-------|--------|
+| unset | No-`Origin` clients only. The default. |
+| `moz-extension://abc,https://my.app` | Those origins **in addition to** no-`Origin` clients. |
+| `*` | Check disabled. The API token is then the only control; a warning is logged. |
+
 ### Communication Flow
 
 ```mermaid
@@ -101,7 +113,7 @@ flowchart TB
 
 The native messaging host (`claudecodebrowser_host.py`) provides an alternative communication path:
 - Used when the browser extension needs to communicate with the local file system
-- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/`, created `0700` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`)
+- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/`, created `0700` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see [Screenshot retention](#screenshot-retention)
 - Starts the MCP server when it is not running, and restarts it if it dies.
   Before trusting whatever is on port 8765 it requires proof that the listener
   holds the shared API token, so a process that squats the port cannot receive
@@ -541,7 +553,7 @@ agent.fill_form({
 |------|-------------|
 | `browser_get_tabs` | List open tabs (current window by default; `current_window_only=false` for all) |
 | `browser_get_tab_info` | Detailed info for one tab, including its page info |
-| `browser_find_tabs` | Find tabs by URL, URL pattern, title, active or audible state |
+| `browser_find_tabs` | Find tabs by URL, URL pattern, title, or `active`/`audible` **set to true**. At least one filter that actually narrows is required, and results cap at 50 — with no filter it returned every tab in every window, uncapped. `active: false` matches almost every tab, so it does not count as a filter. Use `browser_get_tabs` to list tabs deliberately. |
 | `browser_create_tab` | Create a new tab |
 | `browser_close_tab` | Close a tab by ID |
 | `browser_focus_tab` | Focus/activate a tab by ID |
@@ -558,7 +570,7 @@ agent.fill_form({
 #### Advanced Observation
 | Tool | Description |
 |------|-------------|
-| `browser_observe_element` | Start observing element for changes |
+| `browser_observe_element` | Start observing element for changes. Expires after 5 minutes (`max_lifetime_ms`) so a forgotten observer does not run for the document's lifetime; `browser_stop_observing` reports `expired: true` when it did, so a truncated change list is not mistaken for a quiet page |
 | `browser_stop_observing` | Stop observing and get accumulated changes |
 | `browser_scroll_and_capture` | Scroll through page capturing element info |
 
@@ -780,7 +792,7 @@ agent.reload_by_url(url_pattern=r"localhost:500[0-9]")
 | `/mcp/tools` | GET | List available MCP tools |
 | `/mcp/call` | POST | Execute an MCP tool |
 | `/screenshots` | GET | List saved screenshots |
-| `/browser/command` | POST | Send direct browser command |
+| `/browser/command` | POST | **Gone** — returns `410`. It queued a command and reported success having run nothing; use the MCP tool interface. |
 | `/browser/response` | POST | Receive browser response |
 
 ### Example API Calls
@@ -808,13 +820,66 @@ curl -X POST http://localhost:8765/mcp/call \
 | Path | Description |
 |------|-------------|
 | `~/.claudecodebrowser/` | Main installation directory |
-| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`; override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`) |
+| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`, each file `0600`; override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`). Pruned after 7 days / 500 files — see [Screenshot retention](#screenshot-retention) |
 | `~/.claudecodebrowser/logs/` | Log files, including the safety guard's `audit.jsonl` |
 | `~/.claudecodebrowser/api_token` | HTTP/WebSocket API token (`0600`, generated on first run) |
 | `~/.claudecodebrowser/safety.json` | Safety guard configuration (written with defaults on first run) |
 | `~/.mozilla/native-messaging-hosts/` | Firefox native messaging manifests (Linux) |
 | `~/Library/Application Support/Mozilla/NativeMessagingHosts/` | Firefox native messaging manifests (macOS) |
 | `mise.local.toml` | Local-only AMO signing credentials (gitignored) |
+
+### Screenshot retention
+
+A screenshot holds whatever was on screen — open mail, a logged-in dashboard,
+a bank balance — and one file is written per `browser_screenshot` call, since
+`save_to_file` defaults to true. Nothing used to remove them, which made that
+directory the longest-lived record of your browsing in the project. The
+defaults:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS` | `7` | Delete screenshots older than this. `0` disables the age sweep. |
+| `CLAUDE_BROWSER_SCREENSHOT_MAX_FILES` | `500` | Keep at most this many, oldest deleted first. `0` disables the cap. |
+
+Setting both to `0` keeps an indefinite visual record, which is a choice
+rather than an accident. An unparseable value (`7d`, `forever`) logs a
+warning and uses the default — it used to raise at import time, and the
+native host starts the server with `stderr` discarded, so the traceback went
+nowhere and you saw only restart backoff.
+
+**Pruning only ever touches a directory this project created.** It deletes
+`*.png` with no way to tell its own files from yours, and
+`CLAUDE_BROWSER_SCREENSHOTS_DIR` can point anywhere — `~/Pictures`,
+`~/Desktop`, a repo's `docs/screenshots`. So a directory is prunable only if
+it contains a `.ccb-screenshots` marker file, which is written when the
+server creates the directory itself. Point the override at a directory that
+already exists and nothing in it is ever deleted. If you *want* an existing
+directory swept, create the marker by hand:
+
+```bash
+touch "$CLAUDE_BROWSER_SCREENSHOTS_DIR/.ccb-screenshots"
+```
+
+A screenshot of a private-browsing window is never written to disk at all.
+The image is returned in the tool response and nowhere else.
+
+### Private browsing
+
+If you allow the extension in private windows, two things are refused rather
+than done quietly:
+
+- `browser_start_logging` on a private tab. A logging session there would put
+  request and response bodies into a buffer the agent reads, which is the one
+  expectation a private window exists to uphold. The check fails closed: if
+  the tab cannot be inspected, logging is refused.
+- Writing a screenshot of a private window to disk, as above.
+  `browser_screenshot_all_tabs` skips private windows entirely, since it is a
+  bulk sweep you did not aim at any particular tab.
+
+Everything else still works on a private tab — reading text, clicking,
+inspecting — because driving a private window can be exactly what you asked
+for. The line is persistence: nothing from a private window is left behind
+after the session.
 
 ## Troubleshooting
 
@@ -950,7 +1015,8 @@ the `browser_safety_status` tool.
 | Guard | Behavior |
 |-------|----------|
 | **URL scheme guard** | Navigation is limited to `http://`, `https://`, and `about:blank`. `file:`, `javascript:`, `data:`, `chrome:`, `resource:`, and `moz-extension:` targets are always refused. |
-| **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. |
+| **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. A list that *refuses* matches loosely (anywhere in the URL), because a near miss there errs towards refusing. A list that *grants* — `allowed_url_patterns`, `trusted_url_patterns` — is matched **anchored**: the pattern has to cover a whole URL prefix ending at a delimiter, or match a whole hostname. So `^https://localhost` covers `https://localhost:3000/app` but not `https://localhost.evil.com/x`, which a loose match used to allow. An unanchored mid-URL pattern such as `stripe\.com/dashboard` therefore no longer grants anything; write `^https://stripe\.com/` or `.*\.stripe\.com` instead. `.*` still means everything. |
+| **URL normalisation** | Every pattern sees the URL the browser will actually load: leading/trailing control characters and spaces stripped, tab/CR/LF removed, `\` treated as `/`. Firefox loads `https://www.irs.gov\payments` as `https://www.irs.gov/payments`, and without this a backslash walked straight past the protected-domain check. |
 | **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
 | **Password fields (writing)** | Typing into `<input type="password">` (or `autocomplete="current-password"/"new-password"`) is refused by default in both attended and headless modes. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
 | **Credential fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. One function decides this for every read path. "Credential" covers `type=password`, `autocomplete` of `current-password`/`new-password`/`one-time-code`/`cc-*` (matched case-insensitively across the token list), and `type=hidden` — hidden inputs carry CSRF and session tokens. The same `allow_password_typing` setting lifts it. `browser_execute_script` can still read any field — see below. |

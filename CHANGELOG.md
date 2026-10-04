@@ -9,6 +9,199 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+Not yet released. Version strings are deliberately still on 1.8.0 — bumping
+them is part of releasing, and that is being held for approval.
+
+### Security
+- **The WebSocket handshake now rejects a browser `Origin`.** WebSockets are
+  exempt from CORS, so any page you visit could open a connection to the
+  loopback port; the API token refused it, but only after the handshake
+  completed and a task had been held for up to 10s waiting for the first
+  frame. Verified live: `Origin: https://evil.example` gets `HTTP 403` at the
+  handshake, while a no-`Origin` local client still connects and is still
+  token-checked. `CLAUDE_BROWSER_WS_ORIGINS` overrides the default.
+  *(This was described in a code comment in an earlier release and never
+  implemented; the comment read as though it were handled.)*
+- **Logging a private-browsing tab is refused.** Nothing distinguished one, so
+  a session there would have put request and response bodies into a buffer the
+  agent reads — the single expectation a private window exists to uphold.
+- **Screenshots are pruned**: 7 days and 500 files by default, both
+  configurable, both settable to `0` to keep an indefinite record as a
+  deliberate choice. One file was written per `browser_screenshot` call with
+  `save_to_file` defaulting to true and nothing ever removing them, which made
+  that directory the longest-lived record of your browsing in the project.
+  **Pruning only touches a directory this project created** (marked with a
+  `.ccb-screenshots` file). An adversarial review of the first version proved
+  that `CLAUDE_BROWSER_SCREENSHOTS_DIR=~/Pictures` plus one screenshot
+  unlinked four unrelated photographs — a privacy fix that silently destroys
+  user data is a worse failure than the retention it closes. The headless
+  backend writes through Playwright rather than the server's save path, so
+  retention did not exist in headless mode at all; it does now.
+- **`browser_find_tabs` requires a filter that narrows** and caps at 50. With
+  no filter it returned every tab in every window, uncapped — the whole
+  browsing surface, from a tool that reads like a search. `active: false` and
+  `audible: false` passed the original check and matched essentially every
+  tab, so one boolean defeated it. Use `browser_get_tabs` to list tabs
+  deliberately.
+- **A permit list is matched anchored; a refuse list stays loose.**
+  `allowed_url_patterns` is the strongest confinement available and it was
+  prefix-bypassable: `^https://localhost` also matched
+  `https://localhost.evil.com/x` and `https://localhostile.io/`, so any
+  attacker-controlled host with the right prefix opened the guard.
+  `trusted_url_patterns` had the same hole in the other direction. A permit
+  pattern must now cover a whole URL prefix ending at a delimiter, or match a
+  whole hostname. **Breaking:** an unanchored mid-URL permit pattern such as
+  `stripe\.com/dashboard` no longer grants anything and fails closed; write
+  `^https://stripe\.com/` instead. `.*` still means everything.
+- **A backslash no longer walks past the protected-domain check.** Firefox
+  loads `https://www.irs.gov\payments` as `https://www.irs.gov/payments`
+  under WHATWG parsing, but the delimiter class did not match the raw string
+  — so `browser_navigate` reached a `.gov` page with no approval and no
+  token. URLs are normalised the way the browser parses them before any
+  pattern sees them.
+- **Credential redaction covers the shapes a real login uses.** The body
+  scrubber matched only `"key":"string"`, and `requestBody.formData` — what
+  Firefox hands over for an ordinary HTML form POST — is always
+  array-valued, so a form login logged the password verbatim. There was no
+  `formData` fixture in the test suite at all. Numeric OTPs, arrays of
+  tokens, nested credential objects, multipart frames and `pwd=` were all
+  unchanged too, and a credential straddling the 5000-character response cap
+  survived as a fragment because the body was truncated before it was
+  scrubbed. JSON bodies are now walked structurally and re-serialised, so
+  every value shape is covered by construction.
+- **The DOM credential guard looks at `name` and `id`, and beyond
+  `<input>`.** It recognised only `input[type=password]` and the
+  `autocomplete` token list, so `<sl-input type="password">` (the
+  Shoelace/Ionic/Vaadin shape), `name="passwd"`, `cvv`, `otp`, `ssn` and a
+  `<div contenteditable>` holding a PIN all came back in clear. The same
+  field was `***` in the network log and plaintext from
+  `browser_get_value` — the scrubber already knew those names.
+- **A screenshot of a private-browsing window is never written to disk**, and
+  `browser_screenshot_all_tabs` skips private windows. The private-tab check
+  also fails closed: it returned "not private" whenever the tab could not be
+  inspected, which is how a private window's traffic reached the buffer.
+- **The agent no longer sends the API token off-machine.** `CLAUDE_BROWSER_URL`
+  chooses the server with no validation, and the token is full control of the
+  browser; it is now attached for loopback only unless
+  `CLAUDE_BROWSER_ALLOW_REMOTE=1`. The agent also stopped printing the
+  password in verbose mode, retaining it in the action history, and resending
+  it after the browser refused the field.
+- **`--command` is an allowlist.** It did `getattr(agent, name)` on whatever
+  it was handed: `--command __init__` re-ran the constructor and wiped the
+  action history while printing `null`.
+
+### Fixed
+- The native host wrote a `.png` for **any** successful response carrying a
+  `data` field, so page text and structured results landed on disk as junk
+  files and real screenshots were duplicated (`server.py` already saves them).
+- **Captured bodies honour the declared charset.** Everything was decoded as
+  UTF-8, so a `windows-1252` or `shift_jis` page was logged as mojibake with
+  no indication and the agent reasoned over corrupted text believing it was
+  the page. An unknown charset label falls back to UTF-8 with a
+  `charsetNote`, the streaming decoder is flushed so a multi-byte character
+  split across the final chunk is not lost, and truncation at the
+  5000-character cap is now flagged with the real length — a short body and a
+  cut one previously looked identical.
+- **A body is judged by whether it decoded, not by its `content-encoding`.** An
+  intermediate version of the above refused any response carrying that header,
+  which would have dropped bodies on essentially every real site: Firefox
+  hands the stream filter decompressed bytes while the header remains present.
+  Caught and corrected before release.
+- `browser_observe_element` installed a full-subtree observer whose handle was
+  released only by an explicit `browser_stop_observing`, so an agent that
+  forgot left it running for the document's lifetime. It now expires after 5
+  minutes (`maxLifetimeMs`), reports `expiresInMs`, and `stopObserving` says
+  whether it had expired — so a truncated change list is not mistaken for a
+  quiet page.
+- `POST /browser/command` returned `{"success": true, "message": "Command
+  queued"}` having queued nothing, telling its only caller the work had been
+  accepted. It now returns `410`.
+- The native host never reaped its spawned server, leaving a zombie per
+  crash-and-restart cycle. The reap also raced the health-monitor thread and
+  only ran on the next restart attempt — so after `MAX_RESTART_ATTEMPTS` the
+  last dead child stayed a zombie for the host's life.
+- **The native host no longer writes screenshots.** A real screenshot
+  response *is* a `data:image/...` string, so the fix above removed only the
+  junk-payload half: every genuine screenshot was still written twice, and
+  the host's copy used plain `open()` — mode 0644, symlinks followed — under
+  a name unrelated to the one the caller asked for. The server already writes
+  it with `O_NOFOLLOW` and `0600`.
+- **Native-messaging framing.** A single `read()` with no loop meant a short
+  read on the pipe silently truncated a message, and a corrupt length prefix
+  attempted a multi-gigabyte read. `read_message` now reads exactly and
+  distinguishes EOF from one bad frame from a stream that is no longer
+  aligned. An oversized outbound message — which Firefox drops *and* which
+  tears down the port — sends a failure carrying the same `requestId`
+  instead, so the waiter gets an answer.
+- **A result no longer claims work that did not happen.** A content script
+  that exists but answers nothing resolves the sender's promise with
+  `undefined`, and `{success: true, ...undefined}` reported success:
+  `browser_get_text` returned success with no text and `browser_click`
+  reported a click nobody made. Likewise `wait_for_load: "false"` made
+  `browser_refresh` block for its full 30-second timeout, `browser_refresh`
+  reported a `bypass_cache` it had not used, `fill_form(submit=True)`
+  returned a clean-looking result for a form it never submitted, `search()`
+  reported success when the query was refused, `extract_links` returned `[]`
+  for a refusal, and the headless `solveCaptcha` claimed human verification
+  that never occurred.
+- **The headless `scroll` ignored its entire schema.** It read `x`, `y`,
+  `deltaX`, `deltaY`; the schema defines `direction`, `amount`, `selector`
+  and `to_element`, so `browser_scroll(direction="up", amount=1000)` always
+  wheeled 300px *down*. `waitAndAct` looped forever on
+  `poll_interval_ms: 0`, and `timeout_ms: "15000"` raised a `TypeError`.
+- **The headless credential guard was three divergent copies**, each with its
+  own token list: `cc-exp-month` and `cc-exp-year` were missing from all
+  three and `cc-exp` from one, so `browser_type` with a selector refused a
+  card-expiry field while the same field refused by selector was typed into
+  when focused. Both guards also failed *open* on any probe error — a
+  timeout or a destroyed execution context mid-navigation disabled the check
+  while the write went through. `browser_press_key` had no guard at all, and
+  Playwright's `keyboard.press` really types, so it was a headless-only way
+  to enter a credential one character at a time.
+- **Transport failures are distinguishable from tool failures.** `HTTPError`
+  subclasses `URLError`, so a rejected token read as "Connection failed: HTTP
+  Error 403: Forbidden" and the user restarted a server that was never down.
+- Feature flags arriving as JSON strings no longer fail open. `camelize_args`
+  renames keys and coerces nothing, and nothing validates arguments on the
+  path, so `"false"` was truthy: `browser_type {submit_form: "false"}`
+  submitted the form, `save_to_file: "false"` wrote the PNG to disk anyway,
+  and `include_data: "false"` embedded a base64 PNG per tab. Around fifty
+  flags across the extension, the server, the headless backend and the
+  content script now go through a lenient parser; `allow_password` stays a
+  strict `=== true`, because a fail-closed switch must not be opened by a
+  typo.
+- Duplicate response headers collapsed onto one key, so two `Set-Cookie`
+  headers became one with the last value — and almost every real response
+  carries several.
+- A JSON body claiming `charset=ISO-8859-1` was decoded as declared, turning
+  `café` into `cafÃ©` with no note. RFC 8259 requires UTF-8 for
+  `application/json` and says the parameter must be ignored.
+- `observer_id` could not be reused although it is a documented parameter,
+  and `generateSelector` returned selectors that throw when passed back —
+  React and MUI ids look like `headlessui-menu-item-:r1:`, which needs
+  escaping before `querySelector` will take it.
+- `getPageInfo` could report 101 interactive elements and return none of
+  them: the cap counted matches rather than collected elements.
+- `safeElementValue` threw on a numeric `.value` (`<li>`, `<progress>`,
+  `<meter>`, `<md-slider>`) *after* the click had been delivered, so an agent
+  that retried acted twice.
+- `reload_localhost(port=0)` meant "reload every localhost tab" rather than
+  the one port asked for, and interactive mode spun forever on a closed
+  stdin.
+
+### Tests
+
+`headless_backend.py`, `agent/browser_agent.py`, `getText`,
+`getComputedStyles`, `_save_screenshot`, the native host's framing and the
+attended human-approval branch had no tests at all. The suite is now 352
+Python tests plus 146 JavaScript ones, with every fix above shown to fail
+against the source it replaced. Several fixtures were found to be hiding the
+bugs they were meant to cover: `attachShadow()` discarded its argument, so
+changing the approval prompt's shadow root from `closed` to `open` — which
+would let the page read it and click its buttons — kept every test green.
+
 ## [1.8.0]
 
 ### Fixed
