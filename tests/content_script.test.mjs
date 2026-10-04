@@ -143,7 +143,21 @@ function loadContentScript(registry) {
       opacity: '1',
       getPropertyValue: () => ''
     }),
-    scrollTo() {}, scrollBy() {}
+    scrollTo() {}, scrollBy() {},
+    _listeners: {},
+    addEventListener(type, fn) {
+      (this._listeners[type] = this._listeners[type] || []).push(fn);
+    },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type] || [];
+      const i = list.indexOf(fn);
+      if (i >= 0) list.splice(i, 1);
+    },
+    /** Deliver a page error the way Firefox delivers it to a content script. */
+    emit(type, event) {
+      (this._listeners[type] || []).forEach(fn => fn(event));
+    },
+    listenerCount(type) { return (this._listeners[type] || []).length; }
   };
 
   let messageListener = null;
@@ -557,6 +571,91 @@ test('a text selector containing a quote cannot graft on an XPath predicate', as
     'the raw interpolation must be gone');
   assert.ok(SOURCE.includes('xpathLiteral('),
     'the text needle must be quoted through xpathLiteral');
+});
+
+// --------------------------------------------------------------------------
+// What console capture can honestly claim. Verified live: a page's own
+// console.log produced zero entries while execute_script's produced one, and
+// the result said interceptionAvailable: true throughout - inviting an agent
+// to read an empty array as "the page logged nothing".
+
+test('page errors and unhandled rejections are captured', async () => {
+  const ctx = loadContentScript({});
+  await ctx.send({ action: 'startLogging' });
+
+  ctx.window.emit('error', {
+    message: 'Uncaught TypeError: x is not a function',
+    filename: 'http://stub.test/app.js', lineno: 12, colno: 3
+  });
+  ctx.window.emit('unhandledrejection', { reason: new Error('boom') });
+
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  const messages = Array.from(logs.logs, l => l.message);
+  assert.equal(logs.logs.length, 2);
+  assert.ok(messages[0].includes('x is not a function'));
+  assert.ok(messages[0].includes('app.js:12:3'), 'location should be included');
+  assert.ok(messages[1].includes('Unhandled promise rejection'));
+  assert.ok(messages[1].includes('boom'));
+  assert.ok(logs.logs.every(l => l.source === 'page'));
+});
+
+test('the result does not claim to capture the page console', async () => {
+  const ctx = loadContentScript({});
+  await ctx.send({ action: 'startLogging' });
+
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  assert.equal(logs.capturesPageConsole, false,
+    'a content script cannot see the page console; saying otherwise invites '
+    + 'an empty array to be read as "no errors"');
+  assert.equal(logs.capturesPageErrors, true);
+  assert.equal(logs.capturesExtensionConsole, true);
+  assert.match(logs.note, /does not mean the page logged nothing/);
+});
+
+test('extension-side console output is tagged as such', async () => {
+  const ctx = loadContentScript({});
+  await ctx.send({ action: 'startLogging' });
+  ctx.consoleStub.log('from an extension script');
+
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  assert.equal(logs.logs.length, 1);
+  assert.equal(logs.logs[0].source, 'extension',
+    'the two sources must be distinguishable in the result');
+});
+
+test('page error listeners are removed when logging stops', async () => {
+  const ctx = loadContentScript({});
+  assert.equal(ctx.window.listenerCount('error'), 0, 'nothing before logging');
+
+  await ctx.send({ action: 'startLogging' });
+  assert.equal(ctx.window.listenerCount('error'), 1);
+  assert.equal(ctx.window.listenerCount('unhandledrejection'), 1);
+
+  await ctx.send({ action: 'stopLogging' });
+  assert.equal(ctx.window.listenerCount('error'), 0,
+    'a page must not keep paying for a finished logging session');
+  assert.equal(ctx.window.listenerCount('unhandledrejection'), 0);
+});
+
+test('page errors are not recorded while logging is off', async () => {
+  const ctx = loadContentScript({});
+  await ctx.send({ action: 'startLogging' });
+  await ctx.send({ action: 'stopLogging' });
+  ctx.window.emit('error', { message: 'after stop' });
+
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  assert.equal(logs.logs.length, 0);
+});
+
+test('an unprintable rejection reason does not break capture', async () => {
+  const ctx = loadContentScript({});
+  await ctx.send({ action: 'startLogging' });
+  const hostile = { get reason() { throw new Error('nope'); } };
+  ctx.window.emit('unhandledrejection', hostile);
+
+  const logs = await ctx.send({ action: 'getConsoleLogs' });
+  assert.equal(logs.logs.length, 1);
+  assert.match(logs.logs[0].message, /unprintable/);
 });
 
 // --------------------------------------------------------------------------

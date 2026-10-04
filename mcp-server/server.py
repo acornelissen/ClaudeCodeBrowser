@@ -239,7 +239,7 @@ MCP_TOOLS: List[MCPTool] = [
             "type": "object",
             "properties": {
                 "tab_id": {"type": "integer", "description": "Optional tab ID. If not specified, uses active tab."},
-                "full_page": {"type": "boolean", "description": "Capture full page instead of visible area.", "default": False},
+                "full_page": {"type": "boolean", "description": "Capture the full page instead of the visible area. NOT SUPPORTED in attended Firefox - the result falls back to the visible viewport with fullPageCaptured: false. Use browser_scroll_and_capture, or the headless backend, for a whole page.", "default": False},
                 "save_to_file": {"type": "boolean", "description": "Save screenshot to file.", "default": True},
                 "filename": {"type": "string", "description": "Optional filename for saved screenshot."}
             }
@@ -659,7 +659,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_console_logs",
-        description="Retrieve captured console logs (console.log, console.error, console.warn, etc.). Useful for debugging AI chat interfaces, seeing errors, and monitoring application state.",
+        description="Retrieve captured console output. IMPORTANT in attended Firefox: a content script cannot see the page's own console, so this does NOT return the page's console.log calls. It returns uncaught page errors and unhandled promise rejections (source: \"page\"), plus output from the extension's own scripts including anything browser_execute_script prints (source: \"extension\"). An empty result therefore does not mean the page logged nothing. Headless mode (Playwright) captures the page console in full. Check capturesPageConsole in the result.",
         input_schema={
             "type": "object",
             "properties": {

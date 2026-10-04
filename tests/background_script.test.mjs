@@ -68,6 +68,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
 
   const contentMessages = [];
   const tabsOnRemoved = makeEvent();
+  const webNavigationOnCommitted = makeEvent();
   const messageListeners = [];
   const externalListeners = [];
   const createdWindows = [];
@@ -114,6 +115,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
       remove: async (id) => { removedWindows.push(id); }
     },
     webRequest,
+    webNavigation: { onCommitted: webNavigationOnCommitted },
     notifications: { create: async () => 'id' },
     contextMenus: { create() {}, onClicked: { addListener() {} } }
   };
@@ -123,7 +125,8 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
     TextDecoder,
     setTimeout, clearTimeout, setInterval, clearInterval,
-    Date, Map, Set, RegExp, JSON, Math, Promise, Error
+    Date, Map, Set, RegExp, JSON, Math, Promise, Error,
+    URL, URLSearchParams
   };
   sandbox.globalThis = sandbox;
 
@@ -147,6 +150,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   return {
     context, command, webRequest, filters, contentMessages, tabsOnRemoved,
     createdWindows, removedWindows, deliver, externalListeners,
+    webNavigationOnCommitted,
     failWindowCreate: () => { windowCreateFails = true; },
     extensionSender: { id: 'ccb@stub' },
     contentScriptSender: { id: 'ccb@stub', tab: { id: 7 } },
@@ -1027,6 +1031,91 @@ test('ordinary markup is not mangled by the scrubber', async () => {
   const body = (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
   assert.ok(body.includes('search terms'), 'a search box is not a credential');
   assert.ok(body.includes('href="/x?page=2"'), 'links must survive intact');
+});
+
+// --------------------------------------------------------------------------
+// A logging session belongs to a page, not to a tab id
+
+test('navigating the tab to another origin stops capture', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+  fireRequest(ctx.webRequest);
+  assert.equal((await ctx.command('getNetworkLogs', {}, 7)).logs.length, 1);
+
+  // The user types their bank's URL into the same tab.
+  ctx.webNavigationOnCommitted.fire({ tabId: 7, frameId: 0,
+                                      url: 'https://bank.example/accounts' });
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  fireRequest(ctx.webRequest, { requestId: 'after',
+                                url: 'https://bank.example/api/balance' });
+  const logs = await ctx.command('getNetworkLogs', {}, 7);
+  assert.ok(!JSON.stringify(logs).includes('bank.example/api/balance'),
+    'a session started elsewhere must not capture the new origin');
+  assert.equal(logs.loggingEnabled, false, 'the session should have ended');
+});
+
+test('navigating within the same origin keeps capture running', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  ctx.webNavigationOnCommitted.fire({ tabId: 7, frameId: 0,
+                                      url: 'http://stub.test/other-page' });
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  fireRequest(ctx.webRequest, { requestId: 'same' });
+  const logs = await ctx.command('getNetworkLogs', {}, 7);
+  assert.equal(logs.logs.length, 1, 'same-origin navigation is not a new page');
+  assert.equal(logs.loggingEnabled, true);
+});
+
+test('a subframe navigating does not end the session', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+
+  // An ad iframe navigating must not stop the tab's logging.
+  ctx.webNavigationOnCommitted.fire({ tabId: 7, frameId: 3,
+                                      url: 'https://ads.example/frame' });
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  fireRequest(ctx.webRequest, { requestId: 'still' });
+  assert.equal((await ctx.command('getNetworkLogs', {}, 7)).logs.length, 1);
+});
+
+// --------------------------------------------------------------------------
+// Flags and fields the caller reasons about
+
+test('reload_all bypasses the cache by default, as its schema says', async () => {
+  const ctx = loadBackground();
+  const reloads = [];
+  ctx.context.browser.tabs.reload = async (id, options) => { reloads.push(options); };
+  ctx.context.browser.tabs.query = async () => [{ id: 1, url: 'http://a.test/' }];
+
+  await ctx.command('reloadAll', {}, undefined);
+  assert.equal(reloads.length, 1);
+  assert.equal(reloads[0].bypassCache, true,
+    'the tool exists for picking up a restarted dev server');
+});
+
+test('full_page says plainly that it did not capture a full page', async () => {
+  const ctx = loadBackground();
+  const result = await ctx.command('screenshot', { fullPage: true }, 7);
+
+  assert.equal(result.fullPageRequested, true);
+  assert.equal(result.fullPageCaptured, false,
+    'it has never worked; silently returning the viewport is worse');
+  assert.match(result.note, /not supported/i);
+  assert.equal(result.type, 'visible');
+});
+
+test('internal filter bookkeeping does not reach the caller', async () => {
+  const ctx = loadBackground();
+  await ctx.command('startLogging', {}, 7);
+  fireRequest(ctx.webRequest);
+
+  const entry = (await ctx.command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.filterAttached, undefined,
+    'filterAttached is bookkeeping, not something to reason about');
 });
 
 // --------------------------------------------------------------------------

@@ -237,6 +237,8 @@ function finalizeNetworkRequest(requestId, extra) {
   if (!entry) return;
   pendingNetworkRequests.delete(requestId);
   Object.assign(entry, extra);
+  // Internal bookkeeping, not something the caller should reason about.
+  delete entry.filterAttached;
   if (entry.startedAt) {
     entry.duration = Date.now() - entry.startedAt;
     delete entry.startedAt;
@@ -591,12 +593,48 @@ function clearNetworkLogs(tabId) {
   networkLogsByTab.delete(tabId);
 }
 
+// A logging session is scoped to the page it was started on, not to the tab
+// id, which outlives navigation. Otherwise: start logging on a dev server,
+// then type your bank's URL into that same tab, and its request and response
+// bodies are captured by a session you started for something else.
+const loggedOrigins = new Map();
+
+function originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch (e) {
+    return null;
+  }
+}
+
+if (browser.webNavigation && browser.webNavigation.onCommitted) {
+  browser.webNavigation.onCommitted.addListener((details) => {
+    // Top-level navigations only; a subframe moving does not end the session.
+    if (details.frameId !== 0) return;
+    if (!loggedTabs.has(details.tabId)) return;
+
+    const startedOn = loggedOrigins.get(details.tabId);
+    const now = originOf(details.url);
+    // Same page, same session. Anything else - a different origin, or an
+    // origin we cannot determine - ends it: capturing a page the session was
+    // not started for is the failure that matters, so unknown fails closed.
+    if (startedOn && now && startedOn === now) return;
+
+    console.warn(`[ClaudeCodeBrowser] stopping capture on tab ${details.tabId}: ` +
+                 `navigated from ${startedOn} to ${now}`);
+    stopNetworkLogging(details.tabId);
+    loggedOrigins.delete(details.tabId);
+    sendToContentScript(details.tabId, { action: "stopLogging" }).catch(() => {});
+  });
+}
+
 // Don't keep logs for tabs that no longer exist.
 browser.tabs.onRemoved.addListener((tabId) => {
   loggedTabs.delete(tabId);
   networkLogsByTab.delete(tabId);
   idleWatchers.delete(tabId);
   inFlightByTab.delete(tabId);
+  loggedOrigins.delete(tabId);
   releaseWebRequestListenersIfIdle();
 });
 
@@ -928,13 +966,29 @@ async function takeScreenshot(tabId, options = {}) {
         quality: options.quality || 90
       });
 
-      // If full page screenshot requested, use content script
-      if (options.fullPage) {
-        const fullPageData = await browser.tabs.sendMessage(targetTab.id, {
-          action: "captureFullPage",
-          format: options.format || "png"
-        });
-        return { success: true, data: fullPageData, type: "fullPage" };
+      // full_page has never worked: captureFullPage only ever returned the
+      // page's dimensions, which the server then tried to treat as a data
+      // URL and failed on with an AttributeError. A real implementation needs
+      // scroll-and-stitch, which belongs in a separate tool rather than a
+      // flag that silently means something else. Report the visible capture
+      // and say plainly that the flag was not honoured.
+      if (parseFlag(options.fullPage, false)) {
+        const metrics = await browser.tabs.sendMessage(targetTab.id, {
+          action: "captureFullPage"
+        }, { frameId: 0 }).catch(() => null);
+        return {
+          success: true,
+          data: dataUrl,
+          type: "visible",
+          fullPageRequested: true,
+          fullPageCaptured: false,
+          note: "full_page is not supported in attended Firefox: this is the " +
+                "visible viewport only. Use browser_scroll_and_capture to walk " +
+                "the page, or the headless backend, which captures full pages.",
+          pageMetrics: metrics,
+          tab: { id: targetTab.id, url: targetTab.url, title: targetTab.title },
+          wasFocused: needsFocus
+        };
       }
 
       return {
@@ -1204,6 +1258,15 @@ async function startLogging(tabId, data = {}) {
     return { success: false, error: "No tab to log" };
   }
 
+  // Remember which origin this session belongs to, so navigating away ends it.
+  try {
+    const tab = await browser.tabs.get(resolved);
+    const origin = originOf(tab.url);
+    if (origin) loggedOrigins.set(resolved, origin);
+  } catch (e) {
+    // Tab went away; startNetworkLogging below will still be harmless.
+  }
+
   const network = startNetworkLogging(resolved, data);
   const console_ = await sendToContentScript(resolved, { action: "startLogging", ...data });
 
@@ -1218,7 +1281,12 @@ async function startLogging(tabId, data = {}) {
       error: network.error
     },
     console: {
+      // What a content script can actually see: page errors and unhandled
+      // rejections, plus the extension's own output. NOT the page's console -
+      // that lives in a world the content script has no access to.
       capturing: console_.success === true,
+      capturesPageConsole: false,
+      capturesPageErrors: console_.success === true,
       error: console_.success === true ? undefined : console_.error
     }
   };
@@ -1666,7 +1734,7 @@ async function refreshTab(tabId, options = {}) {
               success: true,
               refreshed: true,
               tab: { id: tab.id, url: tab.url, title: tab.title },
-              bypassCache: options.bypassCache || false
+              bypassCache: parseFlag(options.bypassCache, true)
             });
           }
         };
@@ -1711,7 +1779,10 @@ async function reloadAllTabs(options = {}) {
         }
       }
 
-      await browser.tabs.reload(tab.id, { bypassCache: options.bypassCache || false });
+      // The schema documents bypass_cache as defaulting to true, and the
+      // tool exists for picking up a restarted dev server, where a cached
+      // response is the thing you are trying to avoid.
+      await browser.tabs.reload(tab.id, { bypassCache: parseFlag(options.bypassCache, true) });
       results.push({ id: tab.id, url: tab.url, reloaded: true });
     }
 

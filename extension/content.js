@@ -45,6 +45,8 @@
         if (loggingEnabled) {
           const entry = {
             level: method,
+            // Output from the extension's own scripts, not the page's.
+            source: 'extension',
             timestamp: new Date().toISOString(),
             message: args.map(arg => {
               try {
@@ -75,31 +77,96 @@
     });
   }
 
-  // Console capture is opt-in: this script runs on every page in every frame,
-  // and wrapping a page's console when nobody asked for logs is a cost no page
-  // should pay. Network traffic is captured in the background script via
-  // webRequest instead of by replacing page globals — Firefox's sandbox
-  // refuses a window.fetch override anyway, so a content script could only
-  // ever have seen XHR.
-  const interception = { console: false };
+  // What console capture can and cannot see.
+  //
+  // A content script has its own `console`, separate from the page's. Wrapping
+  // it captures output from the extension's own scripts - including anything
+  // browser_execute_script prints - and never a single console.log the page
+  // itself makes. Verified live: a page's console.log produced zero entries
+  // while execute_script's produced one.
+  //
+  // Capturing the page's console for real would mean injecting a script into
+  // the page's own world: back to mutating page globals, breakable by CSP,
+  // and forgeable by the page. That is the thing the webRequest move was for
+  // getting away from, so it is not done here.
+  //
+  // What IS reachable safely: page errors and unhandled rejections arrive as
+  // DOM events on window, so a content-script listener sees them without
+  // touching anything the page owns. That is the subset worth having for
+  // debugging, and it is captured.
+  //
+  // Headless mode has no such boundary - the Playwright backend hooks
+  // page.on('console') and captures everything.
+  const interception = { console: false, pageErrors: false };
+
+  function recordPageError(level, message) {
+    if (!loggingEnabled) return;
+    consoleLogs.push({
+      level: level,
+      source: 'page',
+      timestamp: new Date().toISOString(),
+      message: message,
+      url: window.location.href
+    });
+    if (consoleLogs.length > MAX_LOG_ENTRIES) consoleLogs.shift();
+  }
+
+  const onPageError = (event) => {
+    const where = event.filename
+      ? ` (${event.filename}:${event.lineno || 0}:${event.colno || 0})`
+      : '';
+    recordPageError('error', `${event.message || 'Uncaught error'}${where}`);
+  };
+
+  const onPageRejection = (event) => {
+    let reason;
+    try {
+      reason = event.reason instanceof Error
+        ? `${event.reason.name}: ${event.reason.message}`
+        : String(event.reason);
+    } catch (e) {
+      reason = '[unprintable rejection reason]';
+    }
+    recordPageError('error', `Unhandled promise rejection: ${reason}`);
+  };
 
   function installInterception() {
-    if (interception.console) return;
-    try {
-      interceptConsole();
-      interception.console = true;
-    } catch (e) {
-      // console not writable in this sandbox — skip console logging
+    if (!interception.console) {
+      try {
+        interceptConsole();
+        interception.console = true;
+      } catch (e) {
+        // console not writable in this sandbox — skip it
+      }
+    }
+    if (!interception.pageErrors) {
+      try {
+        window.addEventListener('error', onPageError);
+        window.addEventListener('unhandledrejection', onPageRejection);
+        interception.pageErrors = true;
+      } catch (e) {
+        // no window error events available here
+      }
     }
   }
 
   function removeInterception() {
-    if (!interception.console) return;
-    try {
-      restoreConsole();
-      interception.console = false;
-    } catch (e) {
-      // the wrapper stays, forwarding to originalConsole; logging has stopped
+    if (interception.console) {
+      try {
+        restoreConsole();
+        interception.console = false;
+      } catch (e) {
+        // the wrapper stays, forwarding to originalConsole; logging stopped
+      }
+    }
+    if (interception.pageErrors) {
+      try {
+        window.removeEventListener('error', onPageError);
+        window.removeEventListener('unhandledrejection', onPageRejection);
+      } catch (e) {
+        // nothing more to do
+      }
+      interception.pageErrors = false;
     }
   }
 
@@ -153,7 +220,18 @@
       totalCount: consoleLogs.length,
       returnedCount: logs.length,
       loggingEnabled: loggingEnabled,
-      interceptionAvailable: interception.console
+      // Be precise about what an empty array means. Reporting a single
+      // "interceptionAvailable: true" invited the conclusion that the page
+      // had logged nothing, when the page's console was never visible.
+      capturesPageConsole: false,
+      capturesPageErrors: interception.pageErrors,
+      capturesExtensionConsole: interception.console,
+      note: 'A content script cannot see the page\'s own console. Captured ' +
+            'here: uncaught page errors and unhandled rejections ' +
+            '(source: "page"), and output from the extension\'s own scripts ' +
+            'including browser_execute_script (source: "extension"). An empty ' +
+            'result does not mean the page logged nothing. Headless mode ' +
+            'captures the page console in full.'
     };
   }
 
