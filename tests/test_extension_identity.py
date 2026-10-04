@@ -134,10 +134,15 @@ class AttributionTests(unittest.TestCase):
     def test_source_headers_credit_the_original_author(self):
         """Every source file carries the attribution in its header comment.
         Checked against the header rather than the whole file, so a mention
-        further down does not satisfy it."""
+        further down does not satisfy it.
+
+        20 lines, not 45: safety.py's header docstring grew past 45 and
+        pushed the attribution out of the checked window, which this test
+        then reported as missing attribution. A tight window makes the
+        convention "attribution at the very top", which cannot drift."""
         for path in self.SOURCE_FILES:
             with self.subTest(path=path):
-                header = '\n'.join((ROOT / path).read_text().splitlines()[:45])
+                header = '\n'.join((ROOT / path).read_text().splitlines()[:20])
                 self.assertIn('Copyright', header,
                               f'{path} has no copyright line in its header')
                 self.assertIn(self.UPSTREAM_AUTHOR, header,

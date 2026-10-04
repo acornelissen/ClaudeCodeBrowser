@@ -94,16 +94,46 @@ class ConfirmTokenBindingTests(unittest.TestCase):
 class ProtectedPatternTests(unittest.TestCase):
 
     def test_a_query_string_does_not_switch_the_gov_pattern_off(self):
-        """\.gov(/|$) required a slash or end-of-string, so appending ?x=1
+        r"""\.gov(/|$) required a slash or end-of-string, so appending ?x=1
         disarmed the guard while loading the same page."""
         g = guard()
         for url in ('https://www.irs.gov', 'https://www.irs.gov/',
                     'https://www.irs.gov?x=1', 'https://www.irs.gov#x',
-                    'https://irs.gov:443/'):
+                    'https://irs.gov:443/',
+                    # Firefox parses tabs.update({url}) the WHATWG way, where
+                    # a backslash is a slash, control characters are dropped
+                    # and surrounding whitespace is trimmed. Matching the raw
+                    # string instead meant one backslash landed on the same
+                    # page with the delimiter class unmatched.
+                    'https://www.irs.gov\\payments',
+                    'https://www.irs.gov\\\\payments',
+                    'https://www.irs.gov\t/payments',
+                    'https://www.irs.gov\n/payments',
+                    '  https://www.irs.gov/payments  ',
+                    'https:/\\www.irs.gov/payments'):
             with self.subTest(url=url):
                 g.note_url({'url': url})
                 denial = g.check('browser_click', {'selector': '#x'})
                 self.assertIsNotNone(denial, f'{url} should be protected')
+
+    def test_a_backslash_url_cannot_be_navigated_to_unconfirmed(self):
+        """The exploit the delimiter gap bought: browser_navigate to a .gov
+        page with no human approval and no confirm token."""
+        g = guard()
+        denial = g.check('browser_navigate',
+                         {'url': 'https://www.irs.gov\\payments'})
+        self.assertIsNotNone(denial, 'a backslash must not disarm the guard')
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_normalising_does_not_protect_a_lookalike_host(self):
+        """The host here is evil.com, not irs.gov, and over-matching would
+        train people to approve prompts that do not matter."""
+        g = guard()
+        for url in ('https://www.irs.gov.evil.com/x',
+                    'https://www.irs.gov@evil.com/x'):
+            with self.subTest(url=url):
+                g.note_url({'url': url})
+                self.assertIsNone(g.check('browser_click', {'selector': '#x'}))
 
     def test_an_unprotected_site_needs_no_confirmation(self):
         g = guard()
@@ -139,6 +169,45 @@ class UrlPolicyTests(unittest.TestCase):
         g = guard(allowed_url_patterns=[r'^https://localhost'])
         g.note_url({'url': 'https://localhost:3000/app'})
         self.assertIsNone(g.check('browser_screenshot', {}))
+
+    def test_a_name_that_merely_starts_with_an_allowed_one_is_refused(self):
+        """The allowlist is the strictest setting on offer, and re.search let
+        any attacker-registrable name that extended an allowed one through -
+        which also freed every read tool on that page."""
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        for url in ('https://localhost.evil.com/x', 'https://localhostile.io/',
+                    'https://localhost@evil.com/', 'https://localhost-evil.io/'):
+            with self.subTest(url=url):
+                g.note_url({'url': url})
+                denial = g.check('browser_screenshot', {})
+                self.assertIsNotNone(denial, f'{url} is not localhost')
+                self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
+    def test_an_allowlist_pattern_may_name_a_host_on_its_own(self):
+        g = guard(allowed_url_patterns=[r'localhost'])
+        g.note_url({'url': 'http://localhost:8080/x'})
+        self.assertIsNone(g.check('browser_screenshot', {}))
+        g.note_url({'url': 'https://localhost.evil.com/x'})
+        self.assertIsNotNone(g.check('browser_screenshot', {}))
+
+    def test_an_allowlisted_navigation_is_still_allowed(self):
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        self.assertIsNone(g.check('browser_navigate',
+                                  {'url': 'https://localhost:3000/app'}))
+        denial = g.check('browser_navigate',
+                         {'url': 'https://localhost.evil.com/app'})
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
+    def test_a_trusted_pattern_is_confined_the_same_way(self):
+        """trusted_url_patterns grants the same thing in the other direction:
+        it exempts a site from confirmation, so a prefix match there buys an
+        attacker's subdomain a pass on protected-site checks."""
+        g = guard(unlisted_domains='confirm',
+                  trusted_url_patterns=[r'^https://localhost'])
+        g.note_url({'url': 'https://localhost.evil.com/x'})
+        denial = g.check('browser_click', {'selector': '#x'})
+        self.assertIsNotNone(denial, 'only localhost itself is trusted')
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
 
 
 class ToolClassificationTests(unittest.TestCase):
@@ -300,6 +369,38 @@ class ScriptsOnProtectedSitesTests(unittest.TestCase):
         advisory = guard(allow_script_execution=True,
                          deny_scripts_on_protected_urls=False).status()
         self.assertEqual(advisory['credential_guard'], 'advisory')
+
+
+class PolicyChoiceTests(unittest.TestCase):
+    """protected_approval and unlisted_domains were compared with ==, so
+    "Human" or " human" matched nothing and fell through to the weaker
+    branch - for protected_approval that is the agent-side token flow."""
+
+    def test_an_approval_mode_is_read_case_insensitively(self):
+        g = guard(protected_approval='Human')
+        self.assertEqual(g.status()['protected_approval'], 'human')
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        denial = g.check('browser_click', {'selector': '#x'})
+        self.assertEqual(denial['approval_mode'], 'human',
+                         'the server routes on this value; "Human" must not '
+                         'silently become the token flow')
+
+    def test_surrounding_space_is_tolerated(self):
+        g = guard(protected_approval=' token ')
+        self.assertEqual(g.status()['protected_approval'], 'token')
+
+    def test_an_unknown_mode_falls_back_to_the_default(self):
+        g = guard(protected_approval='yes please')
+        self.assertEqual(g.status()['protected_approval'], 'auto')
+
+    def test_unlisted_domains_is_read_the_same_way(self):
+        g = guard(unlisted_domains=' Confirm ')
+        self.assertEqual(g.status()['unlisted_domains'], 'confirm')
+        g.note_url({'url': 'https://mail.example.com/inbox'})
+        denial = g.check('browser_click', {'selector': '#x'})
+        self.assertIsNotNone(denial, '"Confirm" must invert the policy as '
+                                     'the person asked')
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
 
 
 class AuditLogTests(unittest.TestCase):

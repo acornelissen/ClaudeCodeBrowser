@@ -193,6 +193,60 @@ def redact_for_log(arguments: Dict[str, Any]) -> Dict[str, Any]:
             for k, v in arguments.items()}
 
 
+# Values a string flag may carry. MCP arguments arrive as JSON, but callers
+# (shell wrappers, the stdio bridge, an agent writing JSON by hand) do send
+# "false" as a string, and bool("false") is True. The flags here were read
+# with a bare arguments.get(name, default) and tested for truth, so "false"
+# meant ON - and save_to_file decides whether a PNG of whatever was on screen
+# is written to disk and kept for the retention window. parseFlag in
+# extension/background.js already does this for the browser side; this is the
+# same rule on the server side.
+_TRUE_FLAGS = {'true', '1', 'yes', 'on'}
+_FALSE_FLAGS = {'false', '0', 'no', 'off'}
+
+# browser_get_tabs/browser_find_tabs honour "limit" as the caller gives it.
+DEFAULT_TAB_LIMIT = 50
+MAX_TAB_LIMIT = 200
+
+
+def parse_flag(value: Any, fallback: bool) -> bool:
+    """Read a boolean argument that may have arrived as a string or a number.
+
+    Mirrors parseFlag() in extension/background.js. An unrecognised value
+    falls back rather than being coerced, so a typo cannot silently mean the
+    opposite of what it says.
+    """
+    if value is None or value == '':
+        return fallback
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_FLAGS:
+            return True
+        if text in _FALSE_FLAGS:
+            return False
+    return fallback
+
+
+def clamp_tab_limit(value: Any) -> int:
+    """Clamp a caller-supplied tab limit.
+
+    The limit was passed through untouched and the extension caps nothing, so
+    {"url_pattern": "stub", "limit": 100000} returned 500 tabs - the user's
+    whole browsing surface, from a tool that reads like a search.
+    """
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TAB_LIMIT
+    if limit < 1:
+        return DEFAULT_TAB_LIMIT
+    return min(limit, MAX_TAB_LIMIT)
+
+
 def camelize_args(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Convert snake_case MCP argument keys to the camelCase the extension reads.
 
@@ -379,7 +433,7 @@ MCP_TOOLS: List[MCPTool] = [
             "type": "object",
             "properties": {
                 "current_window_only": {"type": "boolean", "default": True, "description": "Only list tabs in the current window. Set false to include every open Firefox window."},
-                "limit": {"type": "integer", "default": 50, "description": "Max tabs to return."},
+                "limit": {"type": "integer", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT, "description": f"Max tabs to return. Clamped to {MAX_TAB_LIMIT}."},
                 "url_pattern": {"type": "string", "description": "Regex to filter tabs by URL before applying limit."},
                 "include_favicon": {"type": "boolean", "default": False, "description": "Include favIconUrl (often a large base64 data URI) per tab."}
             }
@@ -398,15 +452,26 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_find_tabs",
-        description="Find tabs by URL pattern, title, or other criteria.",
+        description=f"Find tabs by URL pattern, title, or other criteria. At least one filter is required - with none it would hand over every tab in every window, so it is refused; use browser_get_tabs to list tabs deliberately. Returns at most {MAX_TAB_LIMIT} tabs and says so via truncated/total_matched.",
         input_schema={
             "type": "object",
+            # At least one filter. The requirement was added to the handler
+            # and never to the schema, so an agent reading the schema called
+            # it with {} and got a runtime error it had no way to expect.
+            "anyOf": [
+                {"required": ["url"]},
+                {"required": ["url_pattern"]},
+                {"required": ["title"]},
+                {"required": ["active"]},
+                {"required": ["audible"]},
+            ],
             "properties": {
                 "url": {"type": "string", "description": "URL prefix to match."},
                 "url_pattern": {"type": "string", "description": "Regex pattern to match URLs."},
                 "title": {"type": "string", "description": "Text to search for in tab titles (case-insensitive)."},
                 "active": {"type": "boolean", "description": "Filter by active state."},
-                "audible": {"type": "boolean", "description": "Filter by playing audio."}
+                "audible": {"type": "boolean", "description": "Filter by playing audio."},
+                "limit": {"type": "integer", "description": f"Max tabs to return. Default {DEFAULT_TAB_LIMIT}, clamped to {MAX_TAB_LIMIT}.", "default": DEFAULT_TAB_LIMIT, "maximum": MAX_TAB_LIMIT}
             }
         }
     ),
@@ -581,13 +646,14 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_observe_element",
-        description="Start observing an element for changes. Call browser_stop_observing later to get accumulated changes.",
+        description="Start observing an element for changes. Call browser_stop_observing later to get accumulated changes. The observer expires on its own after max_lifetime_ms (5 minutes by default) and stops recording; browser_stop_observing then returns expired: true, so raise max_lifetime_ms up front if you mean to watch for longer.",
         input_schema={
             "type": "object",
             "required": ["selector"],
             "properties": {
                 "selector": {"type": "string", "description": "CSS selector of element to observe."},
                 "observer_id": {"type": "string", "description": "ID for this observer (to stop it later)."},
+                "max_lifetime_ms": {"type": "integer", "description": "How long the observer keeps recording before it expires by itself, in ms. Default 300000 (5 minutes).", "default": 300000},
                 "tab_id": {"type": "integer", "description": "Optional tab ID."}
             }
         }
@@ -992,9 +1058,16 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         else:
             logger.info(f"HTTP: {line}")
 
-    def send_json_response(self, data: Dict[str, Any], status: int = 200):
-        """Send a JSON response."""
-        self.send_response(status)
+    def send_json_response(self, data: Dict[str, Any], status: int = 200,
+                           reason: Optional[str] = None):
+        """Send a JSON response.
+
+        reason overrides the status line's phrase. Every caller here is a
+        local process using urllib.request.urlopen, which raises HTTPError on
+        a 4xx/5xx and throws the body away - so for an error the caller is
+        expected to read, the status line is the only text that reaches it.
+        """
+        self.send_response(status, reason)
         self.send_header('Content-Type', 'application/json')
         # No CORS headers: all callers (stdio_wrapper, native host) are local processes
         # using urllib — not browser fetch. Omitting CORS blocks cross-origin requests.
@@ -1145,7 +1218,14 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 'error': 'POST /browser/command is not implemented and queues '
                          'nothing. It previously reported success without '
                          'doing anything. Use the MCP tool interface.'
-            }, 410)
+            }, 410,
+                # The body never reaches the caller: forward_to_mcp_server in
+                # the native host uses urlopen, which raises HTTPError on 410
+                # and discards the body, so the operator saw "MCP server
+                # connection failed: HTTP Error 410: Gone" and read it as a
+                # connection fault. The status line's phrase does reach them.
+                reason='Gone - use the MCP tool interface, not '
+                       '/browser/command')
 
         elif parsed.path == '/browser/response':
             # Response from browser extension
@@ -1279,6 +1359,12 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         action = tool_action_map[tool_name]
         tab_id = arguments.pop('tab_id', None)
 
+        # Clamp the tab listing cap where the agent cannot reach past it:
+        # the extension honours whatever limit it is handed.
+        if tool_name in ('browser_get_tabs', 'browser_find_tabs') \
+                and 'limit' in arguments:
+            arguments['limit'] = clamp_tab_limit(arguments['limit'])
+
         # Password guard: <input type="password"> is neither written nor read
         # back unless the safety config explicitly allows it. The flag travels
         # with the command so the enforcement happens where the element type is
@@ -1330,11 +1416,19 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                     )
                     result = future.result(timeout=wait_timeout + 5)
 
+                    # Before the screenshot branch, not after it. A screenshot
+                    # result is the one result that always carries a URL
+                    # ({tab: {id, url, title}}), and returning early from here
+                    # meant it never reached the guard: after a click landed on
+                    # a bank, the blocklist, the allowlist and the
+                    # protected-site confirmation were all still judging the
+                    # previous page while the agent photographed the new one.
+                    guard.note_url(result)
+
                     # Handle screenshot saving
                     if action == 'screenshot' and result.get('success') and result.get('data'):
                         return self._save_screenshot(result, arguments)
 
-                    guard.note_url(result)
                     return result
                 except Exception as e:
                     logger.error(f"WebSocket command failed: {e}")
@@ -1413,9 +1507,10 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         if event.wait(timeout=wait_timeout):
             connection_manager.http_pending_requests.pop(request_id, None)
             response = result_holder.get('response', {})
+            # Note the URL first: see the WebSocket path above.
+            guard.note_url(response)
             if action == 'screenshot' and response.get('success') and response.get('data'):
                 return self._save_screenshot(response, arguments)
-            guard.note_url(response)
             return response
         else:
             connection_manager.http_pending_requests.pop(request_id, None)
@@ -1462,8 +1557,9 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         """Execute a declarative list of tool steps with assertions."""
         import re as _re
         steps = arguments.get('steps') or []
-        stop_on_failure = arguments.get('stop_on_failure', True)
-        screenshot_on_failure = arguments.get('screenshot_on_failure', True)
+        stop_on_failure = parse_flag(arguments.get('stop_on_failure'), True)
+        screenshot_on_failure = parse_flag(
+            arguments.get('screenshot_on_failure'), True)
         known_tools = {t.name for t in MCP_TOOLS}
 
         results = []
@@ -1609,11 +1705,11 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
 
         response = {'success': True, 'audit': audit.get('result')}
 
-        if arguments.get('screenshot', True):
+        if parse_flag(arguments.get('screenshot'), True):
             from datetime import datetime as _dt
             shot = self.execute_tool('browser_screenshot', {
                 'filename': f"audit_{_dt.now().strftime('%Y%m%d_%H%M%S')}.png",
-                'full_page': arguments.get('full_page', False),
+                'full_page': parse_flag(arguments.get('full_page'), False),
                 **({'tab_id': tab_id} if tab_id is not None else {})
             })
             response['screenshot'] = shot.get('filepath') if shot.get('success') else None
@@ -1624,7 +1720,9 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         """Save screenshot data to file."""
         try:
             data = result.get('data', '')
-            save_to_file = arguments.get('save_to_file', True)
+            # bool("false") is True, so a caller that explicitly declined
+            # still had the PNG written to disk.
+            save_to_file = parse_flag(arguments.get('save_to_file'), True)
             # Strip directory components to prevent path traversal
             filename = Path(arguments.get('filename') or f'screenshot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png').name
 
@@ -1690,15 +1788,52 @@ def run_http_server():
     server.serve_forever()
 
 
-# Origins accepted at the WebSocket handshake. None means "no Origin header",
-# which is what a non-browser local client sends; extension pages present a
-# moz-extension:// origin. A web page always sends its own origin, so it is
-# refused here rather than after the handshake. Overridable for a custom
-# client, but the token is still required either way.
-ALLOWED_WS_ORIGINS = [
-    origin.strip() or None
-    for origin in os.environ.get('CLAUDE_BROWSER_WS_ORIGINS', '').split(',')
-] if os.environ.get('CLAUDE_BROWSER_WS_ORIGINS') else [None]
+def parse_ws_origins(raw: Optional[str]) -> Optional[List[Optional[str]]]:
+    """Parse CLAUDE_BROWSER_WS_ORIGINS into a websockets `origins` list.
+
+    None in the list means "a request with no Origin header is acceptable",
+    which is the only shape a local non-browser client has; a web page always
+    sends its own origin, so it is refused at the handshake rather than ten
+    seconds later when the token frame fails to arrive.
+
+    The override used to *replace* that None, so naming one custom origin
+    gave every local client a 403 - the one client shape that works today.
+    It now adds to the default instead. Accepted values:
+
+      unset           only no-Origin clients (the default)
+      "moz-ext://a"   that origin, and no-Origin clients
+      "a,b"           both origins, and no-Origin clients
+      "*"             any origin: the handshake check is off and the API
+                      token is the only control. Say so out loud.
+
+    Empty or comma-only means unset rather than "allow nothing", because an
+    empty allowlist that refuses everything is never what someone typing
+    CLAUDE_BROWSER_WS_ORIGINS= wanted, and a server nothing can reach is not
+    a safety feature.
+    """
+    if raw is None:
+        return [None]
+    entries = [entry.strip() for entry in raw.split(',')]
+    entries = [entry for entry in entries if entry]
+    if not entries:
+        return [None]
+    if '*' in entries:
+        logger.warning(
+            "CLAUDE_BROWSER_WS_ORIGINS=* accepts a WebSocket handshake from "
+            "any origin, including any web page the user visits. The API "
+            "token is then the only thing refusing it.")
+        return None
+    origins: List[Optional[str]] = [None]
+    for entry in entries:
+        if entry not in origins:
+            origins.append(entry)
+    return origins
+
+
+# Origins accepted at the WebSocket handshake. Extension pages present a
+# moz-extension:// origin; a local tool sends no Origin at all.
+ALLOWED_WS_ORIGINS = parse_ws_origins(
+    os.environ.get('CLAUDE_BROWSER_WS_ORIGINS'))
 
 
 async def websocket_handler(websocket, path=None):

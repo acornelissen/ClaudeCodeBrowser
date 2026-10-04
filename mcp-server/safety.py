@@ -2,6 +2,9 @@
 """
 Safety guard for ClaudeCodeBrowser.
 
+MIT License
+Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
+
 Every tool call passes through SafetyGuard.check() before it reaches the
 browser. The guard enforces, in order:
 
@@ -11,7 +14,12 @@ browser. The guard enforces, in order:
 2. Blocklist/allowlist   - regex patterns matched against the page the tool
                            will act on (its url argument when it has one, the
                            tracked current URL otherwise). An empty allowlist
-                           means "everything not blocked".
+                           means "everything not blocked". The blocklist
+                           matches loosely (re.search); the allowlist grants
+                           access, so a pattern there has to cover a whole
+                           URL prefix or a whole host - see _permitted().
+                           URLs are normalised the way the browser parses
+                           them before any of this - see _normalise_url().
 3. Protected domains     - banking / payment / healthcare / government login
                            pages (configurable). State-changing actions there
                            require an explicit confirmation: in-browser human
@@ -37,8 +45,6 @@ defaults on first run). Environment overrides:
   CLAUDE_BROWSER_ALLOW_SCRIPTS=0    disable script-execution tools
   CLAUDE_BROWSER_SAFETY_CONFIG=path alternate config file
 
-MIT License
-Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
 """
 
 import hashlib
@@ -51,7 +57,8 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 logger = logging.getLogger('ClaudeCodeBrowser.Safety')
 
@@ -72,6 +79,37 @@ except OSError:
 # Schemes a navigation target may use. Anything else (file:, javascript:,
 # data:, chrome:, resource:, moz-extension:, about:config ...) is refused.
 _SAFE_URL_RE = re.compile(r'^(https?://|about:blank$)', re.IGNORECASE)
+
+# Firefox navigates with tabs.update({url}), which parses the string the
+# WHATWG way; every pattern below is matched with Python's re, which does
+# not. Where the two disagree the guard judges a URL the browser never
+# loads. new URL('https://www.irs.gov\\payments').href is
+# 'https://www.irs.gov/payments', so one backslash walked straight past the
+# protected-domain delimiter class while landing on the same page.
+# _normalise_url closes that gap: match what the browser will actually load.
+_C0_AND_SPACE = ''.join(chr(c) for c in range(0x21))
+_REMOVED_URL_CHARS = str.maketrans('', '', '\t\n\r')
+# Characters that end the authority or a path segment. A pattern that stops
+# anywhere else has only matched part of a name.
+_URL_DELIMITERS = ':/?#'
+
+
+def _normalise_url(url: str) -> str:
+    """Return the URL the browser would load, for matching purposes.
+
+    Three WHATWG rules, which are the ones that changed the host or the
+    first delimiter: leading and trailing C0 controls and spaces are
+    stripped, tabs and line breaks are removed wherever they appear, and a
+    backslash counts as a forward slash. The last one applies to http(s)
+    only in the standard, and http(s) and about:blank are the only schemes
+    this guard lets through anyway, so it is applied unconditionally rather
+    than parsed for.
+    """
+    if not isinstance(url, str):
+        return url
+    cleaned = url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS)
+    return cleaned.replace('\\', '/')
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "enabled": True,
@@ -106,7 +144,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_actions_per_minute": 120,
     "audit_log": True,
     # Regexes matched against target URLs. Empty allowlist = allow everything
-    # that is not blocked.
+    # that is not blocked. blocked_url_patterns is matched with re.search, so
+    # a loose pattern catches more and errs towards refusing. The two lists
+    # that *grant* access - allowed_url_patterns and trusted_url_patterns -
+    # cannot afford that, so they are matched as a whole URL prefix or a whole
+    # host; see _permitted().
     "blocked_url_patterns": [],
     "allowed_url_patterns": [],
     # State-changing actions on URLs matching these patterns need explicit
@@ -179,6 +221,11 @@ SCRIPT_TOOLS = {
 
 # Argument keys whose values never appear in the audit log.
 _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps', 'action_script', 'condition'}
+
+# Accepted values for the two string-valued policy choices. Read through
+# SafetyGuard._choice so that "Human" or " human" lands where it was meant to.
+_APPROVAL_MODES = ('auto', 'human', 'token')
+_UNLISTED_MODES = ('allow', 'confirm')
 
 # How long a confirmation token stays valid, and how many can be outstanding.
 _TOKEN_TTL_SECONDS = 120
@@ -378,10 +425,38 @@ class SafetyGuard:
                 except re.error as e:
                     logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({e})")
             return patterns
+
+        def compile_permit_list(key):
+            """Compile a list whose patterns grant access, not refuse it.
+
+            re.search was wrong for these. The pattern "^https://localhost"
+            also matched https://localhost.evil.com/x and
+            https://localhostile.io/, so in allowlist mode - the strictest
+            setting on offer - any name an attacker can register that merely
+            starts with an allowed one opened the guard, and then reads on
+            that page were free too. A permit pattern now has to cover a
+            whole URL prefix (anchored at the start, ending where the
+            authority or path segment ends) or match the host outright.
+            """
+            patterns = []
+            for pattern in self.config.get(key, []):
+                try:
+                    # The lookahead makes the engine find a match that stops
+                    # at a delimiter, so "^https://localhost" still covers
+                    # https://localhost:3000/app.
+                    prefix = re.compile(f'(?:{pattern})(?=[{_URL_DELIMITERS}]|$)',
+                                        re.IGNORECASE)
+                    host = re.compile(pattern, re.IGNORECASE)
+                except re.error as e:
+                    logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({e})")
+                    continue
+                patterns.append((prefix, host))
+            return patterns
+
         self._blocked = compile_list('blocked_url_patterns')
-        self._allowed = compile_list('allowed_url_patterns')
+        self._allowed = compile_permit_list('allowed_url_patterns')
         self._protected = compile_list('protected_url_patterns')
-        self._trusted = compile_list('trusted_url_patterns')
+        self._trusted = compile_permit_list('trusted_url_patterns')
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -417,11 +492,23 @@ class SafetyGuard:
         return denial
 
     def note_url(self, result: Dict[str, Any]):
-        """Track the browser's current URL from a tool result, if it has one."""
-        url = result.get('url') or (result.get('tab') or {}).get('url')
+        """Track the browser's current URL from a tool result, if it has one.
+
+        Results come in two shapes: navigate and getPageInfo report {"url":
+        ...} at the top level, while a screenshot reports {"tab": {"id",
+        "url", "title"}}. The screenshot shape is the one that always carries
+        a URL, so both have to be read here or the guard keeps judging the
+        page the browser has already left.
+        """
+        if not isinstance(result, dict):
+            return
+        tab = result.get('tab')
+        url = result.get('url')
+        if not url and isinstance(tab, dict):
+            url = tab.get('url')
         if isinstance(url, str) and url:
             with self._lock:
-                self._current_url = url
+                self._current_url = _normalise_url(url)
 
     def status(self) -> Dict[str, Any]:
         """Snapshot of the active policy, for the browser_safety_status tool."""
@@ -435,7 +522,8 @@ class SafetyGuard:
             'read_only': self.config.get('read_only', False),
             'allow_script_execution': self.config.get('allow_script_execution', True),
             'confirm_protected_actions': self.config.get('confirm_protected_actions', True),
-            'protected_approval': self.config.get('protected_approval', 'auto'),
+            'protected_approval': self._choice('protected_approval',
+                                               _APPROVAL_MODES, 'auto'),
             'allow_password_typing': self.config.get('allow_password_typing', False),
             # browser_execute_script can read any field regardless of the
             # credential guard, so say which of the two states we are in.
@@ -451,7 +539,8 @@ class SafetyGuard:
                 'but not arbitrary JavaScript. Set allow_script_execution: false '
                 'to close that, or rely on deny_scripts_on_protected_urls for '
                 'protected sites only.'),
-            'unlisted_domains': self.config.get('unlisted_domains', 'allow'),
+            'unlisted_domains': self._choice('unlisted_domains',
+                                             _UNLISTED_MODES, 'allow'),
             'trusted_url_patterns': self.config.get('trusted_url_patterns', []),
             'deny_scripts_on_protected_urls': self.config.get(
                 'deny_scripts_on_protected_urls', True),
@@ -501,7 +590,7 @@ class SafetyGuard:
                 return self._deny('blocked_url',
                                   f"URL {policy_url!r} matches blocked_url_patterns in "
                                   f"safety.json.")
-            if self._allowed and not any(p.search(policy_url) for p in self._allowed):
+            if self._allowed and not self._permitted(self._allowed, policy_url):
                 return self._deny('not_allowlisted',
                                   f"URL {policy_url!r} does not match allowed_url_patterns "
                                   f"in safety.json (allowlist mode is active).")
@@ -557,7 +646,8 @@ class SafetyGuard:
                     'safety_decision': 'confirmation_required',
                     'confirmation_required': True,
                     'confirm_token': token,
-                    'approval_mode': self.config.get('protected_approval', 'auto'),
+                    'approval_mode': self._choice('protected_approval',
+                                                  _APPROVAL_MODES, 'auto'),
                     'protected_url': check_url,
                     'error': (
                         f"{tool_name} targets a protected site ({check_url!r} matches "
@@ -574,7 +664,43 @@ class SafetyGuard:
 
     def _target_url(self, arguments: Dict[str, Any]) -> Optional[str]:
         url = arguments.get('url')
-        return url if isinstance(url, str) and url else None
+        if not (isinstance(url, str) and url):
+            return None
+        return _normalise_url(url)
+
+    @staticmethod
+    def _permitted(patterns: List[Tuple[Any, Any]], url: str) -> bool:
+        """True when one permit pattern covers the whole of what it names."""
+        host = urlsplit(url).hostname or ''
+        for prefix, host_re in patterns:
+            # Anchored at the start of the URL: "^https://localhost" covers
+            # https://localhost:3000/app and stops at the ':', so it cannot
+            # also cover https://localhost.evil.com/x.
+            if prefix.match(url):
+                return True
+            # A bare host pattern ("localhost", r".*\.example\.com") names a
+            # host, so it has to match all of one.
+            if host and host_re.fullmatch(host):
+                return True
+        return False
+
+    def _choice(self, key: str, valid: Tuple[str, ...], default: str) -> str:
+        """Read a string config choice without being picky about case.
+
+        These were compared with ==, so "Human" or " human" matched nothing
+        and fell through to whichever branch the mismatch landed in - for
+        protected_approval that is the weaker agent-side token flow, which is
+        the opposite of what the person who typed it asked for. An
+        unrecognised value falls back to the documented default rather than
+        to whatever the comparison happens to miss.
+        """
+        raw = self.config.get(key, default)
+        value = raw.strip().lower() if isinstance(raw, str) else ''
+        if value in valid:
+            return value
+        logger.warning(f"Ignoring {key}={raw!r} in safety.json: expected one "
+                       f"of {', '.join(valid)}. Using {default!r}.")
+        return default
 
     def _matched_protected(self, url: Optional[str]) -> Optional[str]:
         if not url:
@@ -584,8 +710,8 @@ class SafetyGuard:
                 return pattern.pattern
 
         # Inverted mode: anything not explicitly trusted is protected.
-        if self.config.get('unlisted_domains', 'allow') == 'confirm':
-            if any(pattern.search(url) for pattern in self._trusted):
+        if self._choice('unlisted_domains', _UNLISTED_MODES, 'allow') == 'confirm':
+            if self._permitted(self._trusted, url):
                 return None
             return 'unlisted_domains: confirm'
         return None

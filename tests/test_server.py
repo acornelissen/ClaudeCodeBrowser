@@ -5,9 +5,13 @@ MCP server configuration and credential-guard plumbing tests.
 Run: python3 -m unittest discover -s tests -v
 """
 
+import asyncio
+import base64
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -331,11 +335,52 @@ class WebSocketOriginTests(unittest.TestCase):
                          'a web page always sends an Origin; refuse it at the '
                          'handshake rather than after')
 
-    def test_the_serve_call_actually_passes_the_origin_list(self):
-        """This was commented as intent and left unimplemented once."""
-        import inspect
-        source = inspect.getsource(server.run_websocket_server)
-        self.assertIn('origins=ALLOWED_WS_ORIGINS', source)
+    def test_an_override_adds_to_the_default_instead_of_replacing_it(self):
+        """None in the list means "no Origin header", which is the only shape
+        a local non-browser client has. Replacing it gave every one of them a
+        403 - so naming one custom origin killed the only client that works
+        today."""
+        self.assertEqual(server.parse_ws_origins('moz-extension://abc'),
+                         [None, 'moz-extension://abc'])
+        self.assertEqual(server.parse_ws_origins('one,two'),
+                         [None, 'one', 'two'])
+
+    def test_an_empty_override_means_unset_not_allow_nothing(self):
+        """A trailing comma used to silently re-permit no-Origin clients, and
+        an empty value was ignored. Both now mean the default."""
+        for raw in ('', ',,', '   ', 'moz-extension://abc,'):
+            with self.subTest(raw=raw):
+                origins = server.parse_ws_origins(raw)
+                self.assertIn(None, origins)
+
+    def test_a_star_disables_the_check_explicitly(self):
+        """There was no way to reach origins=None, and "*" was taken as a
+        literal origin, so it refused everything instead of allowing it."""
+        self.assertIsNone(server.parse_ws_origins('*'))
+
+    def test_the_serve_call_honours_the_origin_list(self):
+        """This used to assert on inspect.getsource() text, which cannot tell
+        whether origins= is actually passed and breaks on a rename. Drive the
+        real call and look at the kwargs instead."""
+        captured = {}
+
+        class FakeServer:
+            async def wait_closed(self):
+                return None
+
+        async def fake_serve(handler, host, port, **kwargs):
+            captured.update(kwargs)
+            return FakeServer()
+
+        origins = [None, 'moz-extension://abc']
+        with unittest.mock.patch.object(server, 'HAS_WEBSOCKETS', True), \
+                unittest.mock.patch.object(server, 'ALLOWED_WS_ORIGINS', origins), \
+                unittest.mock.patch.object(server, 'MAIN_EVENT_LOOP', None), \
+                unittest.mock.patch.object(server.websockets, 'serve', fake_serve):
+            asyncio.run(server.run_websocket_server())
+
+        self.assertEqual(captured.get('origins'), origins,
+                         'the handshake check is only real if serve() gets it')
 
 
 class DeprecatedEndpointTests(unittest.TestCase):
@@ -352,7 +397,7 @@ class DeprecatedEndpointTests(unittest.TestCase):
         handler.rfile = None
         captured = {}
 
-        def send(data, status=200):
+        def send(data, status=200, reason=None):
             captured['data'] = data
             captured['status'] = status
 
@@ -363,6 +408,307 @@ class DeprecatedEndpointTests(unittest.TestCase):
                          'a dead endpoint should say so, not return 200')
         self.assertIs(captured['data']['success'], False)
         self.assertIn('queues nothing', captured['data']['error'])
+
+    def test_the_410_says_what_to_do_in_the_status_line(self):
+        """The body never reaches the caller: the native host uses
+        urllib.request.urlopen, which raises HTTPError on 410 and throws the
+        body away, so the operator saw "connection failed: HTTP Error 410:
+        Gone". HTTPError does carry the status line's phrase."""
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler.path = '/browser/command'
+        handler.headers = {'Content-Length': '0'}
+        handler._check_auth = lambda: True
+        handler.rfile = None
+        captured = {}
+
+        def send(data, status=200, reason=None):
+            captured['status'] = status
+            captured['reason'] = reason
+
+        handler.send_json_response = send
+        handler.do_POST()
+
+        self.assertIsNotNone(captured['reason'],
+                             'without a reason phrase the caller only gets "Gone"')
+        self.assertIn('MCP tool', captured['reason'])
+        self.assertNotIn('\n', captured['reason'])
+
+
+class FlagParsingTests(unittest.TestCase):
+    """bool("false") is True. Flags were read with arguments.get(name, True),
+    so a caller that explicitly declined got the opposite - and two of these
+    decide whether a PNG of the screen is written to disk. Nothing in the
+    Python suite passed a string flag before (grep "'true'|'false'" tests/
+    found nothing), although capture_bodies: "false" was confirmed live."""
+
+    def test_string_flags_are_read_as_booleans(self):
+        for raw in ('false', 'False', 'FALSE', ' off ', 'no', '0'):
+            with self.subTest(raw=raw):
+                self.assertFalse(server.parse_flag(raw, True))
+        for raw in ('true', 'True', ' on ', 'yes', '1'):
+            with self.subTest(raw=raw):
+                self.assertTrue(server.parse_flag(raw, False))
+
+    def test_real_booleans_and_numbers_still_work(self):
+        self.assertTrue(server.parse_flag(True, False))
+        self.assertFalse(server.parse_flag(False, True))
+        self.assertFalse(server.parse_flag(0, True))
+        self.assertTrue(server.parse_flag(1, False))
+
+    def test_a_missing_or_unreadable_value_falls_back(self):
+        """A typo must not silently mean the opposite of what it says."""
+        for raw in (None, '', 'maybe', 'FALSEISH', [], {}):
+            with self.subTest(raw=raw):
+                self.assertTrue(server.parse_flag(raw, True))
+                self.assertFalse(server.parse_flag(raw, False))
+
+
+class ScreenshotSaveFlagTests(unittest.TestCase):
+    """save_to_file is the privacy-relevant one: the PNG lands in
+    ~/.claudecodebrowser/screenshots and is kept for the retention window.
+    Driven through the real _save_screenshot - the handler stub used
+    elsewhere never reaches it."""
+
+    PNG = base64.b64encode(b'\x89PNG\r\n\x1a\x0a').decode()
+
+    def setUp(self):
+        self.handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        self.name = f'ccb-flag-test-{os.getpid()}-{time.time_ns()}.png'
+        self.path = server.SCREENSHOTS_DIR / self.name
+
+    def tearDown(self):
+        if self.path.exists():
+            self.path.unlink()
+
+    def _save(self, arguments):
+        result = {'success': True, 'data': self.PNG,
+                  'tab': {'id': 1, 'url': 'https://example.com/x', 'title': 'x'}}
+        return self.handler._save_screenshot(result, dict(arguments, filename=self.name))
+
+    def test_a_string_false_still_declines_the_write(self):
+        out = self._save({'save_to_file': 'false'})
+        self.assertFalse(self.path.exists(),
+                         'the caller declined; nothing may be written to disk')
+        self.assertNotIn('filepath', out)
+
+    def test_a_real_false_declines_the_write(self):
+        self._save({'save_to_file': False})
+        self.assertFalse(self.path.exists())
+
+    def test_the_default_still_saves(self):
+        out = self._save({})
+        self.assertTrue(self.path.exists(), 'the documented default is to save')
+        self.assertEqual(out['filepath'], str(self.path))
+
+    def test_a_string_true_saves(self):
+        self._save({'save_to_file': 'true'})
+        self.assertTrue(self.path.exists())
+
+
+class CurrentUrlTrackingTests(unittest.TestCase):
+    """The guard judges the blocklist, the allowlist and protected-site
+    confirmation against the page it believes the browser is on. The
+    screenshot path returned before note_url, and a screenshot result is the
+    one result that always carries a URL - so after a click landed on a bank,
+    every one of those checks was still judging the previous page while the
+    agent photographed the new one."""
+
+    PNG = base64.b64encode(b'\x89PNG\r\n\x1a\x0a').decode()
+
+    def setUp(self):
+        self.guard = safety.get_safety_guard()
+        self.original_url = self.guard._current_url
+        self.guard._current_url = 'https://example.com/start'
+        server.connection_manager.http_pending_requests.clear()
+
+    def tearDown(self):
+        self.guard._current_url = self.original_url
+        server.connection_manager.http_pending_requests.clear()
+
+    def _dispatch(self, action, arguments, response):
+        """Drive the real _dispatch_action over the HTTP polling transport,
+        answering its waiter the way /browser/response would."""
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler.server = type('S', (), {'_pending_commands': []})()
+        pending = server.connection_manager.http_pending_requests
+
+        def answer():
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                for request_id, (event, holder) in list(pending.items()):
+                    holder['response'] = dict(response)
+                    event.set()
+                    return
+                time.sleep(0.005)
+
+        responder = threading.Thread(target=answer)
+        responder.start()
+        try:
+            return handler._dispatch_action(action, None, dict(arguments))
+        finally:
+            responder.join(timeout=11)
+
+    def test_a_screenshot_result_updates_the_tracked_url(self):
+        out = self._dispatch('screenshot', {'save_to_file': False}, {
+            'success': True, 'data': self.PNG,
+            'tab': {'id': 7, 'url': 'https://www.chase.com/transfer',
+                    'title': 'Transfer'}})
+        self.assertTrue(out.get('success'))
+        self.assertEqual(self.guard._current_url,
+                         'https://www.chase.com/transfer')
+
+    def test_the_guard_then_protects_the_page_that_was_photographed(self):
+        """The consequence, not just the bookkeeping: a click after the
+        screenshot has to be confirmed."""
+        self._dispatch('screenshot', {'save_to_file': False}, {
+            'success': True, 'data': self.PNG,
+            'tab': {'id': 7, 'url': 'https://www.chase.com/transfer',
+                    'title': 'Transfer'}})
+        denial = self.guard.check('browser_click', {'selector': '#send'})
+        self.assertIsNotNone(denial, 'the bank page was on screen')
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_a_navigate_result_updates_the_tracked_url(self):
+        self._dispatch('navigate', {'url': 'https://example.org/next'},
+                       {'success': True, 'url': 'https://example.org/next'})
+        self.assertEqual(self.guard._current_url, 'https://example.org/next')
+
+    def test_note_url_reads_both_result_shapes(self):
+        """navigate reports {"url": ...}; screenshot reports
+        {"tab": {"id", "url", "title"}}."""
+        self.guard.note_url({'success': True, 'url': 'https://a.example/1'})
+        self.assertEqual(self.guard._current_url, 'https://a.example/1')
+        self.guard.note_url({'success': True, 'data': 'x',
+                             'tab': {'id': 2, 'url': 'https://b.example/2',
+                                     'title': 't'}})
+        self.assertEqual(self.guard._current_url, 'https://b.example/2')
+
+    def test_a_result_with_no_url_leaves_the_last_one_in_place(self):
+        """A click that navigates returns {"success": true, ...contentResult}
+        with no url and no tab, so the tracker cannot learn from it. It keeps
+        the previous page rather than forgetting - an unknown URL would skip
+        the protected-site check entirely."""
+        self.guard.note_url({'success': True, 'clicked': True})
+        self.assertEqual(self.guard._current_url, 'https://example.com/start')
+
+
+class HumanApprovalBranchTests(unittest.TestCase):
+    """The in-browser Approve/Deny prompt is the default enforcement in
+    attended mode and had no Python test at all."""
+
+    def setUp(self):
+        if server.HEADLESS_MODE:
+            self.skipTest('the approval branch only runs in attended mode')
+        self.guard = safety.get_safety_guard()
+        self.original_url = self.guard._current_url
+        self.guard.note_url({'url': 'https://www.chase.com/transfer'})
+
+    def tearDown(self):
+        self.guard._current_url = self.original_url
+
+    def _click(self, approval):
+        dispatched = []
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._request_human_approval = (
+            lambda tool_name, arguments, denial, tab_id=None: approval)
+
+        def fake_dispatch(action, tab_id, arguments):
+            dispatched.append(action)
+            return {'success': True}
+
+        handler._dispatch_action = fake_dispatch
+        result = handler.execute_tool('browser_click', {'selector': '#send'})
+        return result, dispatched
+
+    def test_an_approved_action_goes_through(self):
+        result, dispatched = self._click({'success': True, 'approved': True})
+        self.assertTrue(result.get('success'), result)
+        self.assertEqual(dispatched, ['click'])
+
+    def test_a_denied_action_is_refused_and_not_dispatched(self):
+        result, dispatched = self._click({'success': True, 'approved': False})
+        self.assertFalse(result['success'])
+        self.assertEqual(result['safety_decision'], 'human_denied')
+        self.assertEqual(dispatched, [])
+
+    def test_an_undeliverable_prompt_is_a_refusal_not_a_token(self):
+        """Falling through to the token denial would hand the agent a token
+        and tell it to re-send the call itself, which is not a human in the
+        loop at all."""
+        result, dispatched = self._click({'success': False, 'error': 'no browser'})
+        self.assertFalse(result['success'])
+        self.assertEqual(result['safety_decision'], 'approval_undeliverable')
+        self.assertNotIn('confirm_token', result)
+        self.assertEqual(dispatched, [])
+
+    def test_an_unprotected_page_is_not_prompted_about(self):
+        self.guard.note_url({'url': 'https://example.com/page'})
+
+        def refuse(*args, **kwargs):
+            raise AssertionError('no prompt should be shown here')
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._request_human_approval = refuse
+        handler._dispatch_action = lambda action, tab_id, arguments: {'success': True}
+        self.assertTrue(handler.execute_tool(
+            'browser_click', {'selector': '#ok'})['success'])
+
+
+class TabLimitTests(unittest.TestCase):
+    """browser_find_tabs honoured limit as given and the extension caps
+    nothing: {"url_pattern": "stub", "limit": 100000} returned 500 tabs."""
+
+    def test_the_limit_is_clamped(self):
+        self.assertEqual(server.clamp_tab_limit(100000), server.MAX_TAB_LIMIT)
+        self.assertEqual(server.clamp_tab_limit(10), 10)
+
+    def test_a_nonsense_limit_falls_back_to_the_default(self):
+        for raw in (0, -5, 'all', None):
+            with self.subTest(raw=raw):
+                self.assertEqual(server.clamp_tab_limit(raw),
+                                 server.DEFAULT_TAB_LIMIT)
+
+    def test_the_clamp_is_applied_before_the_browser_sees_it(self):
+        captured = {}
+
+        def fake_dispatch(action, tab_id, arguments):
+            captured['arguments'] = arguments
+            return {'success': True}
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._dispatch_action = fake_dispatch
+        handler.execute_tool('browser_find_tabs',
+                             {'url_pattern': 'stub', 'limit': 100000})
+        self.assertEqual(captured['arguments']['limit'], server.MAX_TAB_LIMIT)
+
+    def test_the_schema_tells_the_agent_what_it_needs(self):
+        """The filter requirement was added to the handler and never to the
+        schema, so an agent reading the schema called it with {} and got a
+        runtime error it had no way to anticipate."""
+        tool = next(t for t in server.MCP_TOOLS if t.name == 'browser_find_tabs')
+        required = [clause['required'][0] for clause in tool.input_schema['anyOf']]
+        self.assertEqual(sorted(required),
+                         ['active', 'audible', 'title', 'url', 'url_pattern'])
+        self.assertIn('limit', tool.input_schema['properties'])
+        self.assertIn('at least one filter', tool.description.lower())
+
+
+class ObserverLifetimeSchemaTests(unittest.TestCase):
+    """The observer expires after 5 minutes, and nothing in the schema or the
+    description said so, so a 10-minute watch stopped silently and the agent
+    only learned from expired: true afterwards."""
+
+    def test_the_lifetime_is_in_the_schema_and_the_description(self):
+        tool = next(t for t in server.MCP_TOOLS
+                    if t.name == 'browser_observe_element')
+        self.assertIn('max_lifetime_ms', tool.input_schema['properties'])
+        self.assertIn('max_lifetime_ms', tool.description)
+
+    def test_the_argument_reaches_the_browser_under_the_name_it_reads(self):
+        """content.js reads options.maxLifetimeMs."""
+        self.assertEqual(
+            server.camelize_args({'max_lifetime_ms': 600000}),
+            {'maxLifetimeMs': 600000})
 
 
 class SafetyGuardTests(unittest.TestCase):
