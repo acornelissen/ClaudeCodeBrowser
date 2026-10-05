@@ -44,6 +44,12 @@ MIN_POLL_INTERVAL_MS = 10
 # stops waiting for it.
 MAX_WAIT_AND_ACT_TIMEOUT_MS = 30000
 
+# Ceiling for how long one browser_type may spend typing, in ms, for the same
+# reason: delay is per keystroke and unbounded in the schema, so honouring it
+# as given let delay=10**9 hold the lock for ever. The per-key delay is
+# lowered until the whole text fits.
+MAX_TYPING_MS = 30000
+
 # Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
 BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
 
@@ -470,6 +476,70 @@ class HeadlessBrowser:
             "}"
         )
 
+    @staticmethod
+    def _prepare_typing_js(clear: bool) -> str:
+        """JS run on the focused element just before type sends its keys.
+
+        A port of the middle of performType in content.js. Only a text field
+        or a contenteditable takes typed text; anything else swallows the
+        keys, and reporting success for that is what performType refuses.
+        clear empties the field the way performType does. Without clear the
+        text goes after what is there, as performType's `value += char`
+        does, so the caret is moved to the end: where focus() leaves it
+        differs between engines.
+
+        An open shadow root is followed to the input it wraps, because that
+        is where the keys go when <sl-input> or similar has focus.
+        """
+        clear_literal = 'true' if clear else 'false'
+        return (
+            "() => {\n"
+            f"const CLEAR = {clear_literal};\n"
+            "let el = document.activeElement;\n"
+            "while (el && el.shadowRoot && el.shadowRoot.activeElement)\n"
+            "  el = el.shadowRoot.activeElement;\n"
+            "if (!el) return {editable: false, tag: 'none'};\n"
+            "const tag = (el.tagName || '').toLowerCase();\n"
+            "const field = tag === 'input' || tag === 'textarea';\n"
+            "if (!field && el.isContentEditable !== true)"
+            " return {editable: false, tag};\n"
+            "if (CLEAR) {\n"
+            "  if (field) el.value = ''; else el.textContent = '';\n"
+            "  el.dispatchEvent(new Event('input', {bubbles: true}));\n"
+            "}\n"
+            "try {\n"
+            "  if (field) {\n"
+            "    el.setSelectionRange(el.value.length, el.value.length);\n"
+            "  } else {\n"
+            "    const range = document.createRange();\n"
+            "    range.selectNodeContents(el);\n"
+            "    range.collapse(false);\n"
+            "    const selection = window.getSelection();\n"
+            "    selection.removeAllRanges();\n"
+            "    selection.addRange(range);\n"
+            "  }\n"
+            # email and number inputs do not support a selection; the
+            # text still goes in, wherever the engine put the caret.
+            "} catch (e) {}\n"
+            "return {editable: true, tag};\n"
+            "}"
+        )
+
+    @staticmethod
+    def _typing_delay(value: Any, text: str):
+        """The per-keystroke delay to use, and whether it was capped.
+
+        No delay when none is asked for. The schema's default of 50ms is
+        attended mode's pace for its simulated keystrokes; applied here it
+        would make every headless type slower than it has always been, and
+        put a 700-character text past server.py's 35s deadline.
+        """
+        requested = max(parse_number(value, 0.0), 0.0)
+        ceiling = MAX_TYPING_MS / max(len(text), 1)
+        if requested > ceiling:
+            return ceiling, True
+        return requested, False
+
     async def _is_password_field(self, page, selector: str,
                                  include_hidden: bool = False) -> bool:
         """True when the selector resolves to a credential input.
@@ -756,19 +826,39 @@ class HeadlessBrowser:
 
         elif action == 'type':
             selector = type_target(args)
-            text = args.get('text', '')
+            text = args.get('text')
+            text = '' if text is None else str(text)
+            # clear, press_enter and delay are in browser_type's schema and
+            # performType honours them; this handler used page.fill, which
+            # always replaced the content, never pressed Enter and had no
+            # pace. Defaults as performType's: append, no Enter.
+            clear = parse_flag(args.get('clear'), False)
+            press_enter = parse_flag(args.get('press_enter'), False)
+            delay, delay_capped = self._typing_delay(args.get('delay'), text)
             if selector:
                 await self._assert_not_password(page, selector, args)
-                await page.fill(selector, text)
-            else:
-                # Typing into the focused element bypassed the guard entirely:
-                # focus a password field with any other call, then type with
-                # no selector. Attended mode resolves document.activeElement
-                # and still checks it, so this was a headless-only hole that
-                # contradicted the documented "refused in both modes".
-                await self._assert_focused_not_password(page, args)
-                await page.keyboard.type(text)
-            return {'success': True}
+                await page.focus(selector)
+            # Checked on both paths, and on the selector path again after
+            # focus, because the keys go wherever focus IS: a page can move
+            # it from its own focus handler. With no selector this is the
+            # only check - typing into the focused element used to bypass
+            # the guard entirely, which attended mode never did.
+            await self._assert_focused_not_password(page, args)
+            target = await page.evaluate(self._prepare_typing_js(clear))
+            if not (isinstance(target, dict) and target.get('editable')):
+                tag = target.get('tag') if isinstance(target, dict) else None
+                raise RuntimeError(
+                    f'Refused: <{tag or "unknown"}> cannot receive typed text '
+                    '(not an input, textarea or contenteditable element). '
+                    'Nothing was typed. Name the field with "selector", or '
+                    'click into it first.')
+            await page.keyboard.type(text, delay=delay)
+            if press_enter:
+                await page.keyboard.press('Enter')
+            result = {'success': True}
+            if delay_capped:
+                result.update(delay_ms=delay, delay_capped=True)
+            return result
 
         elif action == 'scroll':
             return await self._scroll(page, args)

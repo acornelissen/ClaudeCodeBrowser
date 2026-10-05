@@ -416,6 +416,11 @@ def is_element_info_read(script: str) -> bool:
             and 'querySelectorAll' not in script)
 
 
+def is_typing_preparation(script: str) -> bool:
+    """The script type runs on the focused element before it types."""
+    return 'const CLEAR =' in script
+
+
 def reads_allow_password(script: str) -> bool:
     """True when a reader script was built with allow_password honoured."""
     return 'const ALLOW_PASSWORD = true;' in script
@@ -578,6 +583,64 @@ process.stdout.write(JSON.stringify(compiled(root)));
 """.replace('__ELEMENT_FACTORY__', _ELEMENT_FACTORY_JS)
 
 
+# Reads {"script", "active"} on stdin, runs type's preparation script with
+# document.activeElement built from "active", and writes what it returned
+# plus what it did to the element that ends up receiving the keys.
+_TYPING_HARNESS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const compiled = eval('(' + input.script + ')');
+
+function make(spec) {
+  if (!spec) return null;
+  const el = {
+    tagName: spec.tag,
+    value: spec.value,
+    textContent: spec.textContent,
+    isContentEditable: spec.editable === true,
+    events: [],
+    selection: null,
+    dispatchEvent(event) { this.events.push(event.type); },
+    setSelectionRange(start, end) {
+      // email and number inputs throw here in a real browser.
+      if (spec.noSelection) throw new Error('InvalidStateError');
+      this.selection = [start, end];
+    },
+  };
+  if (spec.shadowActive) el.shadowRoot = { activeElement: make(spec.shadowActive) };
+  return el;
+}
+
+const active = make(input.active);
+let ranges = [];
+global.Event = class { constructor(type) { this.type = type; } };
+global.document = {
+  activeElement: active,
+  createRange: () => ({
+    selectNodeContents(node) { this.node = node; },
+    collapse(toStart) { this.toStart = toStart; },
+  }),
+};
+global.window = {
+  getSelection: () => ({
+    removeAllRanges() { ranges = []; },
+    addRange(range) { ranges.push(range); },
+  }),
+};
+const result = compiled();
+let el = active;
+while (el && el.shadowRoot) el = el.shadowRoot.activeElement;
+process.stdout.write(JSON.stringify({
+  result,
+  value: el ? el.value : null,
+  textContent: el ? el.textContent : null,
+  events: el ? el.events : [],
+  selection: el ? el.selection : null,
+  caretAtEnd: ranges.length === 1 && ranges[0].node === el &&
+              ranges[0].toStart === false,
+}));
+"""
+
+
 def _run_node(harness: str, payload: dict):
     proc = subprocess.run([NODE, '-e', harness], input=json.dumps(payload),
                           capture_output=True, text=True, timeout=60,
@@ -632,8 +695,13 @@ class FakeKeyboard:
     def __init__(self, page):
         self._page = page
 
-    async def type(self, text):
+    async def type(self, text, delay=None):
         self._page.calls.append(('keyboard.type', text))
+        self._page.type_delays.append(delay)
+        # Keys land in whatever has focus, after what is already there.
+        target = self._page.active_element
+        if target is not None:
+            target.value = (target.value or '') + text
 
     async def press(self, combo):
         self._page.calls.append(('keyboard.press', combo))
@@ -696,6 +764,8 @@ class FakePage:
         self.nested_masked = 0                 # getText's scrub count
         self.nested_fields = None              # None: same as nested_masked
         self.nested_capped = False             # the scrub's cap bit
+        self.type_delays = []                  # keyboard.type's delay=
+        self.focus_moves_to = None             # Element focus() lands on
         self.fill_error = None
         self.query_results = []
         self.closed = False
@@ -741,7 +811,10 @@ class FakePage:
         el = self.elements.get(selector)
         if el is None:
             raise SelectorError(f'no element for {selector}')
-        self.active_element = el
+        # A page can move focus from its own focus handler, so the element
+        # that ends up focused is not always the one asked for.
+        self.active_element = (self.focus_moves_to
+                               if self.focus_moves_to is not None else el)
 
     async def hover(self, selector):
         self.calls.append(('hover', selector))
@@ -802,6 +875,20 @@ class FakePage:
             if self.focused_probe_error is not None:
                 raise self.focused_probe_error
             return eval_field_predicate(script, self.active_element)
+        if is_typing_preparation(script):
+            # Answered from the focused element the way the page would: only
+            # a text field or a contenteditable takes typed text.
+            clear = 'const CLEAR = true;' in script
+            self.calls.append(('prepare_typing', clear))
+            el = self.active_element
+            if el is None:
+                return {'editable': False, 'tag': 'body'}
+            if el.tag not in ('INPUT', 'TEXTAREA') and \
+                    not el.is_content_editable:
+                return {'editable': False, 'tag': el.tag.lower()}
+            if clear:
+                el.value = ''
+            return {'editable': True, 'tag': el.tag.lower()}
         if self.evaluate_handler is not None:
             return self.evaluate_handler(script)
         return None
@@ -871,6 +958,15 @@ def calls_named(page, name):
     return [c for c in page.calls if c[0] == name]
 
 
+# Every call through which type can change a field: writing text, pressing
+# Enter, and emptying it for clear. A refusal must make none of them.
+_WRITE_CALLS = ('fill', 'keyboard.type', 'keyboard.press', 'prepare_typing')
+
+
+def writes(page):
+    return [c for c in page.calls if c[0] in _WRITE_CALLS]
+
+
 PASSWORD_FIELDS = {
     'password type': Element(input_type='password', value=SECRET),
     'current-password': Element(autocomplete='current-password', value=SECRET),
@@ -922,7 +1018,7 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
                     await browser._dispatch('type', None,
                                             {'selector': '#f', 'text': 'x'})
                 self.assertIn('Refused', str(ctx.exception))
-                self.assertEqual(calls_named(page, 'fill'), [],
+                self.assertEqual(writes(page), [],
                                  'refusal must not write anything')
 
     async def test_type_with_selector_allows_ordinary_input(self):
@@ -930,7 +1026,9 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('type', None,
                                          {'selector': '#q', 'text': 'hello'})
         self.assertTrue(result['success'])
-        self.assertEqual(calls_named(page, 'fill'), [('fill', '#q', 'hello')])
+        self.assertEqual(calls_named(page, 'focus'), [('focus', '#q')])
+        self.assertEqual(calls_named(page, 'keyboard.type'),
+                         [('keyboard.type', 'hello')])
 
     async def test_execute_converts_refusal_into_a_failed_result(self):
         browser, page = make_browser(
@@ -940,7 +1038,7 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['success'])
         self.assertIn('Refused', result['error'])
         self.assertIn('password manager', result['error'])
-        self.assertEqual(calls_named(page, 'fill'), [])
+        self.assertEqual(writes(page), [])
 
     async def test_allow_password_must_be_exactly_true(self):
         """Fail closed: the server sends a real bool, so anything else is a
@@ -953,7 +1051,7 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
                     await browser._dispatch('type', None, {
                         'selector': '#pw', 'text': 'x',
                         'allow_password': value})
-                self.assertEqual(calls_named(page, 'fill'), [])
+                self.assertEqual(writes(page), [])
 
     async def test_allow_password_true_permits_the_write(self):
         browser, page = make_browser(
@@ -961,7 +1059,8 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('type', None, {
             'selector': '#pw', 'text': 'letmein', 'allow_password': True})
         self.assertTrue(result['success'])
-        self.assertEqual(calls_named(page, 'fill'), [('fill', '#pw', 'letmein')])
+        self.assertEqual(calls_named(page, 'keyboard.type'),
+                         [('keyboard.type', 'letmein')])
 
     async def test_set_value_refuses_credential_fields(self):
         browser, page = make_browser(
@@ -1017,7 +1116,8 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
         browser, page = make_browser(elements={'#q': Element()})
         await browser._dispatch('type', None, {'selector': '#q', 'text': 'x'})
         order = [c[0] for c in page.calls]
-        self.assertLess(order.index('eval_on_selector'), order.index('fill'))
+        self.assertLess(order.index('eval_on_selector'),
+                        order.index('keyboard.type'))
 
 
 class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
@@ -1038,9 +1138,10 @@ class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
                 result = await browser._dispatch(
                     'type', None, dict(locator, text='hello'))
                 self.assertTrue(result['success'], result)
-                self.assertEqual(calls_named(page, 'fill'),
-                                 [('fill', selector, 'hello')])
-                self.assertEqual(calls_named(page, 'keyboard.type'), [])
+                self.assertEqual(calls_named(page, 'focus'),
+                                 [('focus', selector)])
+                self.assertEqual(calls_named(page, 'keyboard.type'),
+                                 [('keyboard.type', 'hello')])
 
     async def test_a_credential_field_found_by_name_is_refused(self):
         browser, page = make_browser(
@@ -1048,15 +1149,14 @@ class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             await browser._dispatch('type', None, {'name': 'pw', 'text': 'x'})
         self.assertIn('Refused', str(ctx.exception))
-        self.assertEqual(calls_named(page, 'fill'), [])
-        self.assertEqual(calls_named(page, 'keyboard.type'), [])
+        self.assertEqual(writes(page), [])
 
     async def test_a_quote_in_the_locator_stays_inside_the_string(self):
         browser, page = make_browser(
             elements={'[name="a\\"]b"]': Element()})
         await browser._dispatch('type', None, {'name': 'a"]b', 'text': 'x'})
-        self.assertEqual(calls_named(page, 'fill'),
-                         [('fill', '[name="a\\"]b"]', 'x')])
+        self.assertEqual(calls_named(page, 'focus'),
+                         [('focus', '[name="a\\"]b"]')])
 
     async def test_locators_are_tried_in_content_js_order(self):
         """findElement in content.js tries id, then name, then placeholder.
@@ -1077,8 +1177,147 @@ class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
                     ph_sel: Element()})
                 await browser._dispatch('type', None,
                                         dict(locator, text='x'))
-                self.assertEqual([c[1] for c in calls_named(page, 'fill')],
+                self.assertEqual([c[1] for c in calls_named(page, 'focus')],
                                  [expected])
+
+
+class TypeOptionTests(unittest.IsolatedAsyncioTestCase):
+    """clear, press_enter and delay, as browser_type's schema and attended
+    mode's performType define them.
+
+    Regression tests. Was: the headless handler read none of the three.
+    page.fill always replaced the field's content, so clear: false (the
+    default) still wiped it; press_enter: true never pressed Enter, so a
+    search box was filled and never submitted while the call reported
+    success; and delay was dropped."""
+
+    def browser_with(self, element):
+        return make_browser(elements={'#q': element})
+
+    async def test_text_is_added_after_what_the_field_holds_by_default(self):
+        field = Element(value='abc')
+        browser, page = self.browser_with(field)
+        result = await browser._dispatch('type', None,
+                                         {'selector': '#q', 'text': 'def'})
+        self.assertTrue(result['success'], result)
+        self.assertEqual(field.value, 'abcdef')
+
+    async def test_clear_empties_the_field_first(self):
+        for clear in (True, 'true', 1):
+            with self.subTest(clear=clear):
+                field = Element(value='abc')
+                browser, page = self.browser_with(field)
+                await browser._dispatch('type', None, {
+                    'selector': '#q', 'text': 'def', 'clear': clear})
+                self.assertEqual(field.value, 'def')
+
+    async def test_clear_false_as_a_string_keeps_the_content(self):
+        field = Element(value='abc')
+        browser, page = self.browser_with(field)
+        await browser._dispatch('type', None, {
+            'selector': '#q', 'text': 'def', 'clear': 'false'})
+        self.assertEqual(field.value, 'abcdef')
+
+    async def test_press_enter_presses_enter_after_the_text(self):
+        browser, page = self.browser_with(Element())
+        await browser._dispatch('type', None, {
+            'selector': '#q', 'text': 'query', 'press_enter': True})
+        self.assertEqual(
+            [c for c in page.calls if c[0].startswith('keyboard.')],
+            [('keyboard.type', 'query'), ('keyboard.press', 'Enter')])
+
+    async def test_enter_is_not_pressed_unless_asked(self):
+        for value in (None, False, 'false', 0):
+            with self.subTest(press_enter=value):
+                browser, page = self.browser_with(Element())
+                args = {'selector': '#q', 'text': 'query'}
+                if value is not None:
+                    args['press_enter'] = value
+                await browser._dispatch('type', None, args)
+                self.assertEqual(calls_named(page, 'keyboard.press'), [])
+
+    async def test_delay_paces_the_keystrokes(self):
+        for value, expected in ((120, 120), ('80', 80), (None, 0), (-5, 0)):
+            with self.subTest(delay=value):
+                browser, page = self.browser_with(Element())
+                args = {'selector': '#q', 'text': 'abc'}
+                if value is not None:
+                    args['delay'] = value
+                result = await browser._dispatch('type', None, args)
+                self.assertEqual(page.type_delays, [expected])
+                self.assertNotIn('delay_capped', result)
+
+    async def test_an_enormous_delay_is_capped(self):
+        """delay is per keystroke and unbounded in the schema. Honoured as
+        given, delay=10**9 held the headless lock for ever, the way an
+        unbounded waitAndAct timeout did: server.py stops waiting at 35s
+        but does not cancel the call. The whole text has to finish typing
+        inside the cap, and the result says when it bit."""
+        browser, page = self.browser_with(Element())
+        result = await browser._dispatch('type', None, {
+            'selector': '#q', 'text': 'abcd', 'delay': 10 ** 9})
+        self.assertTrue(result['delay_capped'])
+        self.assertLessEqual(page.type_delays[0] * 4,
+                             headless_backend.MAX_TYPING_MS)
+        self.assertEqual(result['delay_ms'], page.type_delays[0])
+
+    async def test_the_focused_path_honours_the_options_too(self):
+        field = Element(value='abc')
+        browser, page = make_browser(active=field)
+        await browser._dispatch('type', None, {
+            'text': 'def', 'clear': True, 'press_enter': True, 'delay': 30})
+        self.assertEqual(field.value, 'def')
+        self.assertEqual(page.type_delays, [30])
+        self.assertEqual(calls_named(page, 'keyboard.press'),
+                         [('keyboard.press', 'Enter')])
+
+    async def test_an_element_that_cannot_take_text_is_refused(self):
+        """Keystrokes into a <div> or the page body go nowhere. fill used to
+        refuse that; typed keys would silently report success, which is
+        what attended mode's performType refuses."""
+        browser, page = self.browser_with(Element(tag='DIV'))
+        with self.assertRaises(RuntimeError) as ctx:
+            await browser._dispatch('type', None,
+                                    {'selector': '#q', 'text': 'x'})
+        self.assertIn('cannot receive typed text', str(ctx.exception))
+        self.assertEqual(calls_named(page, 'keyboard.type'), [])
+
+        browser, page = make_browser(active=None)
+        with self.assertRaises(RuntimeError):
+            await browser._dispatch('type', None, {'text': 'x'})
+        self.assertEqual(calls_named(page, 'keyboard.type'), [])
+
+    async def test_no_option_gets_past_the_credential_guard(self):
+        """clear empties a field and press_enter submits it, so a refused
+        call must do neither - on either path."""
+        options = {'text': 'x', 'clear': True, 'press_enter': True,
+                   'delay': 10}
+        for label, element in {**PASSWORD_FIELDS,
+                               **NAMED_CREDENTIAL_FIELDS}.items():
+            with self.subTest(field=label, path='selector'):
+                browser, page = make_browser(elements={'#f': element})
+                with self.assertRaises(RuntimeError):
+                    await browser._dispatch('type', None,
+                                            dict(options, selector='#f'))
+                self.assertEqual(writes(page), [])
+            with self.subTest(field=label, path='focused'):
+                browser, page = make_browser(active=element)
+                with self.assertRaises(RuntimeError):
+                    await browser._dispatch('type', None, dict(options))
+                self.assertEqual(writes(page), [])
+
+    async def test_focus_moved_to_a_credential_field_is_refused(self):
+        """Keystrokes go wherever focus is, not to the selector. A page
+        that moves focus into a password field from its focus handler would
+        otherwise collect text the guard approved for another field."""
+        browser, page = self.browser_with(Element())
+        page.focus_moves_to = Element(input_type='password')
+        with self.assertRaises(RuntimeError) as ctx:
+            await browser._dispatch('type', None,
+                                    {'selector': '#q', 'text': SECRET,
+                                     'clear': True})
+        self.assertIn('Refused', str(ctx.exception))
+        self.assertEqual(writes(page), [])
 
 
 class CssStringTests(unittest.TestCase):
@@ -1184,7 +1423,7 @@ class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
             await browser._dispatch('type', None,
                                     {'selector': '#pw', 'text': SECRET})
         self.assertIn('Refused', str(ctx.exception))
-        self.assertEqual(calls_named(page, 'fill'), [])
+        self.assertEqual(writes(page), [])
 
     # Regression test. Was: headless_backend.py:386-398 - pressKey focuses a
     # selector and sends a real key event, which inserts the character. The
@@ -1545,7 +1784,7 @@ class NamedCredentialFieldTests(unittest.IsolatedAsyncioTestCase):
                     await browser._dispatch('type', None,
                                             {'selector': '#f', 'text': 'x'})
                 self.assertIn('Refused', str(ctx.exception))
-                self.assertEqual(calls_named(page, 'fill'), [],
+                self.assertEqual(writes(page), [],
                                  'refusal must not write anything')
 
     async def test_set_value_refuses_every_named_credential_field(self):
@@ -1612,8 +1851,8 @@ class NamedCredentialFieldTests(unittest.IsolatedAsyncioTestCase):
                                                  {'selector': '#f',
                                                   'text': 'Ada'})
                 self.assertTrue(result['success'])
-                self.assertEqual(calls_named(page, 'fill'),
-                                 [('fill', '#f', 'Ada')])
+                self.assertEqual(calls_named(page, 'keyboard.type'),
+                                 [('keyboard.type', 'Ada')])
 
 
 class CredentialTextReadTests(unittest.IsolatedAsyncioTestCase):
@@ -2257,6 +2496,60 @@ class RealTextScrubTests(unittest.TestCase):
         result = run_reader_in_node(HeadlessBrowser._get_text_js(False), page)
         self.assertEqual(result['text'], 'raw text')
         self.assertEqual(result['source'], 'textContent')
+
+
+@requires_node
+class RealTypingPreparationTests(unittest.TestCase):
+    """type's preparation script, executed by node. The fake page answers it
+    from the Element table; this is what it actually does."""
+
+    def prepare(self, active, clear=False):
+        return _run_node(_TYPING_HARNESS, {
+            'script': HeadlessBrowser._prepare_typing_js(clear),
+            'active': active})
+
+    def test_without_clear_the_caret_goes_after_the_content(self):
+        """performType appends; where focus() leaves the caret differs
+        between engines, so it is put at the end."""
+        out = self.prepare({'tag': 'INPUT', 'value': 'abc'})
+        self.assertEqual(out['result'], {'editable': True, 'tag': 'input'})
+        self.assertEqual(out['value'], 'abc')
+        self.assertEqual(out['selection'], [3, 3])
+        self.assertEqual(out['events'], [])
+
+    def test_clear_empties_a_field_and_tells_the_page(self):
+        for tag in ('INPUT', 'TEXTAREA'):
+            with self.subTest(tag=tag):
+                out = self.prepare({'tag': tag, 'value': 'abc'}, clear=True)
+                self.assertEqual(out['value'], '')
+                self.assertEqual(out['events'], ['input'])
+                self.assertEqual(out['selection'], [0, 0])
+
+    def test_clear_empties_a_contenteditable(self):
+        out = self.prepare({'tag': 'DIV', 'editable': True,
+                            'textContent': 'abc'}, clear=True)
+        self.assertEqual(out['result']['editable'], True)
+        self.assertEqual(out['textContent'], '')
+        self.assertEqual(out['events'], ['input'])
+        self.assertTrue(out['caretAtEnd'])
+
+    def test_an_input_without_a_selection_is_still_typed_into(self):
+        out = self.prepare({'tag': 'INPUT', 'value': 'a@b',
+                            'noSelection': True})
+        self.assertEqual(out['result']['editable'], True)
+
+    def test_what_cannot_take_text_is_reported(self):
+        out = self.prepare({'tag': 'DIV', 'textContent': 'abc'}, clear=True)
+        self.assertEqual(out['result'], {'editable': False, 'tag': 'div'})
+        self.assertEqual(out['textContent'], 'abc', 'nothing was cleared')
+        self.assertEqual(self.prepare(None)['result']['editable'], False)
+
+    def test_an_open_shadow_root_is_followed_to_its_input(self):
+        out = self.prepare({'tag': 'SL-INPUT',
+                            'shadowActive': {'tag': 'INPUT', 'value': 'xy'}},
+                           clear=True)
+        self.assertEqual(out['result'], {'editable': True, 'tag': 'input'})
+        self.assertEqual(out['value'], '')
 
 
 @requires_node
