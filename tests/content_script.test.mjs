@@ -119,7 +119,9 @@ function makeElement(tag, props = {}) {
 }
 
 /** Build a fresh sandbox with the given selector -> element(s) registry. */
-function loadContentScript(registry) {
+/** `timers` replaces the page's setTimeout, so a test can see how long the
+ *  script asked to wait without waiting for it. */
+function loadContentScript(registry, { timers } = {}) {
   const single = new Map(Object.entries(registry));
   const all = new Map(
     Object.entries(registry).map(([sel, el]) => [sel, Array.isArray(el) ? el : [el]])
@@ -285,7 +287,7 @@ function loadContentScript(registry) {
     Event: class { constructor(type, init) { Object.assign(this, init, { type }); } },
     Node: { ELEMENT_NODE: 1 },
     XPathResult: { FIRST_ORDERED_NODE_TYPE: 9 },
-    setTimeout, clearTimeout, setInterval, clearInterval
+    setTimeout: timers || setTimeout, clearTimeout, setInterval, clearInterval
   };
   sandbox.globalThis = sandbox;
 
@@ -969,6 +971,29 @@ test('type finds its field by id, name or placeholder, not by the text being typ
     assert.deepEqual([...ctx.xpathAsked], [],
       `${label}: the typed text was used to look the field up`);
   }
+});
+
+test('typing is paced to finish inside the server\'s wait', async () => {
+  // delay is per keystroke and had no cap, and the server stops waiting for
+  // an answer after 30s - so a long text or a large delay kept typing into
+  // the page after the call had already failed. 0 also meant 50.
+  const waits = [];
+  const timers = (fn, ms) => { waits.push(ms || 0); return setTimeout(fn, 0); };
+  const total = () => waits.reduce((sum, ms) => sum + ms, 0);
+
+  const field = makeElement('input', { id: 'q', value: '' });
+  let ctx = loadContentScript({ '#q': field }, { timers });
+  let result = await ctx.send({ action: 'type', selector: '#q',
+                                text: 'x'.repeat(200), delay: 10 ** 6 });
+  assert.notEqual(result.success, false, result.error);
+  assert.equal(field.value, 'x'.repeat(200));
+  assert.ok(total() <= 26000, `asked to wait ${total()}ms in all`);
+
+  waits.length = 0;
+  const quick = makeElement('input', { id: 'q', value: '' });
+  ctx = loadContentScript({ '#q': quick }, { timers });
+  await ctx.send({ action: 'type', selector: '#q', text: 'abc', delay: 0 });
+  assert.ok(total() <= 1000, `delay 0 still waited ${total()}ms`);
 });
 
 test('set_value reports a reformatted value as set, not as a failure', async () => {

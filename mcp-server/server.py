@@ -389,7 +389,7 @@ MCP_TOOLS: List[MCPTool] = [
                 "tab_id": {"type": "integer", "description": "Optional tab ID."},
                 "clear": {"type": "boolean", "description": "Clear existing content first.", "default": False},
                 "press_enter": {"type": "boolean", "description": "Press Enter after typing.", "default": False},
-                "delay": {"type": "integer", "description": "Delay between keystrokes in ms.", "default": 50}
+                "delay": {"type": "integer", "description": "Delay between keystrokes in ms. Attended mode defaults to 50 and headless to none; either way it is lowered so the whole text is typed within about 25 seconds."}
             }
         }
     ),

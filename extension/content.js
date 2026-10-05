@@ -911,6 +911,18 @@
   }
 
   // Type functionality
+  // The server stops waiting for a browser answer after 30s. delay is per
+  // keystroke and had no cap, so a long text or a large delay kept typing
+  // into the page after the call had already failed - and 0 meant 50.
+  const MAX_TYPING_MS = 25000;
+
+  function typingDelay(value, length) {
+    const asked = Number(value);
+    const perKey = value == null || value === '' || !Number.isFinite(asked)
+      ? 50 : Math.max(asked, 0);
+    return Math.min(perKey, MAX_TYPING_MS / Math.max(length, 1));
+  }
+
   async function performType(options) {
     // `text` is the value to type here, not a locator. findElement checks it
     // before id, name and placeholder, so passing it through ignored them and
@@ -952,6 +964,7 @@
     await sleep(100);
 
     const text = options.text || '';
+    const keyDelay = typingDelay(options.delay, text.length);
 
     const clear = parseFlag(options.clear, false);
     if (clear) {
@@ -1005,7 +1018,7 @@
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(keyUp);
 
-        await sleep(options.delay || 50);
+        await sleep(keyDelay);
       }
       element.dispatchEvent(new Event('change', { bubbles: true }));
     }
