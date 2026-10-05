@@ -1032,6 +1032,36 @@ class NonStringUrlTests(unittest.TestCase):
                                   {'selector': '#a', 'url': None}))
 
 
+class TabFilterUrlTests(unittest.TestCase):
+    """browser_find_tabs takes url as a prefix to filter the tab list by,
+    not a page to go to. Judged as a navigation target, a bare host prefix
+    was refused as a bad scheme and an allowlist refused listing tabs it
+    did not cover - while url_pattern and browser_get_tabs list the same
+    tabs with no check at all. browser_reload_by_url acts on the tabs it
+    matches, so its prefix is still judged."""
+
+    def test_find_tabs_is_not_judged_by_its_prefix(self):
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        g.note_url({'url': 'https://localhost/'})
+        for prefix in ('github.com', 'https://github', 'https://www.chase.com'):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(g.check('browser_find_tabs', {'url': prefix}))
+
+    def test_reload_by_url_is_still_judged(self):
+        g = guard(blocked_url_patterns=[r'evil\.com'])
+        g.note_url({'url': 'https://example.com/'})
+        denial = g.check('browser_reload_by_url', {'url': 'https://evil.com'})
+        self.assertEqual(denial['safety_decision'], 'blocked_url')
+        denial = g.check('browser_reload_by_url',
+                         {'url': 'https://www.chase.com'})
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_the_current_page_still_governs_find_tabs(self):
+        g = guard(read_only=False, blocked_url_patterns=[r'evil\.com'])
+        g.note_url({'url': 'https://evil.com/'})
+        self.assertIsNotNone(g.check('browser_find_tabs', {'url': 'https://x'}))
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""

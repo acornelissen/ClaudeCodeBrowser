@@ -309,6 +309,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     ],
 }
 
+# Tools whose url argument filters the tab list rather than naming a target.
+TAB_FILTER_TOOLS = frozenset({'browser_find_tabs'})
+
 # Tools that only observe the page. Allowed in read-only mode and never
 # require protected-domain confirmation.
 OBSERVE_TOOLS = {
@@ -748,7 +751,15 @@ class SafetyGuard:
         approved this exact call (via the in-page Approve/Deny overlay), which
         satisfies the protected-domain confirmation requirement.
         """
-        target_url = self._target_url(arguments)
+        # browser_find_tabs takes url as a prefix to filter the tab list by,
+        # not a page to go to. Judged as a target, a bare host was refused as
+        # a bad scheme, an allowlist refused listing tabs - which url_pattern
+        # and browser_get_tabs do unchecked - and on a blocked page the prefix
+        # was judged instead of the page, so this was the one call that still
+        # went through. browser_reload_by_url acts on what it matches, so its
+        # prefix is still the target.
+        target_url = (None if tool_name in TAB_FILTER_TOOLS
+                      else self._target_url(arguments))
 
         # The schema says string, but the agent writes the JSON. A dict or a
         # list was not judged as a target at all - the current page was
