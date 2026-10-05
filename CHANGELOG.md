@@ -18,6 +18,9 @@ are his releases. 1.5.0 onwards are from the fork at
   running; `stop()` likewise skipped it if closing the browser failed. Both
   now stop the driver. The install hint also names the configured engine
   instead of always Firefox.
+- An empty credential field's `value=""` stays empty in captured HTML instead
+  of becoming `value="***"`, matching the live read, which answers `null` for
+  an empty field.
 
 ## [1.9.6]
 

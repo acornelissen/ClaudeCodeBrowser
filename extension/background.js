@@ -321,7 +321,11 @@ function redactHtmlInputValues(text) {
   for (const inputTag of INPUT_TAG_RES) {
     text = text.replace(inputTag, (tag) => {
       if (!tagLooksSecret(tag)) return tag;
-      return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
+      // An empty value stays empty, as the live read answers null for one:
+      // value="***" made an empty password look filled.
+      return tag.replace(/(\bvalue\s*=\s*)(["'])((?:(?!\2).)*)\2/gi,
+                         (m, lead, quote, inner) =>
+                           (inner ? `${lead}${quote}***${quote}` : m))
                 .replace(/(\bvalue\s*=\s*)(?!["'])[^\s>]+/gi, '$1***');
     });
   }

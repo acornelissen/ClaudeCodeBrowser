@@ -2016,6 +2016,30 @@ test('the HTML scrub masks every autocomplete token the field guard knows', asyn
   }
 });
 
+test('an empty credential value stays empty in captured HTML', async () => {
+  // Masked rather than dropped so a reader can tell a filled field from an
+  // empty one - the live read answers null for empty - but the scrub turned
+  // value="" into value="***", so an empty password looked filled.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', { includeAllTypes: true }, 7);
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    complete: false
+  });
+  filters[0].ondata({ data: new TextEncoder().encode(
+    '<input id="a" type="password" value="">' +
+    "<input id='b' type='password' value=''>" +
+    '<input id="c" type="password" value="FILLED-PW">' +
+    '<textarea id="cvv"></textarea>') });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+  const body = (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
+  assert.ok(body.includes('id="a" type="password" value=""'), body);
+  assert.ok(body.includes("id='b' type='password' value=''"), body);
+  assert.ok(body.includes('value="***"') && !body.includes('FILLED-PW'), body);
+  assert.ok(body.includes('<textarea id="cvv"></textarea>'), body);
+});
+
 test('ordinary markup is not mangled by the scrubber', async () => {
   const { command, webRequest, filters } = loadBackground();
   await command('startLogging', { includeAllTypes: true }, 7);
