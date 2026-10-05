@@ -1012,9 +1012,13 @@ test('no refusal from set_value quotes the value back', async () => {
   // leak describeLocator was written to stop on the not-found path.
   const box = makeElement('input', { id: 'c', type: 'checkbox' });
   const div = makeElement('div', { id: 'd' });
-  const ctx = loadContentScript({ '#c': box, '#d': div });
+  // An input that drops the assignment reaches the "did not take" refusal,
+  // the one the caller is most likely to hit with a real secret in hand.
+  const stubborn = makeElement('input', { id: 's', value: 'old' });
+  Object.defineProperty(stubborn, 'value', { get: () => 'old', set: () => {} });
+  const ctx = loadContentScript({ '#c': box, '#d': div, '#s': stubborn });
 
-  for (const selector of ['#c', '#d']) {
+  for (const selector of ['#c', '#d', '#s']) {
     const result = await ctx.send({ action: 'setValue', selector,
                                     value: 'hunter2-correct-horse' });
     assert.equal(result.success, false, selector);
@@ -1161,6 +1165,35 @@ test('observe_element does not report a credential as a mutation oldValue', asyn
   assert.ok(!dump.includes('OLD-SECRET-PASSWORD'),
             `the previous credential leaked through a mutation: ${dump}`);
   assert.equal(stopped.changes[0].oldValue, '***');
+});
+
+test('observe_element masks a hidden input and a credential-named attribute', async () => {
+  // Two rules besides the password one guard oldValue, and neither had a
+  // test. A hidden input's `value` is a CSRF token or session id - concealed
+  // everywhere else, so the observer cannot be the one reader that shows it.
+  // And a component that keeps its secret in data-token rather than `value`
+  // is only caught by the attribute name, since a <div> is no field. The
+  // hidden input's id is neutral on purpose, so the name rule cannot mask it
+  // for the wrong reason.
+  const csrf = makeElement('input', { id: 'csrf', type: 'hidden' });
+  const box = makeElement('div', { id: 'box' });
+  const ctx = loadContentScript({ '#csrf': csrf, '#box': box });
+
+  const started = await ctx.send({ action: 'observeElement', selector: '#csrf' });
+  ctx.observers.at(-1).cb([
+    { type: 'attributes', target: csrf, attributeName: 'value',
+      oldValue: 'CSRF-SESSION-ID-1234', addedNodes: [], removedNodes: [] },
+    { type: 'attributes', target: box, attributeName: 'data-token',
+      oldValue: 'DATA-TOKEN-SECRET', addedNodes: [], removedNodes: [] }
+  ]);
+  const stopped = await ctx.send({ action: 'stopObserving',
+                                   observerId: started.observerId });
+
+  const dump = JSON.stringify(stopped);
+  for (const secret of ['CSRF-SESSION-ID-1234', 'DATA-TOKEN-SECRET']) {
+    assert.ok(!dump.includes(secret), `${secret} leaked through a mutation: ${dump}`);
+  }
+  assert.deepEqual([...stopped.changes].map(c => c.oldValue), ['***', '***']);
 });
 
 test('observe_element still reports an ordinary attribute change', async () => {
