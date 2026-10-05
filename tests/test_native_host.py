@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 import urllib.error
 from pathlib import Path
 from unittest import mock
@@ -437,6 +438,47 @@ class SendDirectionTests(unittest.TestCase):
         self.assertIs(failure['success'], False)
         self.assertIn('1048576', failure['error'])
         self.assertNotIn('xxxx', json.dumps(failure))
+
+    def test_a_command_of_exactly_the_limit_is_sent(self):
+        command = {'action': 'type', 'requestId': 'r5', 'data': {'text': ''}}
+        pad = host.MAX_OUTGOING_MESSAGE_BYTES - len(json.dumps(command))
+        command['data']['text'] = 'x' * pad
+        self.assertEqual(len(json.dumps(command).encode('utf-8')),
+                         host.MAX_OUTGOING_MESSAGE_BYTES)
+        host.deliver_command(command)
+        self.assertEqual(self.sent, [command])
+        self.assertEqual(self.forwarded, [])
+
+    def test_the_poll_loop_goes_through_deliver_command(self):
+        """The size check lives in deliver_command; a poll loop that called
+        send_message directly undid it with every test still green."""
+        command = {'action': 'click', 'requestId': 'r6', 'data': {}}
+        delivered = []
+
+        class Reply(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            return Reply(json.dumps({'command': command}).encode('utf-8'))
+
+        def stop_after_one_poll(seconds):
+            host.health_monitor_running = False
+
+        self.addCleanup(setattr, host, 'health_monitor_running', True)
+        for target, name, fake in (
+                (host, 'deliver_command', delivered.append),
+                (host.time, 'sleep', stop_after_one_poll),
+                (urllib.request, 'urlopen', fake_urlopen)):
+            self.addCleanup(setattr, target, name, getattr(target, name))
+            setattr(target, name, fake)
+        host.health_monitor_running = True
+        host.poll_for_commands()
+        self.assertEqual(delivered, [command])
+        self.assertEqual(self.sent, [], 'the poll loop must not send directly')
 
     def test_an_ordinary_command_is_delivered(self):
         command = {'action': 'click', 'requestId': 'r4', 'data': {}}
