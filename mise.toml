@@ -13,6 +13,7 @@ run = [
   "python3 -m unittest discover -s tests -t . -v",
   "node tests/content_script.test.mjs",
   "node tests/background_script.test.mjs",
+  "node tests/approve.test.mjs",
 ]
 
 [tasks.test-python]
@@ -24,6 +25,7 @@ description = "Run the extension test suites"
 run = [
   "node tests/content_script.test.mjs",
   "node tests/background_script.test.mjs",
+  "node tests/approve.test.mjs",
 ]
 
 [tasks.package]
