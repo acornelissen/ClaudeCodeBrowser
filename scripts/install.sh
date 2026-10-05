@@ -8,8 +8,29 @@
 # - MCP server
 # - Browser automation agent
 #
+# Usage:
+#   ./scripts/install.sh              # attended mode (drives your Firefox)
+#   ./scripts/install.sh --headless   # also install Playwright + Chromium
+#
 
 set -e
+
+HEADLESS=0
+for arg in "$@"; do
+    case "$arg" in
+        --headless) HEADLESS=1 ;;
+        -h|--help)
+            sed -n '2,15p' "$0"
+            exit 0 ;;
+        *)
+            echo "Unknown option: $arg (try --help)" >&2
+            exit 1 ;;
+    esac
+done
+
+# Tested with this version; pinned so a reinstall cannot pull in a new
+# release unseen.
+PLAYWRIGHT_VERSION="1.63.0"
 
 # Colors for output
 RED='\033[0;31m'
@@ -181,6 +202,21 @@ else
         echo -e "${GREEN}✓ websockets installed${NC}"
     else
         echo -e "${YELLOW}⚠ Could not install websockets (WebSocket support will be disabled)${NC}"
+    fi
+fi
+
+# Headless mode, opt-in: Playwright and a browser for it. Chromium rather
+# than Playwright's Firefox, which cannot start from a terminal on macOS 27:
+# app data protection denies it the Firefox profile folder.
+if [ "$HEADLESS" = "1" ]; then
+    echo -e "\n${YELLOW}Installing headless mode (Playwright ${PLAYWRIGHT_VERSION} + Chromium)...${NC}"
+    if python3 -m pip install --user "playwright==${PLAYWRIGHT_VERSION}" \
+            && python3 -m playwright install chromium; then
+        echo -e "${GREEN}✓ Playwright and Chromium installed${NC}"
+        echo "  To run headless, add to the claudecodebrowser server's env:"
+        echo '    "CLAUDE_BROWSER_HEADLESS": "1", "CLAUDE_BROWSER_ENGINE": "chromium"'
+    else
+        echo -e "${RED}✗ Could not install Playwright; headless mode will not start${NC}"
     fi
 fi
 
