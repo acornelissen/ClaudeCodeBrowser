@@ -9,6 +9,24 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Changed
+- **What counts as a credential is defined once,** in
+  `extension/credentials.js`. It was three hand-kept copies - the field guard
+  in `content.js`, the traffic scrubber in `background.js` and the headless
+  backend - and most leaks found in three mutation passes were one copy
+  behind another. The extension loads the file ahead of both scripts, and
+  headless runs the same file in the page. The installers copy it next to
+  the server; headless will not start without it.
+
+### Tests
+- **Real-browser tests in CI.** 19 end-to-end tests drive the headless
+  backend against real Chromium on Linux: field locators, append/clear/Enter,
+  credential refusals, clipboard keys, focus inside frames and shadow roots,
+  whole-page text masking and masked reads. A missing browser fails the job
+  rather than skipping it.
+
 ## [1.9.5]
 
 ### Fixed
