@@ -118,6 +118,19 @@ class ProtectedPatternTests(unittest.TestCase):
                 denial = g.check('browser_click', {'selector': '#x'})
                 self.assertIsNotNone(denial, f'{url} should be protected')
 
+    def test_a_trailing_control_character_does_not_switch_the_guard_off(self):
+        r"""The browser strips every C0 control from both ends, not only
+        whitespace. str.strip() leaves \x01 on the host, the delimiter class
+        after \.gov finds nothing it accepts, and the page loads
+        unconfirmed."""
+        g = guard()
+        for url in ('https://www.irs.gov\x01', '\x02https://www.irs.gov/x'):
+            with self.subTest(url=url):
+                denial = g.check('browser_navigate', {'url': url})
+                self.assertIsNotNone(denial, f'{url!r} loads irs.gov')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
+
     def test_a_backslash_url_cannot_be_navigated_to_unconfirmed(self):
         """The exploit the delimiter gap bought: browser_navigate to a .gov
         page with no human approval and no confirm token."""
@@ -437,6 +450,55 @@ class ProtectedDomainNormalisationTests(unittest.TestCase):
         self.assertEqual(
             safety._normalise_url('https://localhost:3000@[not:an:address%2F]/x'),
             'https://[not:an:address%2F]/x')
+
+
+class UnparseableUrlTests(unittest.TestCase):
+    """A URL urlsplit or .hostname cannot parse leaves the normal path
+    early, through a fallback written for that case. Each fallback is where
+    a credential used to ride out with the exception, and none of them was
+    pinned, so any of them could regress with the suite green."""
+
+    def test_an_unparseable_url_is_not_logged_with_its_query(self):
+        """'[bad' is a bracketed host that never closes, so urlsplit
+        raises. The log has nothing parsed to reduce, so it gets nothing."""
+        logged = safety.redact_url('https://[bad/reset?token=UNPARSED-S3CRET')
+        self.assertEqual(logged, '***')
+
+    def test_userinfo_with_no_host_after_it_is_dropped(self):
+        """'https://user:pw@/x' has an authority that is all userinfo.
+        .hostname is empty, so it takes the no-host exit, which has to drop
+        the userinfo too."""
+        for url in ('https://user:NOHOST-PW@/x',
+                    'https://a@user:NOHOST-PW@/x'):
+            with self.subTest(url=url):
+                self.assertNotIn('NOHOST-PW', safety._normalise_url(url))
+                self.assertNotIn('NOHOST-PW', safety.redact_url(url))
+
+    def test_text_fallback_takes_the_last_at_sign(self):
+        """The text fallback for an unparseable URL has to read userinfo
+        the way the browser does: up to the authority's last '@'."""
+        self.assertEqual(safety._normalise_url('https://a@b:pw@[bad/x'),
+                         'https://[bad/x')
+
+    def test_text_fallback_ends_the_authority_at_query_and_fragment(self):
+        """An '@' after '?' or '#' is query or fragment data, not userinfo.
+        Reading past either delimiter rewrites the host the guard sees
+        to whatever follows that '@'."""
+        for url in ('https://[bad#a@b/x', 'https://[bad?a@b/x'):
+            with self.subTest(url=url):
+                self.assertEqual(safety._normalise_url(url), url)
+
+    def test_an_encoded_colon_in_the_host_does_not_make_a_port(self):
+        """%3A decodes to ':', which a domain cannot hold, so the browser
+        refuses the URL. Decoding it into the host instead turns
+        'localhost%3A3000.evil.com' into 'localhost:3000.evil.com', and a
+        permit pattern anchored on 'https://localhost' reads the ':' as the
+        end of the host."""
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        denial = g.check('browser_navigate',
+                         {'url': 'https://localhost%3A3000.evil.com/'})
+        self.assertIsNotNone(denial, 'this is not localhost')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
 
 
 class ToolClassificationTests(unittest.TestCase):
