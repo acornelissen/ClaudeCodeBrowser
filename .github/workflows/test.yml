@@ -19,5 +19,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      # The server's one third-party dependency. Without it the WebSocket
+      # tests skip, so CI would not be checking the handshake at all.
+      - name: Install websockets
+        run: mise exec -- python3 -m pip install websockets==17.2
       - name: Run the Python and extension suites
         run: mise run test

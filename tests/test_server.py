@@ -44,7 +44,12 @@ class ScreenshotLocationTests(unittest.TestCase):
             Path(TEST_HOME) / '.claudecodebrowser' / 'screenshots')
 
     def test_default_directory_is_not_in_shared_tmp(self):
-        self.assertFalse(str(server.SCREENSHOTS_DIR).startswith('/tmp/'))
+        """The old default was a fixed directory in the shared /tmp. This
+        used to assert the path did not start with /tmp/, which fails on
+        Linux for the wrong reason: the suite's throwaway home lives there."""
+        self.assertNotEqual(server.SCREENSHOTS_DIR,
+                            Path('/tmp/claudecodebrowser/screenshots'))
+        self.assertTrue(server.SCREENSHOTS_DIR.is_relative_to(Path.home()))
 
     def test_directory_is_not_world_readable(self):
         self.assertTrue(server.SCREENSHOTS_DIR.is_dir())
@@ -534,6 +539,7 @@ class WebSocketOriginTests(unittest.TestCase):
         literal origin, so it refused everything instead of allowing it."""
         self.assertIsNone(server.parse_ws_origins('*'))
 
+    @unittest.skipUnless(server.HAS_WEBSOCKETS, 'websockets is not installed')
     def test_the_serve_call_honours_the_origin_list(self):
         """This used to assert on inspect.getsource() text, which cannot tell
         whether origins= is actually passed and breaks on a rename. Drive the
