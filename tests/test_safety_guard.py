@@ -921,6 +921,9 @@ class AuditLogTests(unittest.TestCase):
             'action_script': 'browser_wait_and_act',
             'condition': 'browser_wait_and_act',
             'key': 'browser_press_key',
+            # A regex over whole tab URLs, query included: it can name the
+            # reset token of the tab it is looking for.
+            'url_pattern': 'browser_reload_by_url',
         }
         # One direction only: a key removed from SENSITIVE_ARGS has to fail
         # on what reaches the log below, not on this bookkeeping.

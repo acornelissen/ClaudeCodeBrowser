@@ -40,7 +40,7 @@ _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 # mirror, and tests/test_browser_agent.py pins it against safety.py's list so
 # the two cannot drift again.
 _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
-                   'action_script', 'condition', 'key'}
+                   'action_script', 'condition', 'key', 'url_pattern'}
 
 # Arguments that are URLs: reduced rather than masked, because which page was
 # acted on is the thing a log is read for, while the userinfo, query and

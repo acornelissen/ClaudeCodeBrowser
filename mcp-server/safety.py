@@ -372,24 +372,20 @@ OBSERVE_SCRIPT_TOOLS = {
 # entry per press and in order, so a typed sequence could be read straight
 # off the log. Synthetic KeyboardEvents cannot type in attended Firefox, but
 # the headless backend's keyboard.press does.
+#
+# 'url_pattern' is a regex matched against whole tab URLs, query string
+# included, so it can name a reset token to find the tab that holds it. It is
+# not a URL, so redact_url cannot reduce it - escapes and quantifiers give its
+# '?' and '/' other meanings - and it is masked outright.
 SENSITIVE_ARGS = frozenset({
     'text', 'script', 'value', 'password', 'steps', 'action_script',
-    'condition', 'key',
+    'condition', 'key', 'url_pattern',
 })
 
 # Argument keys holding a URL. Masking these outright would cost the audit log
 # its point - it exists to say what was done - so they are reduced instead;
 # see redact_url.
 URL_ARGS = frozenset({'url'})
-
-# Argument keys holding a pattern matched against whole tab URLs, query string
-# included. A pattern can name a reset token to find the tab that holds it,
-# and it is a regex rather than a URL, so redact_url cannot reduce it to a
-# host and path - escapes and quantifiers make its '?' and '/' mean something
-# else. Masked outright instead. A separate set rather than an entry in
-# SENSITIVE_ARGS only because agent/browser_agent.py mirrors that list and
-# a parity test holds the two together; the client should mask this too.
-URL_FILTER_ARGS = frozenset({'url_pattern'})
 
 
 def redact_url(url: Any) -> Any:
@@ -443,7 +439,7 @@ def redact_url(url: Any) -> Any:
 def redact_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """A log-safe copy of a tool's arguments."""
     return {
-        k: ('***' if k in SENSITIVE_ARGS or k in URL_FILTER_ARGS
+        k: ('***' if k in SENSITIVE_ARGS
             else redact_url(v) if k in URL_ARGS
             else v)
         for k, v in arguments.items()
