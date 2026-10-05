@@ -659,6 +659,17 @@ class ResultUrlTests(AgentTestCase):
         self.assert_reduced(out)
         self.assert_reduced(self.history_dump(agent))
 
+    def test_the_requested_url_navigate_echoes_back_is_reduced(self):
+        """browser_navigate answers {url: <landed>, requestedUrl: <sent>}
+        (extension/background.js). The argument log reduced the url it sent,
+        and the result then printed the same url whole one line later, under
+        a key the url pass did not know."""
+        self.serve_ok(url='https://x.test/cb', requestedUrl=self.RAW)
+        agent = browser_agent.BrowserAutomationAgent(verbose=True)
+        _, out = self.capture(agent.navigate, self.RAW)
+        self.assert_reduced(out)
+        self.assert_reduced(self.history_dump(agent))
+
 
 # --------------------------------------------------------------------------
 # 3. Selector interpolation into JavaScript

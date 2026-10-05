@@ -45,7 +45,11 @@ _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
 # Arguments that are URLs: reduced rather than masked, because which page was
 # acted on is the thing a log is read for, while the userinfo, query and
 # fragment are where a reset token, an SSO code or a password lives.
-_URL_ARGS = {'url'}
+#
+# Also matched as result keys: browser_navigate answers with the url it was
+# asked for under `requestedUrl`, so the token the argument log just reduced
+# came straight back whole in the logged result.
+_URL_ARGS = {'url', 'requestedUrl'}
 
 _LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
 
