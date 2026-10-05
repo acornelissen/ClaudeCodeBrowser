@@ -241,7 +241,9 @@ function redactHeaderList(headers) {
       // A redirect target carries whatever the next URL carries - an OAuth
       // `code=` in a Location header sat next to a Set-Cookie that *was*
       // redacted.
-      ? redactUrlForLog(header.value)
+      ? (name === "refresh"
+        ? redactRefreshForLog(header.value)
+        : redactUrlForLog(header.value))
       // A header with only a binaryValue gave undefined for its name.
       : (header.value !== undefined ? header.value : "[binary]");
     // A plain assignment collapsed repeats onto one key, and almost every
@@ -489,49 +491,101 @@ const SECRET_URL_PARAMS = new Set([
   "session", "sid", "apikey", "api_key", "secret", "assertion", "jwt"
 ]);
 
-function redactSearchParams(search) {
-  // Parsed, not regexed: a value can contain & and = once encoded, and the
-  // text passes cannot tell a parameter boundary from one inside a value.
+function isSecretUrlParam(name) {
+  return SECRET_URL_PARAMS.has(name.toLowerCase())
+    || looksLikeCredentialName(name);
+}
+
+// A parameter name as the server will read it. A malformed escape is matched
+// as written rather than skipped, so it cannot hide a name.
+function decodeParamName(name) {
   try {
-    const params = new URLSearchParams(search);
-    let touched = false;
-    for (const name of Array.from(params.keys())) {
-      if (SECRET_URL_PARAMS.has(name.toLowerCase())
-          || looksLikeCredentialName(name)) {
-        params.set(name, "***");
-        touched = true;
-      }
-    }
-    return touched ? `?${params.toString()}` : search;
+    return decodeURIComponent(name.replace(/\+/g, " "));
   } catch (e) {
-    return redactTextPasses(search);
+    return name;
   }
+}
+
+// name=value pairs in a query or a fragment, scrubbed in place.
+//
+// Not URLSearchParams, for two reasons. A single-page app's router puts its
+// own query INSIDE the fragment (`#/callback?code=...`), and URLSearchParams
+// read that as one parameter named `/callback?code`, so the OAuth code went
+// through; here a name starts after the last `?` before its `=`. And
+// URLSearchParams re-encodes everything once one value changes, so
+// `#!/cb?token=` came back as `#%21%2Fcb%3Ftoken=`; here only the value
+// changes and the rest stays as written. Pairs split on `&` as
+// URLSearchParams does (an encoded `%26` is not a separator), and on `;`,
+// which some servers still accept: splitting too often only costs a masked
+// value.
+function redactParamText(text) {
+  return text.replace(/(^|[&;?])([^&;=?]*)=([^&;]*)/g,
+    (match, lead, name) =>
+      (isSecretUrlParam(decodeParamName(name)) ? `${lead}${name}=***` : match));
+}
+
+// A URL that new URL() will not take: a relative redirect target
+// (`/cb?code=...`, `//host/cb?code=...`, `cb?code=...`), or a malformed one.
+// The fallback used to be the body text passes, which do not know that `code`
+// is a credential in a URL, so the commonest same-origin OAuth redirect
+// logged its code. Split by hand at the first `?` and `#` instead, so the
+// query and fragment get the same parameter pass as an absolute URL, and keep
+// the rest as written: resolving against a made-up base would report a host
+// the server never sent.
+function redactUnparsedUrl(rawUrl) {
+  const cut = rawUrl.search(/[?#]/);
+  let head = cut < 0 ? rawUrl : rawUrl.slice(0, cut);
+  const tail = cut < 0 ? "" : rawUrl.slice(cut);
+  // Userinfo of a scheme-relative or malformed absolute URL. Only in the
+  // authority position, so an `@` further along a path is left alone.
+  head = head.replace(/^((?:[a-z][a-z0-9+.-]*:)?[\\/]{2})[^\\/]*@/i, "$1");
+  // The path still gets the text passes, as the whole value did before.
+  head = redactTextPasses(head);
+  const hashAt = tail.indexOf("#");
+  const search = hashAt < 0 ? tail : tail.slice(0, hashAt);
+  const hash = hashAt < 0 ? "" : tail.slice(hashAt);
+  return head
+    + (search ? "?" + redactParamText(search.slice(1)) : "")
+    + (hash ? "#" + redactParamText(hash.slice(1)) : "");
 }
 
 function redactUrlForLog(rawUrl) {
   if (typeof rawUrl !== "string" || !rawUrl) return rawUrl;
   try {
-    const parsed = new URL(rawUrl);
+    let parsed;
+    try {
+      parsed = new URL(rawUrl);
+    } catch (e) {
+      return redactUnparsedUrl(rawUrl);
+    }
     // Userinfo is never diagnostic and is always a credential.
     if (parsed.username || parsed.password) {
       parsed.username = "";
       parsed.password = "";
     }
     if (parsed.search) {
-      parsed.search = redactSearchParams(parsed.search);
+      parsed.search = "?" + redactParamText(parsed.search.slice(1));
     }
     if (parsed.hash) {
       // An implicit-flow access_token arrives in the fragment, not the query.
-      parsed.hash = parsed.hash.startsWith("#")
-        ? "#" + redactSearchParams(parsed.hash.slice(1)).replace(/^\?/, "")
-        : redactTextPasses(parsed.hash);
+      parsed.hash = "#" + redactParamText(parsed.hash.slice(1));
     }
     return parsed.href;
   } catch (e) {
-    // Not a URL we can parse (about:, moz-extension:, something malformed).
-    // Scrub it as text rather than handing it over unexamined.
-    return redactTextPasses(rawUrl);
+    // Fail CLOSED: a URL this could not take apart is not handed over whole.
+    return "[url withheld; could not be scrubbed]";
   }
+}
+
+// Refresh is `<delay>; url=<target>`, not a URL, so new URL() threw on every
+// one and the target's query went through the text passes, which let an
+// OAuth `code=` past. Scrub the target as a URL and keep the delay.
+function redactRefreshForLog(value) {
+  if (typeof value !== "string") return redactUrlForLog(value);
+  const match = /^(\s*[\d.]*\s*[;,]\s*(?:url\s*=\s*)?)(["']?)([\s\S]*?)\2\s*$/i
+    .exec(value);
+  if (!match) return redactUrlForLog(value);
+  return match[1] + match[2] + redactUrlForLog(match[3]) + match[2];
 }
 
 // webRequest hands request bodies over as form fields or raw byte buffers.

@@ -1053,6 +1053,72 @@ test('a redirect records its target scrubbed', async () => {
             `redirectedTo leaked the code: ${entry.redirectedTo}`);
 });
 
+test('a relative redirect target is scrubbed and kept as written', async () => {
+  // new URL() throws on anything relative, and the fallback text passes did
+  // not know `code` is a credential in a URL - so `Location: /cb?code=...`,
+  // the shape most OAuth servers on the same origin send, logged the code
+  // verbatim while the absolute form was scrubbed. The target must also stay
+  // as the server wrote it: resolving it against a made-up base would report
+  // a host the server never sent.
+  const cases = [
+    ['location', '/cb?code=AUTHCODE-REL&state=xyz', '/cb?code=***&state=xyz'],
+    ['location', '//login.test/cb?code=AUTHCODE-NET', '//login.test/cb?code=***'],
+    ['location', 'cb?code=AUTHCODE-PATH', 'cb?code=***'],
+    ['location', '//alice:hunter2@login.test/cb', '//login.test/cb'],
+    ['location', '/#/cb?code=AUTHCODE-RELHASH', '/#/cb?code=***'],
+    // The server decodes the name, so an encoded `code` is still the code.
+    ['location', '/cb?%63ode=AUTHCODE-ENC', '/cb?%63ode=***'],
+    ['content-location', '/cb?code=AUTHCODE-CL', '/cb?code=***'],
+    ['refresh', '0; url=https://app.test/cb?code=AUTHCODE-REF',
+     '0; url=https://app.test/cb?code=***'],
+    ['refresh', "0; url='https://alice:hunter2@app.test/'",
+     "0; url='https://app.test/'"],
+    ['refresh', '5;URL=/cb?code=AUTHCODE-REFREL', '5;URL=/cb?code=***'],
+    ['refresh', '5', '5']
+  ];
+  for (const [name, value, expected] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      statusCode: 302,
+      responseHeaders: [{ name: 'content-type', value: 'text/html' },
+                        { name, value }]
+    });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.equal(entry.responseHeaders[name], expected,
+                 `${name}: ${value} was not scrubbed as written`);
+  }
+});
+
+test('a hash-route redirect does not keep its code', async () => {
+  // A single-page app's router puts its own query inside the fragment, so
+  // URLSearchParams over the fragment saw one parameter called
+  // `/callback?code` and let the code through. A hash-bang route was
+  // scrubbed but percent-encoded into `#%21%2Fcb%3Ftoken=***`, which no
+  // longer reads as the route it was.
+  const cases = [
+    ['https://app.test/#/callback?code=SPACODE&state=1',
+     'https://app.test/#/callback?code=***&state=1'],
+    ['https://app.test/#!/cb?token=HASHBANG-TOKEN',
+     'https://app.test/#!/cb?token=***'],
+    ['https://app.test/#access_token=FRAG-TOK&expires_in=3600',
+     'https://app.test/#access_token=***&expires_in=3600']
+  ];
+  for (const [url, expected] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      url,
+      statusCode: 302,
+      responseHeaders: [{ name: 'content-type', value: 'text/html' },
+                        { name: 'location', value: url }]
+    });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.equal(entry.url, expected, 'the request url');
+    assert.equal(entry.responseHeaders.location, expected, 'the Location header');
+  }
+});
+
 test('an attacker-chosen key name cannot exempt a body from redaction', async () => {
   // redactStructure built its output with `{}`, so `out["__proto__"] = x`
   // invoked the Object.prototype setter: the subtree became the prototype,
