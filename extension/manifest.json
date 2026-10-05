@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "ClaudeCodeBrowserX",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "description": "Browser automation for Claude Code: screenshots, clicking, typing and page interaction. A fork of ClaudeCodeBrowser, originally created by Andre Watson (Ligandal Inc.).",
   "author": "Albert Cornelissen",
   "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowser",

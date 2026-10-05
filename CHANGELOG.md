@@ -9,7 +9,7 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
-## [Unreleased]
+## [1.9.2]
 
 ### Fixed
 - **Large results no longer trip Firefox's 1 MB limit.** The native host sent
