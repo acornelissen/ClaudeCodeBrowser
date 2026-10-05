@@ -244,6 +244,81 @@ class ServerIdentityTests(unittest.TestCase):
         self.assertEqual(self.keys_sent, [])
 
 
+class DescribeMessageTests(unittest.TestCase):
+    """Every message is logged both ways through describe_message, into a
+    file under ~/.claudecodebrowser. A command carries typed text and a
+    response carries page text or a screenshot, so the summary may say what
+    a message is and how big, never what it holds."""
+
+    SECRET = 'hunter2-SECRET'
+
+    def assertNoSecret(self, summary):
+        self.assertNotIn(self.SECRET, summary)
+        self.assertNotIn('hunter2', summary)
+
+    def test_typed_text_is_not_logged(self):
+        summary = host.describe_message({
+            'action': 'type', 'requestId': 'r1', 'tabId': 7,
+            'data': {'text': self.SECRET, 'selector': '#password'}})
+        self.assertNoSecret(summary)
+        self.assertNotIn('#password', summary)
+        # Still enough to follow a session in the log.
+        self.assertIn("action='type'", summary)
+        self.assertIn("requestId='r1'", summary)
+        self.assertIn('tabId=7', summary)
+        self.assertIn("'text'", summary)
+        self.assertIn("'selector'", summary)
+
+    def test_page_text_is_logged_as_a_length(self):
+        body = f'<page body with {self.SECRET}>'
+        summary = host.describe_message(
+            {'requestId': 'r1', 'success': True, 'text': body})
+        self.assertNoSecret(summary)
+        self.assertIn(f'text_len={len(body)}', summary)
+        self.assertIn('success=True', summary)
+
+    def test_a_screenshot_is_logged_as_a_length(self):
+        image = 'data:image/png;base64,' + 'aHVudGVyMg' * 50 + self.SECRET
+        summary = host.describe_message(
+            {'requestId': 'r1', 'success': True, 'data': image})
+        self.assertNoSecret(summary)
+        self.assertNotIn('base64', summary)
+        self.assertIn(f'data_len={len(image)}', summary)
+
+    def test_string_payload_fields_are_logged_as_lengths(self):
+        for key in ('result', 'logs', 'elements'):
+            with self.subTest(key=key):
+                summary = host.describe_message({key: self.SECRET})
+                self.assertNoSecret(summary)
+                self.assertIn(f'{key}_len={len(self.SECRET)}', summary)
+
+    def test_structured_payloads_are_not_logged(self):
+        summary = host.describe_message({
+            'requestId': 'r1', 'success': True,
+            'data': {'value': {'nested': [self.SECRET]}},
+            'result': {'value': self.SECRET},
+            'logs': [{'message': self.SECRET}],
+            'elements': [{'text': self.SECRET}],
+        })
+        self.assertNoSecret(summary)
+
+    def test_an_error_is_flagged_not_quoted(self):
+        """An error message can echo what was being typed or read."""
+        summary = host.describe_message({
+            'requestId': 'r1', 'success': False,
+            'error': f'could not type {self.SECRET} into #password'})
+        self.assertNoSecret(summary)
+        self.assertIn('error=yes', summary)
+        self.assertIn('success=False', summary)
+
+    def test_a_non_object_is_named_by_type_only(self):
+        self.assertEqual(host.describe_message([self.SECRET]), '<list>')
+        self.assertEqual(host.describe_message(self.SECRET), '<str>')
+
+    def test_an_empty_message_still_says_something(self):
+        self.assertEqual(host.describe_message({}), '<no action>')
+
+
 class ScreenshotWriteTests(unittest.TestCase):
     """The host does not write screenshots at all.
 
