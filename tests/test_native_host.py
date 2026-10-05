@@ -386,11 +386,99 @@ class ScreenshotWriteTests(unittest.TestCase):
                        'data': 'data:image/png;base64,AAAA'})
         self.assertEqual(self.saved, [])
 
-    def test_the_response_still_reaches_the_server(self):
+    def test_the_response_reaches_the_server_and_is_not_echoed_back(self):
+        """The server is the one waiting for a result. The whole result used
+        to be returned here as well, and sent straight back to the extension,
+        which ignored it - so a 3 MB screenshot tripped the 1 MB limit on its
+        way back for nothing."""
         response = {'requestId': 1, 'success': True,
                     'data': 'data:image/png;base64,AAAA'}
-        self.assertIs(self._process(response), response)
+        self.assertIsNone(self._process(response))
         self.assertEqual(self.forwarded, [response])
+
+
+class SendDirectionTests(unittest.TestCase):
+    """Firefox caps a message from the host to the extension at 1 MB, and
+    that is the only direction with a cap that matters. What may cross it,
+    and who hears about it when something cannot."""
+
+    def setUp(self):
+        self.sent, self.forwarded = [], []
+        for name, fake in (('send_message', self.sent.append),
+                           ('forward_response_to_server', self.forwarded.append),
+                           ('check_mcp_server', lambda: True)):
+            self.addCleanup(setattr, host, name, getattr(host, name))
+            setattr(host, name, fake)
+
+    def test_a_large_result_goes_to_the_server_only(self):
+        result = {'requestId': 'r1', 'success': True,
+                  'data': 'x' * (3 * host.MAX_OUTGOING_MESSAGE_BYTES)}
+        host.handle_incoming(result)
+        self.assertEqual(self.forwarded, [result])
+        self.assertEqual(self.sent, [], 'nothing goes back to the extension')
+
+    def test_a_request_from_the_extension_still_gets_its_reply(self):
+        host.handle_incoming({'action': 'ping', 'requestId': 'r2'})
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0]['pong'])
+        self.assertEqual(self.sent[0]['requestId'], 'r2')
+
+    def test_an_oversized_command_fails_at_the_server_at_once(self):
+        """A failure sent in its place went to the extension, which ignores
+        a reply nobody asked for, so the caller waited out the full timeout
+        and got no reason."""
+        command = {'action': 'type', 'requestId': 'r3', 'tabId': 1,
+                   'data': {'text': 'x' * (2 * host.MAX_OUTGOING_MESSAGE_BYTES)}}
+        host.deliver_command(command)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(len(self.forwarded), 1)
+        failure = self.forwarded[0]
+        self.assertEqual(failure['requestId'], 'r3')
+        self.assertIs(failure['success'], False)
+        self.assertIn('1048576', failure['error'])
+        self.assertNotIn('xxxx', json.dumps(failure))
+
+    def test_an_ordinary_command_is_delivered(self):
+        command = {'action': 'click', 'requestId': 'r4', 'data': {}}
+        host.deliver_command(command)
+        self.assertEqual(self.sent, [command])
+        self.assertEqual(self.forwarded, [])
+
+
+class ConcurrentSendTests(unittest.TestCase):
+    """The polling thread and the main thread both write to the extension.
+    The length prefix and the body went out as two writes with no lock, so
+    two senders could interleave them, Firefox would read a corrupt frame,
+    and it tears the port down."""
+
+    def test_two_threads_never_interleave_a_frame(self):
+        class SlowStream(io.BytesIO):
+            def write(self, data):
+                # Yield mid-message so the other sender gets its chance.
+                time.sleep(0.0002)
+                return super().write(data)
+
+            def flush(self):
+                pass
+
+        stream = SlowStream()
+
+        def sender(tag):
+            for i in range(60):
+                host.send_message({'tag': tag, 'i': i}, stream)
+
+        threads = [threading.Thread(target=sender, args=(t,)) for t in 'ab']
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        stream.seek(0)
+        seen = []
+        for _ in range(120):
+            seen.append(host.read_message(stream))
+        self.assertEqual(sorted((m['tag'], m['i']) for m in seen),
+                         sorted((t, i) for t in 'ab' for i in range(60)))
 
 
 class ExplicitScreenshotSaveTests(unittest.TestCase):

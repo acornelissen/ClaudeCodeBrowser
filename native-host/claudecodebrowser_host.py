@@ -252,6 +252,9 @@ def read_message(stream=None):
     return message
 
 
+_send_lock = threading.Lock()
+
+
 def send_message(message, stream=None):
     """Send a message to the extension using the native messaging protocol."""
     stream = sys.stdout.buffer if stream is None else stream
@@ -295,9 +298,13 @@ def send_message(message, stream=None):
                 replacement.pop('requestId', None)
                 encoded = json.dumps(replacement).encode('utf-8')
 
-        stream.write(struct.pack(NATIVE_LENGTH_FORMAT, len(encoded)))
-        stream.write(encoded)
-        stream.flush()
+        # One frame at a time: the polling thread and the main thread both
+        # send, and a length prefix from one followed by a body from the
+        # other is a corrupt frame that makes Firefox tear the port down.
+        with _send_lock:
+            stream.write(struct.pack(NATIVE_LENGTH_FORMAT, len(encoded)))
+            stream.write(encoded)
+            stream.flush()
 
         logger.debug(f"Sent message: {describe_message(message)}")
     except Exception as e:
@@ -847,7 +854,11 @@ def process_message(message):
         # to be a data:image/ URL - getValue on an input holding an inline
         # image - landed on disk as a .png.
         forward_response_to_server(message)
-        return message
+        # Nothing goes back to the extension: it posts results without
+        # waiting for a reply, and ignores one. Returning the message here
+        # sent every result straight back to it, so a 3 MB screenshot broke
+        # the 1 MB host-to-extension limit on a trip nobody needed.
+        return None
 
     # Try to handle locally first
     local_result = handle_local_command(message)
@@ -886,6 +897,42 @@ def forward_response_to_server(response):
     except Exception as e:
         logger.error(f"Failed to forward response to server: {e}")
         return None
+
+
+def handle_incoming(message):
+    """Process one message from the extension and send any reply it needs."""
+    response = process_message(message)
+    if response is None:
+        return
+    # Include request ID for correlation
+    if 'requestId' in message:
+        response['requestId'] = message['requestId']
+    send_message(response)
+
+
+def deliver_command(command):
+    """Send a server command on to the extension, if it fits.
+
+    Firefox drops a host-to-extension message over 1 MB. send_message would
+    put a small failure in its place, but that goes to the extension, which
+    ignores a reply nobody asked for - so the server, the one waiting, timed
+    out with no reason given. Answer the server directly instead.
+    """
+    size = len(json.dumps(command).encode('utf-8'))
+    if size <= MAX_OUTGOING_MESSAGE_BYTES:
+        send_message(command)
+        return
+    logger.error(f"Command {command.get('action')} is {size} bytes, over the "
+                 f"{MAX_OUTGOING_MESSAGE_BYTES}-byte native messaging limit; "
+                 f"failing it at the server instead of sending it")
+    forward_response_to_server({
+        'requestId': command.get('requestId'),
+        'success': False,
+        'error': (f'The {command.get("action")} command was {size} bytes, '
+                  f'over Firefox\'s {MAX_OUTGOING_MESSAGE_BYTES}-byte limit '
+                  f'for a message to the extension, so it was not sent. '
+                  f'Send less in one call.'),
+    })
 
 
 def input_thread():
@@ -936,8 +983,7 @@ def poll_for_commands():
                 if data.get('command'):
                     command = data['command']
                     logger.info(f"Got command from server: {command.get('action')}")
-                    # Forward command to extension
-                    send_message(command)
+                    deliver_command(command)
 
         except urllib.error.URLError:
             consecutive_failures += 1
@@ -1070,15 +1116,7 @@ def main():
             break
 
         logger.debug(f"Received: {describe_message(message)}")
-
-        # Process and respond
-        response = process_message(message)
-
-        # Include request ID for correlation
-        if 'requestId' in message:
-            response['requestId'] = message['requestId']
-
-        send_message(response)
+        handle_incoming(message)
 
     shutdown()
 
