@@ -694,6 +694,8 @@ class FakePage:
         self.guard_probe_error = None          # raised by eval_on_selector
         self.focused_probe_error = None        # raised by evaluate
         self.nested_masked = 0                 # getText's scrub count
+        self.nested_fields = None              # None: same as nested_masked
+        self.nested_capped = False             # the scrub's cap bit
         self.fill_error = None
         self.query_results = []
         self.closed = False
@@ -818,8 +820,11 @@ class FakePage:
                 return {'self': True}
             # What the nested scrub found is the page's business, and the
             # scrub itself runs in node in RealTextScrubTests; the fake only
-            # has to report a count so the result's shape can be checked.
+            # has to report counts so the result's shape can be checked.
+            fields = (self.nested_masked if self.nested_fields is None
+                      else self.nested_fields)
             return {'text': el.value, 'masked': self.nested_masked,
+                    'fields': fields, 'capped': self.nested_capped,
                     'source': 'innerText'}
         if is_guard_probe(script):
             if self.guard_probe_error is not None:
@@ -1547,6 +1552,32 @@ class CredentialTextReadTests(unittest.IsolatedAsyncioTestCase):
         result = await browser._dispatch('getText', None, {})
         self.assertEqual(result['maskedFields'], 2)
         self.assertIn('***', result['note'])
+        self.assertNotIn('maskedFieldsCapped', result)
+
+    async def test_get_text_reports_fields_and_secrets_as_the_extension_does(self):
+        """maskedFields is how many fields were masked and maskedSecrets how
+        many distinct values were replaced; content.js returns both. This
+        used to put the secret count under maskedFields."""
+        browser, page = make_browser(
+            elements={'body': Element(tag='BODY', value='code ***')})
+        page.nested_masked = 1
+        page.nested_fields = 2
+        result = await browser._dispatch('getText', None, {})
+        self.assertEqual(result['maskedFields'], 2)
+        self.assertEqual(result['maskedSecrets'], 1)
+        self.assertTrue(result['note'].startswith('2 credential field(s)'))
+
+    async def test_get_text_says_when_the_scrub_cap_left_fields_unmasked(self):
+        """Regression test. Was: past the cap the rest of the credential
+        fields were returned in clear and the result did not say so."""
+        browser, page = make_browser(
+            elements={'body': Element(tag='BODY', value='*** *** PIN-0501')})
+        page.nested_masked = HeadlessBrowser.MAX_SCRUBBED_FIELDS
+        page.nested_capped = True
+        result = await browser._dispatch('getText', None, {})
+        self.assertIs(result['maskedFieldsCapped'], True)
+        self.assertIn('NOT masked', result['note'])
+        self.assertIn(str(HeadlessBrowser.MAX_SCRUBBED_FIELDS), result['note'])
 
     async def test_get_text_reads_and_decides_in_one_page_call(self):
         """Not two: a probe followed by a separate read leaves a window
@@ -1584,6 +1615,16 @@ class GuardDefinitionMirrorTests(unittest.TestCase):
         runtime, so a change on either side has to be made on both."""
         self.assertEqual(HeadlessBrowser.CREDENTIAL_NAME_RE,
                          extension_name_pattern())
+
+    def test_the_scrub_cap_matches_the_extension(self):
+        """content.js raised its cap from 50 to 500 because 50 leaked the
+        rest of a busy page; this copy stayed at 50 and leaked the same
+        way. Pinned so the two cannot drift apart again."""
+        found = re.findall(r'^  const MAX_SCRUBBED_FIELDS = (\d+);$',
+                           CONTENT_JS.read_text(), re.M)
+        self.assertEqual(len(found), 1,
+                         'MAX_SCRUBBED_FIELDS has moved in content.js')
+        self.assertEqual(HeadlessBrowser.MAX_SCRUBBED_FIELDS, int(found[0]))
 
     def test_every_generated_predicate_carries_the_whole_token_list(self):
         for name, script in self.scripts().items():
@@ -2025,6 +2066,52 @@ class RealTextScrubTests(unittest.TestCase):
                 result = self.read(page)
                 self.assertEqual(result['text'], visible)
                 self.assertEqual(result['source'], 'innerText')
+
+    def test_more_than_fifty_credential_fields_are_all_masked(self):
+        """Regression test. Was: the cap was 50, so the 51st credential
+        field on a page came back in clear and nothing in the result said
+        so. content.js raised its cap to 500 for exactly that leak."""
+        pins = [f'PIN-{n:03d}' for n in range(120)]
+        page = text_fixture(
+            ' '.join(pins), tag='BODY',
+            children=[text_fixture(pin, tag='DIV', contenteditable='',
+                                   el_id=f'pin{n}')
+                      for n, pin in enumerate(pins)])
+        result = self.read(page)
+        for pin in pins:
+            self.assertNotIn(pin, result['text'])
+        self.assertEqual(result['fields'], 120)
+        self.assertFalse(result['capped'])
+
+    def test_the_cap_says_when_it_bites(self):
+        """Past the cap the rest are NOT masked. That is reported, as
+        content.js reports it, rather than left for the caller to find."""
+        cap = HeadlessBrowser.MAX_SCRUBBED_FIELDS
+        for count, capped in ((cap, False), (cap + 1, True)):
+            with self.subTest(fields=count):
+                pins = [f'PIN-{n:04d}' for n in range(count)]
+                page = text_fixture(
+                    ' '.join(pins), tag='BODY',
+                    children=[text_fixture(pin, tag='DIV',
+                                           contenteditable='',
+                                           el_id=f'pin{n}')
+                              for n, pin in enumerate(pins)])
+                result = self.read(page)
+                self.assertIs(result['capped'], capped)
+                self.assertEqual(result['fields'], cap)
+
+    def test_fields_and_secrets_are_counted_separately(self):
+        """Two fields holding one value are one secret replaced, but two
+        fields masked - the two counts content.js reports."""
+        page = text_fixture(
+            'code 123456', tag='BODY',
+            children=[text_fixture('123456', tag='DIV', contenteditable='',
+                                   el_id='otp-code'),
+                      text_fixture('123456', tag='DIV', contenteditable='',
+                                   el_id='otp-confirm')])
+        result = self.read(page)
+        self.assertEqual(result['masked'], 1)
+        self.assertEqual(result['fields'], 2)
 
     def test_textcontent_is_the_fallback_and_the_result_says_so(self):
         """innerText is the visible text this tool promises, but it does not

@@ -285,8 +285,12 @@ class HeadlessBrowser:
 
     # How many nested credential fields a single getText will mask. See
     # _get_text_js for why the cap is on how many are masked, not on how many
-    # are examined.
-    MAX_SCRUBBED_FIELDS = 50
+    # are examined. Mirrors MAX_SCRUBBED_FIELDS in content.js, and the tests
+    # pin the two together: this copy stayed at 50 after content.js found
+    # that 50 leaked the rest of a busy page in clear, and it leaked the same
+    # way, without saying so. The cap only bounds the work, and the result
+    # now reports when it bites.
+    MAX_SCRUBBED_FIELDS = 500
 
     @classmethod
     def _credential_defs_js(cls) -> str:
@@ -407,12 +411,14 @@ class HeadlessBrowser:
             "const source = visible ? 'innerText' : 'textContent';\n"
             "if (ALLOW_PASSWORD || !raw) return {text: raw, masked: 0, source};\n"
             "let candidates = [];\n"
+            "let capped = false;\n"
             "try {\n"
-            "  candidates = root.querySelectorAll\n"
+            "  const all = root.querySelectorAll\n"
             "    ? Array.from(root.querySelectorAll('[contenteditable], textarea'))\n"
             "        .filter(el => el !== root && isPasswordField(el))\n"
-            f"        .slice(0, {cls.MAX_SCRUBBED_FIELDS})\n"
             "    : [];\n"
+            f"  capped = all.length > {cls.MAX_SCRUBBED_FIELDS};\n"
+            f"  candidates = all.slice(0, {cls.MAX_SCRUBBED_FIELDS});\n"
             "} catch (e) { candidates = []; }\n"
             "const secrets = [];\n"
             "for (const field of candidates) {\n"
@@ -433,7 +439,9 @@ class HeadlessBrowser:
             "  out = out.split(secret).join('***');\n"
             "  masked++;\n"
             "}\n"
-            "return {text: out, masked, source};\n"
+            # masked counts secrets replaced, and two fields holding one
+            # value are one secret, so the field count goes back separately.
+            "return {text: out, masked, fields: secrets.length, capped, source};\n"
             "}"
         )
 
@@ -1022,7 +1030,7 @@ class HeadlessBrowser:
                     'url': page.url
                 }
             text = read.get('text') or ''
-            masked_fields = read.get('masked') or 0
+            masked_secrets = read.get('masked') or 0
             result = {
                 'success': True,
                 'text': text[:max_length],
@@ -1031,13 +1039,23 @@ class HeadlessBrowser:
                 'source': read.get('source'),
                 'url': page.url
             }
-            if masked_fields:
-                # Named as the extension names it, since a caller reads the
-                # same key in both modes.
-                result['maskedFields'] = masked_fields
-                result['note'] = (
-                    f'{masked_fields} credential field(s) inside this element '
-                    'had their text replaced with ***.')
+            if masked_secrets:
+                # Named and counted as the extension does, since a caller
+                # reads the same keys in both modes. maskedFields used to
+                # carry the secret count here.
+                fields = read.get('fields') or 0
+                result['maskedFields'] = fields
+                result['maskedSecrets'] = masked_secrets
+                note = (f'{fields} credential field(s) inside this element '
+                        'had their text replaced with ***.')
+                if read.get('capped'):
+                    # Saying so beats silently returning the rest in clear,
+                    # which is what hitting the cap used to do.
+                    result['maskedFieldsCapped'] = True
+                    note += (f' More than {self.MAX_SCRUBBED_FIELDS} were '
+                             'present; the rest were NOT masked. Read a '
+                             'narrower selector.')
+                result['note'] = note
             return result
 
         elif action == 'refresh':
