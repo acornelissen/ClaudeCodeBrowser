@@ -9,6 +9,21 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Fixed
+- **Large results no longer trip Firefox's 1 MB limit.** The native host sent
+  every result the extension returned straight back to the extension as well
+  as to the server, so a big screenshot broke the host-to-extension limit on
+  that pointless echo. Results now go to the server only; a 15 MB screenshot
+  went through cleanly in a live check.
+- **A command over the 1 MB limit now fails at once, with a reason.** Its
+  failure used to go to the extension, which ignores it, so the call waited
+  out the full timeout.
+- **The native host could corrupt its own messages.** Two threads wrote the
+  length and body of a message separately with no lock; interleaved, Firefox
+  reads a corrupt frame and drops the connection.
+
 ## [1.9.1]
 
 ### Security
