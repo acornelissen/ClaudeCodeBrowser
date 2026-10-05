@@ -75,6 +75,30 @@ if [ -n "$CHECK" ]; then
 fi
 echo "  verified: signed, version $VERSION, updates.json agrees"
 
+# The release is cut from the commit checked out here, and only once CI has
+# passed on it. Without --target, GitHub tagged whatever main pointed at,
+# which need not be the commit that was built, tested and signed.
+HEAD_SHA=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
+CI_URL="repos/${REPO_SLUG}/commits/${HEAD_SHA}/check-runs?check_name=test"
+if command -v gh &> /dev/null; then
+    CI=$(gh api "$CI_URL" --jq '.check_runs[0].conclusion // "none"' 2>/dev/null) || CI="unknown"
+elif [ -n "$GITHUB_TOKEN" ]; then
+    CI=$(printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | \
+        curl -sS --config - -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/${CI_URL}" | python3 -c "
+import json, sys
+runs = json.load(sys.stdin).get('check_runs') or [{}]
+print(runs[0].get('conclusion') or 'none')") || CI="unknown"
+else
+    CI="unknown"
+fi
+if [ "$CI" != "success" ]; then
+    echo "Error: CI ('test') has not passed on ${HEAD_SHA} (it reports: ${CI})." >&2
+    echo "Push this commit and wait for the test workflow to pass, then retry." >&2
+    exit 1
+fi
+echo "  verified: CI passed on ${HEAD_SHA}"
+
 NOTES="ClaudeCodeBrowser ${TAG}
 
 Install: download \`claudecodebrowser-${VERSION}.xpi\` and open it in Firefox
@@ -92,6 +116,7 @@ if command -v gh &> /dev/null; then
     gh release create "$TAG" "$XPI" "$UPDATES" \
         --repo "$REPO_SLUG" \
         --title "$TAG" \
+        --target "$HEAD_SHA" \
         --notes "$NOTES" \
         $DRAFT_FLAG
     echo "Done. Release: https://github.com/${REPO_SLUG}/releases/tag/${TAG}"
@@ -107,10 +132,11 @@ else
     # Create the release; capture its id. Values are passed via the
     # environment (not interpolated into Python source) so quotes and newlines
     # in the notes can't break the JSON or inject code.
-    BODY=$(CCB_TAG="$TAG" CCB_DRAFT="$DRAFT" python3 -c "
+    BODY=$(CCB_TAG="$TAG" CCB_DRAFT="$DRAFT" CCB_SHA="$HEAD_SHA" python3 -c "
 import json, os, sys
 print(json.dumps({
     'tag_name': os.environ['CCB_TAG'],
+    'target_commitish': os.environ['CCB_SHA'],
     'name': os.environ['CCB_TAG'],
     'body': sys.stdin.read(),
     'draft': os.environ['CCB_DRAFT'] == '1',
