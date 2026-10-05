@@ -1282,6 +1282,81 @@ class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result['success'], result)
                 self.assertEqual(result['key'], key)
 
+    # Regression test. Was: the guard looked at `key` alone, and its last
+    # part, while the modifiers can also arrive as the shift/ctrl/alt/meta
+    # flags. Insert and Delete are on the allowlist because on their own they
+    # cannot type - but Shift+Insert pastes, Control+Insert copies and
+    # Shift+Delete cuts in Chromium's and Firefox's editing keymaps on Linux
+    # and Windows. Paste puts a credential into the field as surely as
+    # typing it; copy and cut take one out, to be pasted into an ordinary
+    # field and read back - the same reason Control+c is refused.
+    CLIPBOARD_SHORTCUTS = (
+        ({'key': 'Insert', 'shift': True}, 'Shift+Insert'),
+        ({'key': 'Shift+Insert'}, 'Shift+Insert'),
+        ({'key': 'Insert', 'ctrl': True}, 'Control+Insert'),
+        ({'key': 'Control+Insert'}, 'Control+Insert'),
+        ({'key': 'Insert', 'shift': 'true'}, 'Shift+Insert'),
+        ({'key': 'Delete', 'shift': True}, 'Shift+Delete'),
+        ({'key': 'Shift+Delete'}, 'Shift+Delete'),
+        ({'key': 'ShiftLeft+Delete'}, 'ShiftLeft+Delete'),
+        # Already refused, because the last part types; pinned so a change
+        # to the combination logic cannot unrefuse them.
+        ({'key': 'v', 'ctrl': True}, 'Control+v'),
+        ({'key': 'v', 'meta': True}, 'Meta+v'),
+        ({'key': 'KeyV', 'ctrl': True}, 'Control+KeyV'),
+        ({'key': 'c', 'ctrl': True}, 'Control+c'),
+        ({'key': 'x', 'meta': True}, 'Meta+x'),
+    )
+
+    async def test_press_key_refuses_clipboard_shortcuts_into_a_credential(self):
+        for keys, combination in self.CLIPBOARD_SHORTCUTS:
+            with self.subTest(combination=combination, path='selector'):
+                browser, page = make_browser(
+                    elements={'#pw': Element(input_type='password')})
+                with self.assertRaises(RuntimeError) as ctx:
+                    await browser._dispatch('pressKey', None,
+                                            dict(keys, selector='#pw'))
+                self.assertIn('Refused', str(ctx.exception))
+                self.assertEqual(calls_named(page, 'keyboard.press'), [])
+            with self.subTest(combination=combination, path='focused'):
+                browser, page = make_browser(
+                    active=Element(input_type='password'))
+                with self.assertRaises(RuntimeError):
+                    await browser._dispatch('pressKey', None, dict(keys))
+                self.assertEqual(calls_named(page, 'keyboard.press'), [])
+
+    async def test_press_key_allows_clipboard_shortcuts_in_an_ordinary_field(self):
+        for keys, combination in self.CLIPBOARD_SHORTCUTS:
+            with self.subTest(combination=combination):
+                browser, page = make_browser(elements={'#q': Element()})
+                result = await browser._dispatch('pressKey', None,
+                                                 dict(keys, selector='#q'))
+                self.assertTrue(result['success'], result)
+                self.assertEqual(calls_named(page, 'keyboard.press'),
+                                 [('keyboard.press', combination)])
+
+    async def test_press_key_keeps_editing_combinations_on_a_credential(self):
+        """Selecting, moving by word and deleting do not move a credential
+        anywhere, so refusing them would only make the tool worse."""
+        for keys, combination in (
+                ({'key': 'ArrowLeft', 'shift': True}, 'Shift+ArrowLeft'),
+                ({'key': 'ArrowRight', 'ctrl': True}, 'Control+ArrowRight'),
+                ({'key': 'Home', 'shift': True}, 'Shift+Home'),
+                ({'key': 'Backspace', 'ctrl': True}, 'Control+Backspace'),
+                ({'key': 'Delete', 'ctrl': True}, 'Control+Delete'),
+                ({'key': 'Control+Backspace'}, 'Control+Backspace'),
+                ({'key': 'Tab', 'shift': True}, 'Shift+Tab'),
+                ({'key': 'Insert'}, 'Insert'),
+                ({'key': 'Delete'}, 'Delete')):
+            with self.subTest(combination=combination):
+                browser, page = make_browser(
+                    elements={'#pw': Element(input_type='password')})
+                result = await browser._dispatch('pressKey', None,
+                                                 dict(keys, selector='#pw'))
+                self.assertTrue(result['success'], result)
+                self.assertEqual(calls_named(page, 'keyboard.press'),
+                                 [('keyboard.press', combination)])
+
     async def test_press_key_into_an_ordinary_field_is_not_guarded(self):
         browser, page = make_browser(elements={'#q': Element()})
         for key in ('a', 'KeyA', 'Space', 'Shift+a'):

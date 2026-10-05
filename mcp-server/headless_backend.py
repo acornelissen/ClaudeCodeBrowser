@@ -571,6 +571,30 @@ class HeadlessBrowser:
         actual = key.split('+')[-1].strip() or '+'
         return actual.lower() not in cls._KEYS_THAT_CANNOT_TYPE
 
+    @staticmethod
+    def _key_uses_clipboard(combination: str) -> bool:
+        """True for the clipboard shortcuts built from keys that cannot type.
+
+        Insert and Delete are on the allowlist above because on their own
+        they put no character anywhere. With a modifier they are the old
+        CUA clipboard keys, which Chromium's and Firefox's editing keymaps
+        still honour on Linux and Windows: Shift+Insert pastes,
+        Control+Insert copies, Shift+Delete cuts. Paste puts a credential
+        into a field as surely as typing it, and copy or cut takes one out
+        to be pasted somewhere readable - Control+v, c and x are refused for
+        the same reasons, through the letter. Any modifier on Insert counts,
+        so a variant this list did not foresee is refused rather than
+        waved through; Delete with Control alone deletes a word and stays
+        allowed.
+        """
+        parts = [part.strip().lower() for part in combination.split('+')]
+        key, modifiers = parts[-1], [m for m in parts[:-1] if m]
+        if key == 'insert':
+            return bool(modifiers)
+        if key == 'delete':
+            return any(m.startswith('shift') for m in modifiers)
+        return False
+
     # The directions browser_scroll's schema allows.
     _RELATIVE_DIRECTIONS = {'up': (0, -1), 'down': (0, 1),
                             'left': (-1, 0), 'right': (1, 0)}
@@ -973,28 +997,35 @@ class HeadlessBrowser:
             # type is refused on a credential field; navigation and editing
             # keys stay allowed. See _KEYS_THAT_CANNOT_TYPE for why this is
             # an allowlist.
-            if self._key_can_type(key) and \
-                    args.get('allow_password') is not True:
-                if selector:
-                    if await self._is_password_field(page, selector,
-                                                     include_hidden=False):
-                        raise RuntimeError(
-                            'Refused: pressing a printable key into a '
-                            'credential field would enter the credential one '
-                            'character at a time. Set "allow_password_typing": '
-                            'true in ~/.claudecodebrowser/safety.json to '
-                            'override.')
-                else:
-                    await self._assert_focused_not_password(page, args)
-
-            if selector:
-                await page.focus(selector)
+            #
+            # The guard judges the whole combination that will be pressed,
+            # not `key`: the modifiers can also arrive as the ctrl/shift/
+            # alt/meta flags, and key='Insert' with shift=true is Shift+Insert,
+            # which pastes. Judging `key` alone waved that through.
             modifiers = [m for m, on in (
                 ('Control', parse_flag(args.get('ctrl'), False)),
                 ('Shift', parse_flag(args.get('shift'), False)),
                 ('Alt', parse_flag(args.get('alt'), False)),
                 ('Meta', parse_flag(args.get('meta'), False))) if on]
             combination = '+'.join(modifiers + [key]) if modifiers else key
+            if (self._key_can_type(combination) or
+                    self._key_uses_clipboard(combination)) and \
+                    args.get('allow_password') is not True:
+                if selector:
+                    if await self._is_password_field(page, selector,
+                                                     include_hidden=False):
+                        raise RuntimeError(
+                            f'Refused: pressing {combination} in a credential '
+                            'field would put a credential into it or take one '
+                            'out (a printable key types it one character at a '
+                            'time; a clipboard shortcut pastes, copies or '
+                            'cuts it). Set "allow_password_typing": true in '
+                            '~/.claudecodebrowser/safety.json to override.')
+                else:
+                    await self._assert_focused_not_password(page, args)
+
+            if selector:
+                await page.focus(selector)
             await page.keyboard.press(combination)
             return {'success': True, 'key': combination}
 
