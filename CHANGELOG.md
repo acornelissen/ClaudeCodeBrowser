@@ -1,13 +1,39 @@
 # Changelog
 
-All notable changes to ClaudeCodeBrowser are documented here. Versions follow
+All notable changes to ClaudeCodeBrowserX are documented here. Versions follow
 [semantic versioning](https://semver.org/). The MCP server, extension, and
 docs are versioned together.
 
 ClaudeCodeBrowser was created by Andre Watson
 ([@nanogenomic](https://github.com/nanogenomic), Ligandal Inc.); 1.1.0–1.4.0
 are his releases. 1.5.0 onwards are from the fork at
-<https://github.com/acornelissen/ClaudeCodeBrowser>.
+<https://github.com/acornelissen/ClaudeCodeBrowserX>, since renamed
+ClaudeCodeBrowserX.
+
+## [Unreleased]
+
+### Changed
+- **Renamed to ClaudeCodeBrowserX.** Everything user-facing moves:
+  - the MCP server is registered as `claudecodebrowserx`, so its tools are
+    `mcp__claudecodebrowserx__*`;
+  - the install folder is `~/.claudecodebrowserx`, and the native messaging
+    host is `claudecodebrowserx`;
+  - environment variables are `CLAUDE_BROWSERX_*`;
+  - the repository is `acornelissen/ClaudeCodeBrowserX`. GitHub redirects
+    the old URL, so installed extensions keep finding updates.
+
+  The extension ID is unchanged, so Firefox treats it as the same add-on.
+
+### Migrating
+- Run `./scripts/install.sh` (or `install.ps1`). It moves
+  `~/.claudecodebrowser` to the new folder with your `safety.json`, token and
+  logs, writes the new native host manifest, and points the old one at the
+  new host so an extension that has not updated yet still connects.
+- Re-register the MCP server: `claude mcp remove claudecodebrowser`, then the
+  `claude mcp add` line the installer prints. Update any permission rules
+  that name `mcp__claudecodebrowser__*`.
+- Rename `CLAUDE_BROWSER_*` variables to `CLAUDE_BROWSERX_*`. The old names
+  still work for this release and log a deprecation warning once each.
 
 ## [1.9.7]
 
