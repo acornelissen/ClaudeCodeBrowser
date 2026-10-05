@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -521,6 +522,67 @@ class ConcurrentSendTests(unittest.TestCase):
             seen.append(host.read_message(stream))
         self.assertEqual(sorted((m['tag'], m['i']) for m in seen),
                          sorted((t, i) for t in 'ab' for i in range(60)))
+
+
+class ScreenshotRetentionTests(unittest.TestCase):
+    """The server prunes screenshots only in a directory carrying its
+    marker, and only *.png. The host's context-menu save created a custom
+    directory without the marker - so once the host made it first, nothing
+    in it was ever pruned - and kept whatever suffix it was given."""
+
+    MARKER = '.ccb-screenshots'   # safety.OWNED_DIR_MARKER
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        previous = os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
+        self.addCleanup(self._restore, previous)
+
+    def _restore(self, previous):
+        os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
+        if previous is not None:
+            os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = previous
+
+    def _save(self, filename='shot.png'):
+        return host.handle_local_command({
+            'action': 'saveScreenshot', 'filename': filename,
+            'data': 'data:image/png;base64,AAAA'})
+
+    def test_a_directory_the_host_creates_is_marked(self):
+        target = Path(self.tmp.name) / 'new-dir'
+        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = str(target)
+        self.assertTrue(self._save()['success'])
+        self.assertTrue((target / self.MARKER).is_file(),
+                        'without the marker the server never prunes it')
+
+    def test_an_existing_directory_is_not_claimed(self):
+        target = Path(self.tmp.name)
+        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = str(target)
+        self.assertTrue(self._save()['success'])
+        self.assertFalse((target / self.MARKER).exists(),
+                         'its other contents are not ours to delete')
+
+    def test_the_default_directory_is_private_and_marked(self):
+        with unittest.mock.patch.object(Path, 'home',
+                                        return_value=Path(self.tmp.name)):
+            self.assertTrue(self._save()['success'])
+        default = Path(self.tmp.name) / '.claudecodebrowser' / 'screenshots'
+        self.assertTrue((default / self.MARKER).is_file())
+        self.assertEqual(default.stat().st_mode & 0o077, 0)
+
+    def test_the_file_is_always_a_png(self):
+        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = self.tmp.name
+        result = self._save('capture.jpg')
+        self.assertTrue(result['filepath'].endswith('.png'), result)
+
+    def test_the_marker_name_matches_the_server(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'ccb_safety_marker',
+            Path(__file__).resolve().parent.parent / 'mcp-server' / 'safety.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.OWNED_DIR_MARKER, self.MARKER)
 
 
 class ExplicitScreenshotSaveTests(unittest.TestCase):

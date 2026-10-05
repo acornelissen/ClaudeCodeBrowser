@@ -755,6 +755,49 @@ def ensure_mcp_server():
     return start_mcp_server()
 
 
+# Mirrors OWNED_DIR_MARKER in mcp-server/safety.py: the server prunes only a
+# directory carrying it. A test holds the two names together.
+OWNED_DIR_MARKER = '.ccb-screenshots'
+
+
+def _screenshots_dir():
+    """The screenshots directory, created and marked as resolve_screenshots_dir
+    in mcp-server/safety.py does it; this host is installed on its own and
+    cannot import that.
+
+    A screenshot can contain anything that was on screen, so the default is
+    the user's own directory at 0700, not a shared /tmp. A directory created
+    here is marked so the server's retention can prune it: without the
+    marker, a custom directory the host happened to create first was never
+    pruned. One that already existed is left unmarked - its other contents
+    are not ours to delete.
+    """
+    override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+    if override:
+        path = Path(override).expanduser()
+        created = not path.is_dir()
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        path = Path.home() / '.claudecodebrowser' / 'screenshots'
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        created = True
+        try:
+            # mkdir's mode only applies on creation.
+            path.chmod(0o700)
+        except OSError as e:
+            logger.warning(f"Could not restrict permissions on {path}: {e}")
+    marker = path / OWNED_DIR_MARKER
+    if created and not marker.exists():
+        try:
+            marker.write_text(
+                'Created by ClaudeCodeBrowser. Its presence allows the retention '
+                'policy to delete *.png files in this directory. Remove it to '
+                'keep screenshots indefinitely.\n')
+        except OSError as e:
+            logger.warning(f"Could not mark {path} as prunable: {e}")
+    return path
+
+
 def handle_local_command(message):
     """Handle commands that don't need MCP server."""
     action = message.get('action')
@@ -791,18 +834,12 @@ def handle_local_command(message):
             # directory or its parent instead of a file in it.
             if filename in ('', '.', '..'):
                 filename = generated
+            # Retention only ever considers *.png, so anything else was kept
+            # for ever. Mirrors screenshot_filename() in safety.py.
+            if not filename.endswith('.png'):
+                filename = Path(filename).with_suffix('.png').name
 
-            # A screenshot can contain anything that was on screen, so the
-            # default is the user's own directory at 0700, not a shared /tmp.
-            # Mirrors resolve_screenshots_dir() in mcp-server/safety.py; this
-            # host is installed on its own and cannot import it.
-            override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
-            if override:
-                screenshots_dir = Path(override).expanduser()
-                screenshots_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                screenshots_dir = Path.home() / '.claudecodebrowser' / 'screenshots'
-                screenshots_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            screenshots_dir = _screenshots_dir()
 
             filepath = screenshots_dir / filename
 
