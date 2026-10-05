@@ -1097,6 +1097,23 @@ test('a redirect records its target scrubbed', async () => {
             `redirectedTo leaked the code: ${entry.redirectedTo}`);
 });
 
+test('a Referer carrying a code is scrubbed', async () => {
+  // Found live: the redirect target was scrubbed in Location, then the
+  // browser sent the whole callback URL, code and all, as the Referer of the
+  // next request.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', { includeAllTypes: true }, 7);
+  fireRequest(webRequest, {
+    url: 'https://app.test/favicon.ico',
+    requestHeaders: [{ name: 'Referer',
+                       value: 'https://app.test/cb?code=REFERER-CODE-9&state=ok' }]
+  });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(!JSON.stringify(entry).includes('REFERER-CODE-9'),
+            JSON.stringify(entry.requestHeaders));
+  assert.match(entry.requestHeaders.Referer, /app\.test\/cb\?code=\*\*\*&state=ok/);
+});
+
 test('a relative redirect target is scrubbed and kept as written', async () => {
   // new URL() throws on anything relative, and the fallback text passes did
   // not know `code` is a credential in a URL - so `Location: /cb?code=...`,
@@ -1861,6 +1878,32 @@ test('credential values in HTML attributes are scrubbed from captured bodies', a
   assert.ok(body.includes('albert'),
     'a non-credential field must still be readable');
   assert.ok(body.includes('<form>'), 'the markup itself must stay intact');
+});
+
+test('a credential name after an ordinary id, and a credential textarea, are scrubbed', async () => {
+  // Found live: only the first name/id attribute was judged, so
+  // <input id="mfa" name="mfaCode"> was judged by id="mfa" and its value
+  // logged; and a textarea's contents were never looked at.
+  const { command, webRequest, filters } = loadBackground();
+  await command('startLogging', { includeAllTypes: true }, 7);
+  fireRequest(webRequest, {
+    responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    complete: false
+  });
+  const html =
+    '<input id="mfa" name="mfaCode" value="MFA-SECRET-1">' +
+    '<input name="q" id="otp" value="OTP-SECRET-2">' +
+    '<textarea id="cvv">CVV-SECRET-3</textarea>' +
+    '<textarea name="notes">ordinary notes</textarea>';
+  filters[0].ondata({ data: new TextEncoder().encode(html) });
+  filters[0].onstop();
+  webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+  const body = (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
+  for (const secret of ['MFA-SECRET-1', 'OTP-SECRET-2', 'CVV-SECRET-3']) {
+    assert.ok(!body.includes(secret), `${secret} must not survive: ${body}`);
+  }
+  assert.ok(body.includes('ordinary notes'), 'an ordinary textarea stays readable');
+  assert.ok(body.includes('<textarea id="cvv">'), 'the markup stays intact');
 });
 
 test('ordinary markup is not mangled by the scrubber', async () => {

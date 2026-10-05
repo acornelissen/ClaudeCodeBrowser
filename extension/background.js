@@ -79,8 +79,10 @@ const REDACTED_HEADERS = new Set([
 // Headers whose value is a URL, and so can carry a credential in its query
 // string. Scrubbed as URLs rather than blanked, because where a redirect went
 // is the thing you are reading the log for.
+// Referer too: after a redirect is scrubbed in Location, the browser sends
+// the whole callback URL, code and all, as the next request's Referer.
 const URL_VALUED_HEADERS = new Set([
-  "location", "content-location", "refresh"
+  "location", "content-location", "refresh", "referer"
 ]);
 
 // Response bodies are only collected for types that are text to begin with.
@@ -317,17 +319,31 @@ function looksLikeCredentialName(name) {
 const SECRET_INPUT_RE =
   /type\s*=\s*["']?(password|hidden)|autocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc)/i;
 
+// Every name and id the tag carries. Only the first used to be judged, so
+// <input id="mfa" name="mfaCode"> was judged by id="mfa" and its value logged.
+function tagLooksSecret(tag) {
+  if (SECRET_INPUT_RE.test(tag)) return true;
+  const attrs = /\s(?:name|id)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/gi;
+  for (const match of tag.matchAll(attrs)) {
+    if (looksLikeCredentialName(match[1] ?? match[2] ?? match[3] ?? '')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function redactHtmlInputValues(text) {
   // Tag-level: find each <input ...> and blank its value when the tag itself
-  // looks like a credential field. Regex over HTML is crude, but this is
-  // best-effort redaction of a log, not parsing.
+  // looks like a credential field, and each credential <textarea>'s contents.
+  // Regex over HTML is crude, but this is best-effort redaction of a log, not
+  // parsing.
   return text.replace(/<input\b[^>]*>/gi, (tag) => {
-    const looksSecret = SECRET_INPUT_RE.test(tag) || looksLikeCredentialName(
-      (tag.match(/(?:name|id)\s*=\s*["']?([^"'\s>]*)/i) || [])[1] || '');
-    if (!looksSecret) return tag;
+    if (!tagLooksSecret(tag)) return tag;
     return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
               .replace(/(\bvalue\s*=\s*)(?!["'])[^\s>]+/gi, '$1***');
-  });
+  }).replace(/(<textarea\b[^>]*>)([\s\S]*?)(<\/textarea\s*>)/gi,
+    (match, open, body, close) =>
+      (tagLooksSecret(open) && body ? `${open}***${close}` : match));
 }
 
 // Walk a parsed structure, replacing any value under a credential-shaped key.
