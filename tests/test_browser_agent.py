@@ -247,7 +247,7 @@ class AgentTestCase(unittest.TestCase):
                 'error': 'Refused: target is a password field. Use the '
                          'browser’s own password manager (autofill) for '
                          'credentials, or set "allow_password_typing": true '
-                         'in ~/.claudecodebrowser/safety.json if you really '
+                         'in ~/.claudecodebrowserx/safety.json if you really '
                          'want automated password entry.',
             })
 
@@ -314,7 +314,7 @@ class ApiTokenTests(AgentTestCase):
         # CURRENT BEHAVIOUR (regression guard): never from the repo or /tmp.
         self.assertEqual(
             DEFAULT_TOKEN_FILE,
-            Path(TEST_HOME) / '.claudecodebrowser' / 'api_token')
+            Path(TEST_HOME) / '.claudecodebrowserx' / 'api_token')
 
     def test_the_token_is_sent_when_the_file_exists(self):
         # CURRENT BEHAVIOUR (regression guard).

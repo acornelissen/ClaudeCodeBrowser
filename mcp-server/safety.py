@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Safety guard for ClaudeCodeBrowser.
+Safety guard for ClaudeCodeBrowserX.
 
 MIT License
 Copyright (c) 2025 Andre Watson (nanogenomic), Ligandal Inc.
@@ -41,13 +41,13 @@ browser. The guard enforces, in order:
                            runaway agent cannot machine-gun the browser.
 7. Audit log             - every decision (allowed, denied, confirmation
                            requested) is appended to
-                           ~/.claudecodebrowser/logs/audit.jsonl with
+                           ~/.claudecodebrowserx/logs/audit.jsonl with
                            sensitive argument values redacted. A URL keeps
                            its host and path, which is what makes the entry
                            useful, and loses the userinfo, query and fragment,
                            which is where credentials live - see redact_url.
 
-Configuration lives in ~/.claudecodebrowser/safety.json (created with safe
+Configuration lives in ~/.claudecodebrowserx/safety.json (created with safe
 defaults on first run). Environment overrides:
 
   CLAUDE_BROWSERX_READ_ONLY=1        force read-only mode
@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-logger = logging.getLogger('ClaudeCodeBrowser.Safety')
+logger = logging.getLogger('ClaudeCodeBrowserX.Safety')
 
 # Environment variables are CLAUDE_BROWSERX_*. The CLAUDE_BROWSER_* names from
 # before the project was renamed are still read, with a warning, for one
@@ -96,9 +96,9 @@ def env(name: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 _CONFIG_FILE = Path(env('SAFETY_CONFIG',
-    str(Path.home() / '.claudecodebrowser' / 'safety.json')
+    str(Path.home() / '.claudecodebrowserx' / 'safety.json')
 ))
-_AUDIT_FILE = Path.home() / '.claudecodebrowser' / 'logs' / 'audit.jsonl'
+_AUDIT_FILE = Path.home() / '.claudecodebrowserx' / 'logs' / 'audit.jsonl'
 
 # An audit log written by an older version is world-readable; tighten it on
 # import rather than waiting for the next entry.
@@ -607,7 +607,7 @@ def _mark_as_ours(path: Path) -> None:
         return
     try:
         marker.write_text(
-            'Created by ClaudeCodeBrowser. Its presence allows the retention '
+            'Created by ClaudeCodeBrowserX. Its presence allows the retention '
             'policy to delete *.png files in this directory. Remove it to '
             'keep screenshots indefinitely.\n')
     except OSError as e:
@@ -661,7 +661,7 @@ def resolve_screenshots_dir() -> Path:
             _mark_as_ours(path)
         return path
 
-    path = Path.home() / '.claudecodebrowser' / 'screenshots'
+    path = Path.home() / '.claudecodebrowserx' / 'screenshots'
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     _mark_as_ours(path)
     try:

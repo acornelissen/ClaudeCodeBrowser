@@ -52,7 +52,7 @@ from headless_backend import HeadlessBrowser  # noqa: E402
 
 # The backend logs every refused or failed command at error level; these
 # tests deliberately provoke those, so keep the expected noise off stderr.
-logging.getLogger('ClaudeCodeBrowser.Headless').setLevel(logging.CRITICAL)
+logging.getLogger('ClaudeCodeBrowserX.Headless').setLevel(logging.CRITICAL)
 
 CONTENT_JS = ROOT / 'extension' / 'content.js'
 # The one definition of a credential, which the extension and headless share.

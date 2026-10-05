@@ -20,14 +20,14 @@ $Dist = Join-Path $RepoRoot "dist"
 $manifest = Get-Content (Join-Path $Src "manifest.json") -Raw | ConvertFrom-Json
 $Version = $manifest.version
 $ExtId = $manifest.browser_specific_settings.gecko.id
-$Xpi = Join-Path $Dist "claudecodebrowser-$Version.xpi"
+$Xpi = Join-Path $Dist "claudecodebrowserx-$Version.xpi"
 
-$RepoSlug = if ($env:CCB_REPO_SLUG) { $env:CCB_REPO_SLUG } else { "acornelissen/ClaudeCodeBrowser" }
-$XpiUrl = "https://github.com/$RepoSlug/releases/download/v$Version/claudecodebrowser-$Version.xpi"
+$RepoSlug = if ($env:CCB_REPO_SLUG) { $env:CCB_REPO_SLUG } else { "acornelissen/ClaudeCodeBrowserX" }
+$XpiUrl = "https://github.com/$RepoSlug/releases/download/v$Version/claudecodebrowserx-$Version.xpi"
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
-Write-Host "Packaging ClaudeCodeBrowser extension v$Version ($ExtId)"
+Write-Host "Packaging ClaudeCodeBrowserX extension v$Version ($ExtId)"
 
 # Firefox update manifest, so installed copies can auto-update.
 $updates = [ordered]@{

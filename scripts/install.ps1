@@ -1,4 +1,4 @@
-# ClaudeCodeBrowser Installation Script for Windows
+# ClaudeCodeBrowserX Installation Script for Windows
 #
 # Installs the native messaging host, MCP server, and browser agent, and
 # registers the native host with Firefox via the Windows registry.
@@ -8,12 +8,12 @@
 
 $ErrorActionPreference = "Stop"
 
-$InstallDir = Join-Path $env:USERPROFILE ".claudecodebrowser"
+$InstallDir = Join-Path $env:USERPROFILE ".claudecodebrowserx"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 Write-Host ""
 Write-Host "+--------------------------------------------------------------+"
-Write-Host "|       ClaudeCodeBrowser Installation Script (Windows)        |"
+Write-Host "|       ClaudeCodeBrowserX Installation Script (Windows)        |"
 Write-Host "+--------------------------------------------------------------+"
 Write-Host ""
 
@@ -54,11 +54,22 @@ if ($Firefox) {
 Write-Host ""
 Write-Host "Installing components to $InstallDir ..."
 
+# Upgrading from before the rename: move %USERPROFILE%\.claudecodebrowser
+# (safety.json, API token, logs, screenshots) once rather than start fresh,
+# which would silently drop the user's safety policy.
+$LegacyInstallDir = Join-Path $env:USERPROFILE ".claudecodebrowser"
+if ((Test-Path $LegacyInstallDir) -and -not (Test-Path $InstallDir)) {
+    Move-Item -Path $LegacyInstallDir -Destination $InstallDir
+    Write-Host "[ok] Moved $LegacyInstallDir to $InstallDir (config, token, logs kept)"
+} elseif ((Test-Path $LegacyInstallDir) -and (Test-Path $InstallDir)) {
+    Write-Host "[warn] Both $LegacyInstallDir and $InstallDir exist; using the new one"
+}
+
 foreach ($sub in @("native-host", "mcp-server", "agent", "screenshots", "logs")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir $sub) | Out-Null
 }
 
-Copy-Item (Join-Path $RepoRoot "native-host\claudecodebrowser_host.py") (Join-Path $InstallDir "native-host\")
+Copy-Item (Join-Path $RepoRoot "native-host\claudecodebrowserx_host.py") (Join-Path $InstallDir "native-host\")
 foreach ($f in @("server.py", "safety.py", "headless_backend.py", "stdio_wrapper.py")) {
     Copy-Item (Join-Path $RepoRoot "mcp-server\$f") (Join-Path $InstallDir "mcp-server\")
 }
@@ -73,7 +84,7 @@ Write-Host "[ok] Components installed"
 # Firefox on Windows can only launch .exe/.bat native hosts, not .py files,
 # so generate a .bat wrapper with the absolute Python path baked in.
 $HostBat = Join-Path $InstallDir "native-host\run_host.bat"
-$HostPy = Join-Path $InstallDir "native-host\claudecodebrowser_host.py"
+$HostPy = Join-Path $InstallDir "native-host\claudecodebrowserx_host.py"
 @"
 @echo off
 "$Python" "$HostPy" %*
@@ -82,7 +93,7 @@ Write-Host "[ok] Native host wrapper created: $HostBat"
 
 # --- Native messaging manifest + registry key ---------------------------
 
-$ManifestPath = Join-Path $InstallDir "native-host\claudecodebrowser.json"
+$ManifestPath = Join-Path $InstallDir "native-host\claudecodebrowserx.json"
 
 # Read the extension ID from the manifest rather than repeating it here.
 # Firefox only talks to the native host if this list matches the ID exactly,
@@ -95,8 +106,8 @@ if (-not $ExtId) {
 }
 
 $Manifest = @{
-    name = "claudecodebrowser"
-    description = "ClaudeCodeBrowser Native Messaging Host"
+    name = "claudecodebrowserx"
+    description = "ClaudeCodeBrowserX Native Messaging Host"
     path = $HostBat
     type = "stdio"
     allowed_extensions = @($ExtId)
@@ -104,10 +115,22 @@ $Manifest = @{
 $Manifest | ConvertTo-Json | Set-Content -Path $ManifestPath -Encoding UTF8
 
 # Firefox on Windows finds native hosts through the registry, not a directory.
-$RegKey = "HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowser"
+$RegKey = "HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowserx"
 New-Item -Path $RegKey -Force | Out-Null
 Set-ItemProperty -Path $RegKey -Name "(Default)" -Value $ManifestPath
 Write-Host "[ok] Registry key set: $RegKey -> $ManifestPath"
+
+# An extension from before the rename connects to the old host name until it
+# updates; keep that name pointing at the new host for one release.
+$LegacyRegKey = "HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowser"
+if (Test-Path $LegacyRegKey) {
+    $LegacyManifestPath = Join-Path $InstallDir "native-host\claudecodebrowser.json"
+    $LegacyManifest = $Manifest.Clone()
+    $LegacyManifest.name = "claudecodebrowser"
+    $LegacyManifest | ConvertTo-Json | Set-Content -Path $LegacyManifestPath -Encoding UTF8
+    Set-ItemProperty -Path $LegacyRegKey -Name "(Default)" -Value $LegacyManifestPath
+    Write-Host "[ok] Pre-rename host name points at the new host until the extension updates"
+}
 
 # --- Instructions -------------------------------------------------------
 
@@ -125,7 +148,7 @@ Write-Host "=============================================================="
 Write-Host "Claude Code MCP Configuration:"
 Write-Host "=============================================================="
 Write-Host ""
-Write-Host "  claude mcp add claudecodebrowser -- `"$Python`" `"$InstallDir\mcp-server\stdio_wrapper.py`""
+Write-Host "  claude mcp add claudecodebrowserx -- `"$Python`" `"$InstallDir\mcp-server\stdio_wrapper.py`""
 Write-Host ""
 Write-Host "+--------------------------------------------------------------+"
 Write-Host "|       Installation complete!                                 |"

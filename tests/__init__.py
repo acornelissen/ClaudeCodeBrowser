@@ -5,7 +5,7 @@ code. The modules compute paths from Path.home() at import time, so each test
 file setting its own temp HOME meant whichever imported last won and a lazily
 imported module disagreed with an already-imported one. Doing it in the
 package init makes every module agree, and keeps the real
-~/.claudecodebrowser untouched.
+~/.claudecodebrowserx untouched.
 
 Every CLAUDE_BROWSERX_* variable is cleared for the same reason. Only two were,
 so the suite gave a different answer depending on what the developer happened

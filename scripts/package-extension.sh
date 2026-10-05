@@ -27,17 +27,17 @@ SIGN=0
 # source: a checkout path containing a quote would otherwise break or inject.
 VERSION=$(CCB_SRC="$SRC" python3 -c "import json,os; print(json.load(open(os.environ['CCB_SRC']+'/manifest.json'))['version'])")
 EXT_ID=$(CCB_SRC="$SRC" python3 -c "import json,os; print(json.load(open(os.environ['CCB_SRC']+'/manifest.json'))['browser_specific_settings']['gecko']['id'])")
-XPI="$DIST/claudecodebrowser-${VERSION}.xpi"
+XPI="$DIST/claudecodebrowserx-${VERSION}.xpi"
 
 # Where release assets live. The manifest's update_url points at
 # releases/latest/download/updates.json (a stable URL), and each release's
 # .xpi is downloaded from its versioned tag.
-REPO_SLUG="${CCB_REPO_SLUG:-acornelissen/ClaudeCodeBrowser}"
-XPI_URL="https://github.com/${REPO_SLUG}/releases/download/v${VERSION}/claudecodebrowser-${VERSION}.xpi"
+REPO_SLUG="${CCB_REPO_SLUG:-acornelissen/ClaudeCodeBrowserX}"
+XPI_URL="https://github.com/${REPO_SLUG}/releases/download/v${VERSION}/claudecodebrowserx-${VERSION}.xpi"
 
 mkdir -p "$DIST"
 
-echo "Packaging ClaudeCodeBrowser extension v${VERSION} (${EXT_ID})"
+echo "Packaging ClaudeCodeBrowserX extension v${VERSION} (${EXT_ID})"
 
 
 # Emit the Firefox update manifest. Called only after the artifact exists and

@@ -53,7 +53,7 @@ cat > "$OUT/manifest.json" << EOF
   "version": "$VERSION",
   "description": "Browser automation for Claude Code - EXPERIMENTAL Chrome build; Firefox is the primary target. A fork of ClaudeCodeBrowser, originally created by Andre Watson (Ligandal Inc.).",
   "author": "Albert Cornelissen",
-  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowser",
+  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowserX",
 
   "permissions": [
     "activeTab",
@@ -87,7 +87,7 @@ cat > "$OUT/manifest.json" << EOF
       "32": "icons/icon-32.png",
       "48": "icons/icon-48.png"
     },
-    "default_title": "ClaudeCodeBrowser",
+    "default_title": "ClaudeCodeBrowserX",
     "default_popup": "popup/popup.html"
   },
 
@@ -106,11 +106,11 @@ EOF
 
 # Native messaging manifest template for Chrome (uses allowed_origins with the
 # extension ID, which Chrome assigns when the unpacked extension is loaded)
-cat > "$OUT/claudecodebrowser.chrome.json" << EOF
+cat > "$OUT/claudecodebrowserx.chrome.json" << EOF
 {
-  "name": "claudecodebrowser",
-  "description": "ClaudeCodeBrowser Native Messaging Host",
-  "path": "$HOME/.claudecodebrowser/native-host/claudecodebrowser_host.py",
+  "name": "claudecodebrowserx",
+  "description": "ClaudeCodeBrowserX Native Messaging Host",
+  "path": "$HOME/.claudecodebrowserx/native-host/claudecodebrowserx_host.py",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID/"
@@ -123,10 +123,10 @@ echo "Done. To try it:"
 echo "  1. Open chrome://extensions, enable Developer mode"
 echo "  2. Click 'Load unpacked' and select: $OUT"
 echo "  3. Copy the extension ID Chrome assigns, then edit"
-echo "     $OUT/claudecodebrowser.chrome.json and replace REPLACE_WITH_YOUR_EXTENSION_ID"
+echo "     $OUT/claudecodebrowserx.chrome.json and replace REPLACE_WITH_YOUR_EXTENSION_ID"
 echo "  4. Install the native messaging manifest:"
-echo "       Linux:  ~/.config/google-chrome/NativeMessagingHosts/claudecodebrowser.json"
-echo "       macOS:  ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/claudecodebrowser.json"
+echo "       Linux:  ~/.config/google-chrome/NativeMessagingHosts/claudecodebrowserx.json"
+echo "       macOS:  ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/claudecodebrowserx.json"
 echo "       (create the directory if needed, copy the edited file there)"
 echo ""
 echo "This build is EXPERIMENTAL. Network logging captures metadata and headers"

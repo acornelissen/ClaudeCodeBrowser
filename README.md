@@ -1,7 +1,7 @@
-# ClaudeCodeBrowser
+# ClaudeCodeBrowserX
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Version](https://img.shields.io/badge/version-1.9.7-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowser/releases)
+[![Version](https://img.shields.io/badge/version-1.9.7-blue.svg)](https://github.com/acornelissen/ClaudeCodeBrowserX/releases)
 [![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-FF7139?logo=firefox-browser)](https://addons.mozilla.org/firefox/)
 [![MCP](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-8A2BE2.svg)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org)
@@ -9,8 +9,11 @@
 
 A browser automation system for Claude Code that enables AI-powered interaction with web pages — with **built-in safety guards for humans**. Take screenshots, click elements, type text, navigate pages, and **force refresh browser tabs** when launching development servers. Drive your real Firefox through the extension, or run fully headless (Firefox, Chromium, or WebKit) via Playwright.
 
-The browser extension installs as **ClaudeCodeBrowserX**; the MCP server, native
-messaging host and install directory keep the `claudecodebrowser` name.
+Everything is named ClaudeCodeBrowserX: the extension, the `claudecodebrowserx`
+MCP server and native messaging host, the `~/.claudecodebrowserx` install
+directory and the `CLAUDE_BROWSERX_*` environment variables. Installs from before
+the rename (`claudecodebrowser`, `~/.claudecodebrowser`, `CLAUDE_BROWSER_*`) are
+migrated by the installer; see *Upgrading from ClaudeCodeBrowser* below.
 
 ## Credits
 
@@ -50,7 +53,7 @@ Attended mode drives your real browser with your logged-in sessions. Headless mo
 
 ## Overview
 
-ClaudeCodeBrowser consists of four main components:
+ClaudeCodeBrowserX consists of four main components:
 
 1. **Firefox WebExtension** (*ClaudeCodeBrowserX*) - Runs in the browser to execute automation commands
 2. **Native Messaging Host** - Bridge between the extension and local server
@@ -61,7 +64,7 @@ ClaudeCodeBrowser consists of four main components:
 
 ### Dual-Server Design
 
-ClaudeCodeBrowser uses a **dual-server architecture** for maximum reliability and flexibility:
+ClaudeCodeBrowserX uses a **dual-server architecture** for maximum reliability and flexibility:
 
 | Server | Port | Protocol | Purpose |
 |--------|------|----------|---------|
@@ -113,7 +116,7 @@ In headless mode the server drives Playwright directly and none of steps 2–6 a
 
 ### Native Host
 
-The native messaging host (`claudecodebrowser_host.py`) is how the Firefox
+The native messaging host (`claudecodebrowserx_host.py`) is how the Firefox
 extension reaches the server; the extension makes no HTTP or WebSocket
 connection of its own.
 - Polls the server for commands and relays them to the extension, and posts
@@ -125,7 +128,7 @@ connection of its own.
   the host accepts up to 64 MB, so a large screenshot is fine.
 - Saves the screenshot taken from the context menu's *Take Screenshot for
   Claude*. Screenshots from `browser_screenshot` are saved by the server, at
-  `~/.claudecodebrowser/screenshots/`, created `0700` (override with
+  `~/.claudecodebrowserx/screenshots/`, created `0700` (override with
   `CLAUDE_BROWSERX_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see
   [Screenshot retention](#screenshot-retention)
 - Starts the MCP server when it is not running, and restarts it if it dies.
@@ -160,7 +163,7 @@ way.
 ### Quick Install (Linux and macOS)
 
 ```bash
-cd ClaudeCodeBrowser
+cd ClaudeCodeBrowserX
 ./scripts/install.sh
 ```
 
@@ -169,35 +172,35 @@ cd ClaudeCodeBrowser
 The install script handles these automatically, but if you are installing manually:
 
 - The native messaging manifest goes in `~/Library/Application Support/Mozilla/NativeMessagingHosts/` (not `~/.mozilla/`).
-- The native host must live outside TCC-protected folders (`~/Documents`, `~/Desktop`, `~/Downloads`). Firefox is not allowed to execute anything there and fails with `Operation not permitted`. The default install location `~/.claudecodebrowser` is fine.
+- The native host must live outside TCC-protected folders (`~/Documents`, `~/Desktop`, `~/Downloads`). Firefox is not allowed to execute anything there and fails with `Operation not permitted`. The default install location `~/.claudecodebrowserx` is fine.
 - The manifest should point to a wrapper script with an absolute `python3` path. Firefox launches native hosts with a minimal PATH, so `#!/usr/bin/env python3` may not resolve (e.g. Homebrew installs).
 
 ### Manual Installation
 
 1. **Install the MCP server and agent:**
    ```bash
-   mkdir -p ~/.claudecodebrowser/{native-host,mcp-server,agent,screenshots,logs}
-   cp native-host/* ~/.claudecodebrowser/native-host/
-   cp mcp-server/* ~/.claudecodebrowser/mcp-server/
-   cp agent/* ~/.claudecodebrowser/agent/
-   chmod +x ~/.claudecodebrowser/**/*.py
+   mkdir -p ~/.claudecodebrowserx/{native-host,mcp-server,agent,screenshots,logs}
+   cp native-host/* ~/.claudecodebrowserx/native-host/
+   cp mcp-server/* ~/.claudecodebrowserx/mcp-server/
+   cp agent/* ~/.claudecodebrowserx/agent/
+   chmod +x ~/.claudecodebrowserx/**/*.py
    ```
 
 2. **Install native messaging manifest for Firefox:**
 
-   `native-host/claudecodebrowser.json` ships with a placeholder `path`.
+   `native-host/claudecodebrowserx.json` ships with a placeholder `path`.
    Firefox needs a real absolute path there and does **not** expand `~` or
    `$HOME`, so substitute it while copying:
 
    ```bash
    # Linux
    mkdir -p ~/.mozilla/native-messaging-hosts
-   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowser.json \
-     > ~/.mozilla/native-messaging-hosts/claudecodebrowser.json
+   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowserx.json \
+     > ~/.mozilla/native-messaging-hosts/claudecodebrowserx.json
    # macOS
    mkdir -p ~/Library/Application\ Support/Mozilla/NativeMessagingHosts
-   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowser.json \
-     > ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claudecodebrowser.json
+   sed "s|/ABSOLUTE/PATH/TO/HOME|$HOME|" native-host/claudecodebrowserx.json \
+     > ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claudecodebrowserx.json
    ```
 
    (`scripts/install.sh` writes this file for you, with the path already
@@ -214,16 +217,16 @@ The install script handles these automatically, but if you are installing manual
    Claude Code does not read MCP servers from `settings.json`. Add it for
    every project (stored in `~/.claude.json`):
    ```bash
-   claude mcp add --scope user claudecodebrowser -- \
-       python3 ~/.claudecodebrowser/mcp-server/stdio_wrapper.py
+   claude mcp add --scope user claudecodebrowserx -- \
+       python3 ~/.claudecodebrowserx/mcp-server/stdio_wrapper.py
    ```
    Or for one project, in that project's `.mcp.json`:
    ```json
    {
      "mcpServers": {
-       "claudecodebrowser": {
+       "claudecodebrowserx": {
          "command": "python3",
-         "args": ["${HOME}/.claudecodebrowser/mcp-server/stdio_wrapper.py"]
+         "args": ["${HOME}/.claudecodebrowserx/mcp-server/stdio_wrapper.py"]
        }
      }
    }
@@ -237,7 +240,7 @@ The install script handles these automatically, but if you are installing manual
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-This copies the components to `%USERPROFILE%\.claudecodebrowser`, generates the
+This copies the components to `%USERPROFILE%\.claudecodebrowserx`, generates the
 `.bat` native-host wrapper with your Python path baked in, writes the native
 messaging manifest, and registers it in the Windows registry. Then load the
 extension (step 1 below) and add the printed MCP config to Claude Code.
@@ -251,35 +254,59 @@ extension (step 1 below) and add the printed MCP config to Claude Code.
    - Select `extension/manifest.json`
 
 2. **Register the native messaging host:**
-   Update the path in `native-host/claudecodebrowser.json` to point to the `.bat` wrapper:
+   Update the path in `native-host/claudecodebrowserx.json` to point to the `.bat` wrapper:
    ```json
    {
-     "path": "C:\\path\\to\\ClaudeCodeBrowser\\native-host\\claudecodebrowser_host.bat"
+     "path": "C:\\path\\to\\ClaudeCodeBrowserX\\native-host\\claudecodebrowserx_host.bat"
    }
    ```
    Then register it in the Registry:
    ```powershell
-   New-Item -Path 'HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowser' -Force | Out-Null
-   Set-ItemProperty -Path 'HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowser' -Name '(Default)' -Value 'C:\path\to\ClaudeCodeBrowser\native-host\claudecodebrowser.json'
+   New-Item -Path 'HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowserx' -Force | Out-Null
+   Set-ItemProperty -Path 'HKCU:\Software\Mozilla\NativeMessagingHosts\claudecodebrowserx' -Name '(Default)' -Value 'C:\path\to\ClaudeCodeBrowserX\native-host\claudecodebrowserx.json'
    ```
 
 3. **Configure Claude Code MCP:**
    Claude Code does not read MCP servers from `settings.json`. Add it for
    every project (stored in `%USERPROFILE%\.claude.json`):
    ```powershell
-   claude mcp add --scope user claudecodebrowser -- python C:/path/to/ClaudeCodeBrowser/mcp-server/stdio_wrapper.py
+   claude mcp add --scope user claudecodebrowserx -- python C:/path/to/ClaudeCodeBrowserX/mcp-server/stdio_wrapper.py
    ```
    Or for one project, in that project's `.mcp.json`:
    ```json
    {
      "mcpServers": {
-       "claudecodebrowser": {
+       "claudecodebrowserx": {
          "command": "python",
-         "args": ["C:/path/to/ClaudeCodeBrowser/mcp-server/stdio_wrapper.py"]
+         "args": ["C:/path/to/ClaudeCodeBrowserX/mcp-server/stdio_wrapper.py"]
        }
      }
    }
    ```
+
+## Upgrading from ClaudeCodeBrowser
+
+From 2.0.0 everything is named ClaudeCodeBrowserX. To upgrade an existing
+install:
+
+1. Pull the repository and run `./scripts/install.sh` (or `install.ps1`). It
+   moves `~/.claudecodebrowser` to `~/.claudecodebrowserx` - your
+   `safety.json`, API token, logs and screenshots come with it - and keeps the
+   old native messaging host name pointing at the new host until the
+   extension has updated.
+2. Re-register the MCP server under its new name:
+   ```bash
+   claude mcp remove claudecodebrowser
+   claude mcp add --scope user claudecodebrowserx -- \
+       python3 ~/.claudecodebrowserx/mcp-server/stdio_wrapper.py
+   ```
+   The tools are then `mcp__claudecodebrowserx__*`, so update any permission
+   rules or notes that name `mcp__claudecodebrowser__*`.
+3. Rename `CLAUDE_BROWSER_*` environment variables to `CLAUDE_BROWSERX_*`. The
+   old names still work in 2.0.x, with a warning in the server log, and stop
+   working in the next release.
+4. Let the extension update (`about:addons` > gear > Check for Updates), then
+   restart Firefox.
 
 ## Updating the Firefox Extension
 
@@ -293,7 +320,7 @@ auto-update — see below):
 
 ```bash
 # Linux / macOS
-./scripts/package-extension.sh          # dist/claudecodebrowser-<version>.xpi
+./scripts/package-extension.sh          # dist/claudecodebrowserx-<version>.xpi
 ./scripts/package-extension.sh --sign   # signed via AMO (see below)
 ```
 
@@ -368,7 +395,7 @@ Mozilla without a public listing:
 > `claudecodebrowser@ligandal.com`: AMO rejects a submission under an ID
 > registered to a different account. If you fork this in turn you will need
 > your own ID again — change `browser_specific_settings.gecko.id` and
-> `allowed_extensions` in `native-host/claudecodebrowser.json`. Both
+> `allowed_extensions` in `native-host/claudecodebrowserx.json`. Both
 > installers read the ID from the manifest, so there is nothing else to edit,
 > and `tests/test_extension_identity.py` checks the two agree. Get it wrong
 > and native messaging fails silently.
@@ -376,7 +403,7 @@ Mozilla without a public listing:
 **Auto-update is already wired** to GitHub Releases. The manifest carries:
 
 ```json
-"update_url": "https://github.com/acornelissen/ClaudeCodeBrowser/releases/latest/download/updates.json"
+"update_url": "https://github.com/acornelissen/ClaudeCodeBrowserX/releases/latest/download/updates.json"
 ```
 
 That's a stable URL — it always resolves to the newest release's
@@ -385,7 +412,7 @@ pointing at the matching versioned `.xpi`. So each new plugin version is just:
 
 1. Bump `version` in `extension/manifest.json`.
 2. `./scripts/package-extension.sh --sign` (or the `.ps1` on Windows) — writes
-   the signed `claudecodebrowser-<version>.xpi` **and** `updates.json` into
+   the signed `claudecodebrowserx-<version>.xpi` **and** `updates.json` into
    `dist/`.
 3. Publish the release with both assets — one command:
    ```bash
@@ -402,20 +429,20 @@ pointing at the matching versioned `.xpi`. So each new plugin version is just:
    ```bash
    VER=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
    gh release create "v$VER" \
-     "dist/claudecodebrowser-$VER.xpi" "dist/updates.json" \
-     --title "v$VER" --notes "ClaudeCodeBrowser v$VER"
+     "dist/claudecodebrowserx-$VER.xpi" "dist/updates.json" \
+     --title "v$VER" --notes "ClaudeCodeBrowserX v$VER"
    ```
 
    With `curl` (set `GITHUB_TOKEN`):
    ```bash
    VER=$(python3 -c "import json;print(json.load(open('extension/manifest.json'))['version'])")
-   REPO=acornelissen/ClaudeCodeBrowser
+   REPO=acornelissen/ClaudeCodeBrowserX
    ID=$(curl -sS -X POST "https://api.github.com/repos/$REPO/releases" \
      -H "Authorization: Bearer $GITHUB_TOKEN" \
      -d "{\"tag_name\":\"v$VER\",\"name\":\"v$VER\"}" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
-   curl -sS -X POST "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=claudecodebrowser-$VER.xpi" \
+   curl -sS -X POST "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=claudecodebrowserx-$VER.xpi" \
      -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/octet-stream" \
-     --data-binary @"dist/claudecodebrowser-$VER.xpi"
+     --data-binary @"dist/claudecodebrowserx-$VER.xpi"
    curl -sS -X POST "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=updates.json" \
      -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" \
      --data-binary @"dist/updates.json"
@@ -447,12 +474,12 @@ version is reviewed.
 ### Starting the MCP Server
 
 ```bash
-~/.claudecodebrowser/start-server.sh
+~/.claudecodebrowserx/start-server.sh
 ```
 
 Or directly:
 ```bash
-python3 ~/.claudecodebrowser/mcp-server/stdio_wrapper.py
+python3 ~/.claudecodebrowserx/mcp-server/stdio_wrapper.py
 ```
 
 The server runs on:
@@ -528,7 +555,7 @@ is refused.
 
 #### Interactive Mode
 ```bash
-python3 ~/.claudecodebrowser/agent/browser_agent.py -i
+python3 ~/.claudecodebrowserx/agent/browser_agent.py -i
 ```
 
 #### Command Line
@@ -566,7 +593,7 @@ agent.type_text("Hello, World!", selector="#search-input")
 
 # Fill a form. Note: password fields are refused by default - use the
 # browser's own password manager for credentials, or set
-# "allow_password_typing": true in ~/.claudecodebrowser/safety.json.
+# "allow_password_typing": true in ~/.claudecodebrowserx/safety.json.
 agent.fill_form({
     "username": "myuser",
     "email": "myuser@example.com"
@@ -705,7 +732,7 @@ agent.call_tool("browser_stop_logging")
 > result does not mean the page logged nothing; the result says so with
 > `capturesPageConsole: false`.
 
-> **Logs on disk.** `~/.claudecodebrowser/logs/` holds `mcp_server.log`,
+> **Logs on disk.** `~/.claudecodebrowserx/logs/` holds `mcp_server.log`,
 > `native_host.log` and the guard's `audit.jsonl`, all created `0600` in a
 > `0700` directory. `mcp_server.log` and `audit.jsonl` rotate at 5 MB;
 > `native_host.log` is rotated only when the host starts and finds it over
@@ -886,7 +913,7 @@ lowering with `delay_capped`; Firefox lowers it without saying so.
 | `/browser/response` | POST | Receive browser response (posted by the native host) |
 
 Every endpoint except `/health` requires the `X-API-Key` header, holding the
-token from `~/.claudecodebrowser/api_token`; without it the server answers
+token from `~/.claudecodebrowserx/api_token`; without it the server answers
 `403`.
 
 ### Example API Calls
@@ -895,7 +922,7 @@ token from `~/.claudecodebrowser/api_token`; without it the server answers
 # Health check
 curl http://localhost:8765/health
 
-KEY="X-API-Key: $(cat ~/.claudecodebrowser/api_token)"
+KEY="X-API-Key: $(cat ~/.claudecodebrowserx/api_token)"
 
 # List tools
 curl -H "$KEY" http://localhost:8765/mcp/tools
@@ -915,11 +942,11 @@ curl -X POST http://localhost:8765/mcp/call \
 
 | Path | Description |
 |------|-------------|
-| `~/.claudecodebrowser/` | Main installation directory |
-| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`, each file `0600`; override with `CLAUDE_BROWSERX_SCREENSHOTS_DIR`). Pruned after 7 days / 500 files — see [Screenshot retention](#screenshot-retention) |
-| `~/.claudecodebrowser/logs/` | Log files, including the safety guard's `audit.jsonl` |
-| `~/.claudecodebrowser/api_token` | HTTP/WebSocket API token (`0600`, generated on first run) |
-| `~/.claudecodebrowser/safety.json` | Safety guard configuration (written with defaults on first run) |
+| `~/.claudecodebrowserx/` | Main installation directory |
+| `~/.claudecodebrowserx/screenshots/` | Saved screenshots (`0700`, each file `0600`; override with `CLAUDE_BROWSERX_SCREENSHOTS_DIR`). Pruned after 7 days / 500 files — see [Screenshot retention](#screenshot-retention) |
+| `~/.claudecodebrowserx/logs/` | Log files, including the safety guard's `audit.jsonl` |
+| `~/.claudecodebrowserx/api_token` | HTTP/WebSocket API token (`0600`, generated on first run) |
+| `~/.claudecodebrowserx/safety.json` | Safety guard configuration (written with defaults on first run) |
 | `~/.mozilla/native-messaging-hosts/` | Firefox native messaging manifests (Linux) |
 | `~/Library/Application Support/Mozilla/NativeMessagingHosts/` | Firefox native messaging manifests (macOS) |
 | `mise.local.toml` | Local-only AMO signing credentials (gitignored) |
@@ -987,17 +1014,17 @@ after the session.
   reloaded — see [Updating the Firefox Extension](#updating-the-firefox-extension)
 
 ### Native messaging not working
-- Check that the path in `claudecodebrowser.json` is correct
+- Check that the path in `claudecodebrowserx.json` is correct
 - Ensure the host script is executable
-- Check `~/.claudecodebrowser/logs/native_host.log`
+- Check `~/.claudecodebrowserx/logs/native_host.log`
 
 ### Server connection issues
 - Verify the server is running: `curl http://localhost:8765/health`
-- Check `~/.claudecodebrowser/logs/mcp_server.log`
+- Check `~/.claudecodebrowserx/logs/mcp_server.log`
 - Ensure no firewall is blocking local connections
 
 ### Screenshots not saving
-- Check write permissions for `~/.claudecodebrowser/screenshots/`
+- Check write permissions for `~/.claudecodebrowserx/screenshots/`
 - Verify the browser has the page fully loaded
 
 ## Development
@@ -1022,7 +1049,7 @@ Tooling is pinned with [mise](https://mise.jdx.dev) (Python, Node and
 ### Extension debugging
 - Open Firefox Developer Tools (F12)
 - Go to the Console tab
-- Filter by "ClaudeCodeBrowser"
+- Filter by "ClaudeCodeBrowserX"
 
 ### Tests
 
@@ -1102,7 +1129,7 @@ this tool is the evidence-gathering step.
 Every tool call passes through a safety guard before it reaches the browser.
 The guard is designed to keep an automated agent from doing things the human
 operating it would not expect, while staying out of the way for normal
-development workflows. Policy lives in `~/.claudecodebrowser/safety.json`
+development workflows. Policy lives in `~/.claudecodebrowserx/safety.json`
 (created with safe defaults on first run) and can be inspected at runtime with
 the `browser_safety_status` tool.
 
@@ -1137,7 +1164,7 @@ the `browser_safety_status` tool.
 | **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSERX_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
 | **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSERX_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, `browser_inject_observer` and `browser_audit_page` entirely. `browser_audit_page` only observes, but it does so by running a fixed script in the page, so the toggle covers it; `browser_safety_status` lists every tool it covers as `script_tools`. |
 | **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
-| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords, pressed keys, URL patterns) redacted at any depth and URLs reduced to scheme, host and path. Nothing is written while `"enabled": false`. |
+| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowserx/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords, pressed keys, URL patterns) redacted at any depth and URLs reduced to scheme, host and path. Nothing is written while `"enabled": false`. |
 
 ### Example `safety.json`
 
@@ -1174,7 +1201,7 @@ never changed.
 
 ### Credentials and 2FA: what this project deliberately does NOT do
 
-- **No password vault.** ClaudeCodeBrowser never stores credentials, and by
+- **No password vault.** ClaudeCodeBrowserX never stores credentials, and by
   default refuses to type into password fields. Use the browser's own
   password manager (Firefox autofill, Bitwarden, 1Password, ...): you click
   the autofill yourself, and the secret never passes through the AI, its
@@ -1211,7 +1238,7 @@ so you can complete the challenge.
 
 ## Pairs Well With
 
-ClaudeCodeBrowser is the *browser hands* of a Claude Code setup. For
+ClaudeCodeBrowserX is the *browser hands* of a Claude Code setup. For
 secretary-style workflows, combine it with purpose-built MCP connectors
 rather than screen-driving web apps: Gmail/Calendar MCP connectors handle
 email triage and scheduling far more reliably than clicking through webmail,
@@ -1237,21 +1264,21 @@ on its own the next time Firefox restarts — or click **Remove** on the
 ./scripts/uninstall.sh
 ```
 
-This removes the native messaging manifest, the `~/.claudecodebrowser`
+This removes the native messaging manifest, the `~/.claudecodebrowserx`
 install directory, and its own symlinks in `~/bin`. If there are saved
 screenshots it asks first, and can keep a copy in
-`~/claudecodebrowser-screenshots`. If you registered the MCP server with
+`~/claudecodebrowserx-screenshots`. If you registered the MCP server with
 Claude Code, also run:
 
 ```bash
-claude mcp remove claudecodebrowser
+claude mcp remove claudecodebrowserx
 ```
 
 ## Security Considerations
 
 - The server only binds to localhost (127.0.0.1) by default
 - All HTTP endpoints except `/health` require the `X-API-Key` token
-  (auto-generated at `~/.claudecodebrowser/api_token`, mode 0600)
+  (auto-generated at `~/.claudecodebrowserx/api_token`, mode 0600)
 - The WebSocket control channel requires the same token as its first frame,
   so no other local process can register as the browser or forge responses
 - No CORS headers are sent, so web pages cannot reach the API from the browser
@@ -1261,7 +1288,7 @@ claude mcp remove claudecodebrowser
 - A configurable safety guard (see [Safety Guards](#safety-guards)) enforces
   URL restrictions, protected-site confirmation, read-only mode, rate
   limiting, and audit logging
-- Screenshots are stored under `~/.claudecodebrowser/screenshots` with `0700`
+- Screenshots are stored under `~/.claudecodebrowserx/screenshots` with `0700`
   permissions, not in a world-readable shared `/tmp`
 - Password fields are protected in both directions: neither typed into nor
   read back without an explicit opt-in

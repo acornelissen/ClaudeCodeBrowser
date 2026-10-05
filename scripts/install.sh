@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# ClaudeCodeBrowser Installation Script
+# ClaudeCodeBrowserX Installation Script
 #
-# This script installs the ClaudeCodeBrowser components:
+# This script installs the ClaudeCodeBrowserX components:
 # - Firefox extension
 # - Native messaging host
 # - MCP server
@@ -40,7 +40,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="$HOME/.claudecodebrowser"
+INSTALL_DIR="$HOME/.claudecodebrowserx"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
@@ -51,7 +51,7 @@ fi
 
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║       ClaudeCodeBrowser Installation Script                  ║"
+echo "║       ClaudeCodeBrowserX Installation Script                  ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -76,6 +76,19 @@ else
     echo -e "${YELLOW}⚠ Firefox not found${NC}"
 fi
 
+# Upgrading from before the rename: ~/.claudecodebrowser held safety.json,
+# the API token, logs and screenshots. Move it once rather than start fresh,
+# which would silently drop the user's safety policy.
+LEGACY_INSTALL_DIR="$HOME/.claudecodebrowser"
+if [ -d "$LEGACY_INSTALL_DIR" ] && [ ! -L "$LEGACY_INSTALL_DIR" ]; then
+    if [ ! -e "$INSTALL_DIR" ]; then
+        mv "$LEGACY_INSTALL_DIR" "$INSTALL_DIR"
+        echo -e "${GREEN}✓ Moved $LEGACY_INSTALL_DIR to $INSTALL_DIR (config, token, logs kept)${NC}"
+    else
+        echo -e "${YELLOW}⚠ Both $LEGACY_INSTALL_DIR and $INSTALL_DIR exist; using the new one and leaving the old one alone${NC}"
+    fi
+fi
+
 # Create installation directory
 echo -e "\n${YELLOW}Creating installation directory...${NC}"
 mkdir -p "$INSTALL_DIR"/{native-host,mcp-server,agent,screenshots,logs}
@@ -85,8 +98,8 @@ echo -e "${GREEN}✓ Created $INSTALL_DIR${NC}"
 echo -e "\n${YELLOW}Installing components...${NC}"
 
 # Copy native host
-cp "$SCRIPT_DIR/native-host/claudecodebrowser_host.py" "$INSTALL_DIR/native-host/"
-chmod +x "$INSTALL_DIR/native-host/claudecodebrowser_host.py"
+cp "$SCRIPT_DIR/native-host/claudecodebrowserx_host.py" "$INSTALL_DIR/native-host/"
+chmod +x "$INSTALL_DIR/native-host/claudecodebrowserx_host.py"
 echo -e "${GREEN}✓ Native messaging host installed${NC}"
 
 # Copy MCP server
@@ -109,7 +122,7 @@ echo -e "${GREEN}✓ Browser agent installed${NC}"
 echo -e "\n${YELLOW}Installing Firefox native messaging manifest...${NC}"
 mkdir -p "$FIREFOX_NATIVE_MANIFESTS_DIR"
 
-NATIVE_HOST_PATH="$INSTALL_DIR/native-host/claudecodebrowser_host.py"
+NATIVE_HOST_PATH="$INSTALL_DIR/native-host/claudecodebrowserx_host.py"
 if [ "$OS" = "Darwin" ]; then
     # Firefox on macOS launches native hosts with a minimal PATH (launchd's),
     # so "#!/usr/bin/env python3" may not resolve (e.g. Homebrew installs).
@@ -124,7 +137,7 @@ if [ "$OS" = "Darwin" ]; then
     fi
     cat > "$INSTALL_DIR/native-host/run_host.sh" << WRAPEOF
 #!/bin/bash
-exec "$PYTHON_BIN" "$INSTALL_DIR/native-host/claudecodebrowser_host.py"
+exec "$PYTHON_BIN" "$INSTALL_DIR/native-host/claudecodebrowserx_host.py"
 WRAPEOF
     chmod +x "$INSTALL_DIR/native-host/run_host.sh"
     NATIVE_HOST_PATH="$INSTALL_DIR/native-host/run_host.sh"
@@ -139,10 +152,10 @@ if [ -z "$EXT_ID" ]; then
     exit 1
 fi
 
-cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" << EOF
+cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowserx.json" << EOF
 {
-  "name": "claudecodebrowser",
-  "description": "ClaudeCodeBrowser Native Messaging Host",
+  "name": "claudecodebrowserx",
+  "description": "ClaudeCodeBrowserX Native Messaging Host",
   "path": "$NATIVE_HOST_PATH",
   "type": "stdio",
   "allowed_extensions": [
@@ -151,6 +164,25 @@ cat > "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" << EOF
 }
 EOF
 echo -e "${GREEN}✓ Firefox native messaging manifest installed (extension $EXT_ID)${NC}"
+
+# An extension from before the rename connects to the old host name until it
+# updates. Point that name at the new host too, for one release, so the
+# browser does not lose its bridge in between; uninstall removes both.
+LEGACY_MANIFEST="$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json"
+if [ -f "$LEGACY_MANIFEST" ]; then
+    cat > "$LEGACY_MANIFEST" << EOF
+{
+  "name": "claudecodebrowser",
+  "description": "ClaudeCodeBrowserX Native Messaging Host (pre-rename name)",
+  "path": "$NATIVE_HOST_PATH",
+  "type": "stdio",
+  "allowed_extensions": [
+    "$EXT_ID"
+  ]
+}
+EOF
+    echo -e "${GREEN}✓ Pre-rename host name still points at the new host until the extension updates${NC}"
+fi
 
 # Create convenience scripts
 echo -e "\n${YELLOW}Creating convenience scripts...${NC}"
@@ -175,9 +207,9 @@ if [ -d "$HOME/bin" ]; then
     # browser-agent is a generic name and ln -sf replaces a regular file, so
     # this used to destroy a user's own script with no warning (and uninstall
     # only reverses it when it is still our symlink).
-    for link in claudecodebrowser-server browser-agent; do
+    for link in claudecodebrowserx-server browser-agent; do
         target="$INSTALL_DIR/browser-agent"
-        [ "$link" = "claudecodebrowser-server" ] && target="$INSTALL_DIR/start-server.sh"
+        [ "$link" = "claudecodebrowserx-server" ] && target="$INSTALL_DIR/start-server.sh"
         if [ -e "$HOME/bin/$link" ] && [ ! -L "$HOME/bin/$link" ]; then
             echo -e "${YELLOW}⚠ ~/bin/$link exists and is not a symlink; leaving it alone${NC}"
             continue
@@ -215,7 +247,7 @@ if [ "$HEADLESS" = "1" ]; then
     if python3 -m pip install --user "playwright==${PLAYWRIGHT_VERSION}" \
             && python3 -m playwright install chromium; then
         echo -e "${GREEN}✓ Playwright and Chromium installed${NC}"
-        echo "  To run headless, add to the claudecodebrowser server's env:"
+        echo "  To run headless, add to the claudecodebrowserx server's env:"
         echo '    "CLAUDE_BROWSERX_HEADLESS": "1", "CLAUDE_BROWSERX_ENGINE": "chromium"'
     else
         echo -e "${RED}✗ Could not install Playwright; headless mode will not start${NC}"
@@ -256,7 +288,10 @@ echo -e "${BLUE}═════════════════════�
 echo ""
 echo "Register the server with Claude Code (all projects; stored in ~/.claude.json):"
 echo ""
-echo "  claude mcp add --scope user claudecodebrowser -- python3 $INSTALL_DIR/mcp-server/stdio_wrapper.py"
+echo "  claude mcp add --scope user claudecodebrowserx -- python3 $INSTALL_DIR/mcp-server/stdio_wrapper.py"
+echo ""
+echo "Upgrading from before the rename? Remove the old registration as well:"
+echo "  claude mcp remove claudecodebrowser"
 echo ""
 echo "Claude Code does not read MCP servers from settings.json."
 echo ""

@@ -1,5 +1,5 @@
 /**
- * ClaudeCodeBrowser - Content Script
+ * ClaudeCodeBrowserX - Content Script
  * Runs in web pages to handle DOM interactions, clicks, typing, and element inspection
  *
  * MIT License
@@ -11,8 +11,8 @@
   'use strict';
 
   // Prevent multiple injections
-  if (window.__claudeCodeBrowserInjected) return;
-  window.__claudeCodeBrowserInjected = true;
+  if (window.__claudeCodeBrowserXInjected) return;
+  window.__claudeCodeBrowserXInjected = true;
 
   let highlightOverlay = null;
   let inspectorMode = false;
@@ -422,7 +422,7 @@
       throw new Error(
         'Refused: target is a password field. Use the browser’s own ' +
         'password manager (autofill) for credentials, or set ' +
-        '"allow_password_typing": true in ~/.claudecodebrowser/safety.json ' +
+        '"allow_password_typing": true in ~/.claudecodebrowserx/safety.json ' +
         'if you really want automated password entry.'
       );
     }
@@ -465,7 +465,7 @@
   function onHumanClick(element, handler) {
     element.addEventListener('click', (event) => {
       if (!event.isTrusted) {
-        console.warn('[ClaudeCodeBrowser] ignoring untrusted click on prompt');
+        console.warn('[ClaudeCodeBrowserX] ignoring untrusted click on prompt');
         return;
       }
       handler();
@@ -1648,7 +1648,7 @@
         masked: true,
         note: 'Credential field value withheld (password, one-time code, card ' +
               'or hidden field). Set "allow_password_typing": true in ' +
-              '~/.claudecodebrowser/safety.json to read credentials through the agent.',
+              '~/.claudecodebrowserx/safety.json to read credentials through the agent.',
         element: getElementInfo(element)
       };
     }
@@ -1798,7 +1798,7 @@
         value: element.getAttribute(attribute) ? '***' : null,
         masked: true,
         note: 'Credential field value withheld. See allow_password_typing in ' +
-              '~/.claudecodebrowser/safety.json.',
+              '~/.claudecodebrowserx/safety.json.',
         element: getElementInfo(element)
       };
     }
@@ -1890,7 +1890,7 @@
         text: '***',
         masked: true,
         note: 'Credential field text withheld. Use browser_get_value with ' +
-              '"allow_password_typing": true in ~/.claudecodebrowser/safety.json ' +
+              '"allow_password_typing": true in ~/.claudecodebrowserx/safety.json ' +
               'to read credentials through the agent.',
         url: window.location.href,
         title: document.title
@@ -2176,5 +2176,5 @@
     return '/' + parts.join('/');
   }
 
-  console.log('[ClaudeCodeBrowser] Content script loaded');
+  console.log('[ClaudeCodeBrowserX] Content script loaded');
 })();

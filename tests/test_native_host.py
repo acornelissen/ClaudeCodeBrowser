@@ -32,7 +32,7 @@ from tests import TEST_HOME  # noqa: F401  (redirects HOME before the import bel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'native-host'))
 
-import claudecodebrowser_host as host  # noqa: E402
+import claudecodebrowserx_host as host  # noqa: E402
 
 
 class ProcessOwnershipTests(unittest.TestCase):
@@ -46,18 +46,18 @@ class ProcessOwnershipTests(unittest.TestCase):
 
     def test_our_own_server_is_ours_to_kill(self):
         for command in (
-            '/usr/bin/python3 /Users/someone/.claudecodebrowser/mcp-server/server.py',
-            'python3 /Users/someone/.claudecodebrowser/mcp-server/server.py',
-            'python3.12 /Users/someone/.claudecodebrowser/mcp-server/server.py',
-            '/opt/x/bin/python3 -u /Users/someone/.claudecodebrowser/mcp-server/server.py',
-            'python3 /Users/someone/.claudecodebrowser/mcp-server/server.py --headless',
+            '/usr/bin/python3 /Users/someone/.claudecodebrowserx/mcp-server/server.py',
+            'python3 /Users/someone/.claudecodebrowserx/mcp-server/server.py',
+            'python3.12 /Users/someone/.claudecodebrowserx/mcp-server/server.py',
+            '/opt/x/bin/python3 -u /Users/someone/.claudecodebrowserx/mcp-server/server.py',
+            'python3 /Users/someone/.claudecodebrowserx/mcp-server/server.py --headless',
         ):
             with self.subTest(command=command):
                 self._with_command(command)
                 self.assertTrue(host._is_our_server(1234), command)
 
     def test_server_started_from_a_checkout_is_ours_to_kill(self):
-        self._with_command('python3 /Users/someone/src/ClaudeCodeBrowser/mcp-server/server.py')
+        self._with_command('python3 /Users/someone/src/ClaudeCodeBrowserX/mcp-server/server.py')
         self.assertTrue(host._is_our_server(1234))
 
     def test_unrelated_services_are_not_ours_to_kill(self):
@@ -71,8 +71,8 @@ class ProcessOwnershipTests(unittest.TestCase):
             # substring test killed the first three; requiring the marker to
             # be an argument still killed them, because the path IS their
             # argument. Only an interpreter running it counts.
-            'vim /Users/someone/src/ClaudeCodeBrowser/mcp-server/server.py',
-            'tail -f /Users/someone/.claudecodebrowser/mcp-server/server.py',
+            'vim /Users/someone/src/ClaudeCodeBrowserX/mcp-server/server.py',
+            'tail -f /Users/someone/.claudecodebrowserx/mcp-server/server.py',
             'node esbuild.js --watch src mcp-server/server.py',
             'grep -r pattern mcp-server/server.py',
             'python3 -m http.server 8765 # mcp-server/server.py',
@@ -112,7 +112,7 @@ class KillTargetSelectionTests(unittest.TestCase):
     def test_only_our_server_processes_are_terminated(self):
         host._pids_on_port = lambda port: [111, 222]
         commands = {
-            111: 'python3 /home/someone/.claudecodebrowser/mcp-server/server.py',
+            111: 'python3 /home/someone/.claudecodebrowserx/mcp-server/server.py',
             222: '/usr/local/bin/node /home/someone/work/api/index.js',
         }
         host._process_command = lambda pid: commands[pid]
@@ -248,7 +248,7 @@ class ServerIdentityTests(unittest.TestCase):
 
 class DescribeMessageTests(unittest.TestCase):
     """Every message is logged both ways through describe_message, into a
-    file under ~/.claudecodebrowser. A command carries typed text and a
+    file under ~/.claudecodebrowserx. A command carries typed text and a
     response carries page text or a screenshot, so the summary may say what
     a message is and how big, never what it holds."""
 
@@ -566,7 +566,7 @@ class ScreenshotRetentionTests(unittest.TestCase):
         with unittest.mock.patch.object(Path, 'home',
                                         return_value=Path(self.tmp.name)):
             self.assertTrue(self._save()['success'])
-        default = Path(self.tmp.name) / '.claudecodebrowser' / 'screenshots'
+        default = Path(self.tmp.name) / '.claudecodebrowserx' / 'screenshots'
         self.assertTrue((default / self.MARKER).is_file())
         self.assertEqual(default.stat().st_mode & 0o077, 0)
 
@@ -716,7 +716,7 @@ class ChildReapingTests(unittest.TestCase):
         self.assertTrue(appended.wait(1), 'the appending thread never ran')
         self.assertEqual(host._spawned_children, [late])
 
-    # Regression test. Was: claudecodebrowser_host.py:580 - the list is
+    # Regression test. Was: claudecodebrowserx_host.py:580 - the list is
     # guarded by a plain threading.Lock, and the comment above it says the
     # list is touched "from the signal handler (through shutdown)". Python
     # runs signal handlers on the main thread, so a SIGTERM landing while
@@ -929,7 +929,7 @@ class FramingTests(unittest.TestCase):
         with self.assertRaises(host.MessageDecodeError):
             host.read_message(io.BytesIO(framed(b'\xff\xfe')))
 
-    # Regression test. Was: claudecodebrowser_host.py:234 - read_message
+    # Regression test. Was: claudecodebrowserx_host.py:234 - read_message
     # returned whatever json.loads produced without checking it is an
     # object. A frame of `5`, `"hi"` or `[1,2,3]` is valid JSON, so it came
     # straight back and reached message.get() in main() as an
@@ -985,7 +985,7 @@ class SendMessageTests(unittest.TestCase):
         self.assertNotIn('xxxx', sent['error'],
                          'the dropped payload must not be echoed back')
 
-    # Regression test. Was: claudecodebrowser_host.py:246-266 - the
+    # Regression test. Was: claudecodebrowserx_host.py:246-266 - the
     # replacement copies requestId verbatim and is never re-measured, so an
     # oversized requestId produced an oversized replacement. Firefox drops
     # that one too AND tears the port down, which is the exact outcome the

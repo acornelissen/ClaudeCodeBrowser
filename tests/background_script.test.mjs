@@ -2320,7 +2320,7 @@ test('the screenshot menu item posts an action the native host handles', async (
   // message fell through to the /browser/command endpoint and the menu item
   // did nothing at all. The host's only screenshot handler is
   // "saveScreenshot" - see handle_local_command in
-  // native-host/claudecodebrowser_host.py.
+  // native-host/claudecodebrowserx_host.py.
   const ctx = loadBackground();
 
   await ctx.clickMenuItem('claude-screenshot');

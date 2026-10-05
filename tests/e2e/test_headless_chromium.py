@@ -72,7 +72,7 @@ INSTALL_HINT = ('python3 -m pip install playwright==1.63.0 && '
                 'python3 -m playwright install chromium')
 
 # Refusals are logged at error level and these tests provoke them on purpose.
-logging.getLogger('ClaudeCodeBrowser.Headless').setLevel(logging.CRITICAL)
+logging.getLogger('ClaudeCodeBrowserX.Headless').setLevel(logging.CRITICAL)
 
 
 def serve_fixtures():

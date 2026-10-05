@@ -1,5 +1,5 @@
 /**
- * ClaudeCodeBrowser - Background Script
+ * ClaudeCodeBrowserX - Background Script
  * Handles native messaging, tab management, and coordination with content scripts
  *
  * MIT License
@@ -7,7 +7,7 @@
  * Author: dre@ligandal.com
  */
 
-const NATIVE_HOST_NAME = "claudecodebrowser";
+const NATIVE_HOST_NAME = "claudecodebrowserx";
 let nativePort = null;
 let isConnected = false;
 
@@ -733,7 +733,7 @@ const onHeadersReceivedListener = (details) => {
   } catch (e) {
     // This listener is registered as "blocking"; an exception escaping it
     // must never be able to interfere with the response.
-    console.error("[ClaudeCodeBrowser] header capture failed:", e);
+    console.error("[ClaudeCodeBrowserX] header capture failed:", e);
   }
 };
 
@@ -966,7 +966,7 @@ function attachWebRequestListeners() {
     webRequestListenersAttached = true;
     return { attached: true };
   } catch (e) {
-    console.error("[ClaudeCodeBrowser] Could not attach webRequest listeners:", e);
+    console.error("[ClaudeCodeBrowserX] Could not attach webRequest listeners:", e);
     return { attached: false, error: e.message };
   }
 }
@@ -981,7 +981,7 @@ function detachWebRequestListeners() {
     browser.webRequest.onCompleted.removeListener(onCompletedListener);
     browser.webRequest.onErrorOccurred.removeListener(onErrorOccurredListener);
   } catch (e) {
-    console.error("[ClaudeCodeBrowser] Could not detach webRequest listeners:", e);
+    console.error("[ClaudeCodeBrowserX] Could not detach webRequest listeners:", e);
   }
   webRequestListenersAttached = false;
   pendingNetworkRequests.clear();
@@ -1133,7 +1133,7 @@ if (browser.webNavigation && browser.webNavigation.onCommitted) {
     // not started for is the failure that matters, so unknown fails closed.
     if (startedOn && now && startedOn === now) return;
 
-    console.warn(`[ClaudeCodeBrowser] stopping capture on tab ${details.tabId}: ` +
+    console.warn(`[ClaudeCodeBrowserX] stopping capture on tab ${details.tabId}: ` +
                  `navigated from ${startedOn} to ${now}`);
     stopNetworkLogging(details.tabId);
     loggedOrigins.delete(details.tabId);
@@ -1163,21 +1163,21 @@ function getReconnectDelay() {
 // Connect to native messaging host
 function connectNativeHost() {
   if (isConnected && nativePort) {
-    console.log("[ClaudeCodeBrowser] Already connected");
+    console.log("[ClaudeCodeBrowserX] Already connected");
     return;
   }
 
   try {
-    console.log(`[ClaudeCodeBrowser] Connecting to native host (attempt ${reconnectAttempts + 1})...`);
+    console.log(`[ClaudeCodeBrowserX] Connecting to native host (attempt ${reconnectAttempts + 1})...`);
     nativePort = browser.runtime.connectNative(NATIVE_HOST_NAME);
     isConnected = true;
     reconnectAttempts = 0;  // Reset on successful connection
-    console.log("[ClaudeCodeBrowser] Connected to native host");
+    console.log("[ClaudeCodeBrowserX] Connected to native host");
 
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(handleDisconnect);
   } catch (error) {
-    console.error("[ClaudeCodeBrowser] Failed to connect to native host:", error);
+    console.error("[ClaudeCodeBrowserX] Failed to connect to native host:", error);
     isConnected = false;
     nativePort = null;
     scheduleReconnect();
@@ -1186,7 +1186,7 @@ function connectNativeHost() {
 
 function scheduleReconnect() {
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-    console.error(`[ClaudeCodeBrowser] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
+    console.error(`[ClaudeCodeBrowserX] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
     // Reset after a long delay to try again eventually
     setTimeout(() => {
       reconnectAttempts = 0;
@@ -1197,14 +1197,14 @@ function scheduleReconnect() {
 
   const delay = getReconnectDelay();
   reconnectAttempts++;
-  console.log(`[ClaudeCodeBrowser] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+  console.log(`[ClaudeCodeBrowserX] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
   setTimeout(connectNativeHost, delay);
 }
 
 function handleDisconnect(port) {
-  console.log("[ClaudeCodeBrowser] Disconnected from native host");
+  console.log("[ClaudeCodeBrowserX] Disconnected from native host");
   if (port.error) {
-    console.error("[ClaudeCodeBrowser] Disconnect error:", port.error);
+    console.error("[ClaudeCodeBrowserX] Disconnect error:", port.error);
   }
   isConnected = false;
   nativePort = null;
@@ -1219,7 +1219,7 @@ function handleNativeMessage(message) {
   // where it is kept for the session and exportable. Every other stage on
   // this path redacts (the server's redact_for_log, the guard's audit, the
   // native host's describe_message, the agent's _redact); this one did not.
-  console.log("[ClaudeCodeBrowser] Received from native host:", {
+  console.log("[ClaudeCodeBrowserX] Received from native host:", {
     action: message && message.action,
     requestId: message && message.requestId,
     tabId: message && message.tabId,
@@ -1626,7 +1626,7 @@ async function requestApprovalInWindow(data) {
       clearTimeout(timer);
       pendingApprovals.delete(requestId);
       settled = true;
-      console.warn("[ClaudeCodeBrowser] approval window unavailable:", error);
+      console.warn("[ClaudeCodeBrowserX] approval window unavailable:", error);
       resolve(null);
     });
   });
@@ -1639,7 +1639,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Only our own extension pages may answer an approval, and never a tab: a
   // content script must not be able to decide one.
   if (sender.id !== browser.runtime.id || sender.tab) {
-    console.warn("[ClaudeCodeBrowser] refused approval message from", sender.id);
+    console.warn("[ClaudeCodeBrowserX] refused approval message from", sender.id);
     sendResponse({ found: false });
     return;
   }
@@ -2451,7 +2451,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // extension run arbitrary commands (including executeScript on any tab),
 // bypassing the API token and the localhost boundary entirely.
 browser.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
-  console.warn("[ClaudeCodeBrowser] Refused external message from", sender?.id);
+  console.warn("[ClaudeCodeBrowserX] Refused external message from", sender?.id);
   sendResponse({ success: false, error: "External messages are not accepted" });
   return false;
 });
@@ -2477,7 +2477,7 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
       // so the server's refusal to persist a private-window screenshot does
       // not cover this path.
       if (result.privateWindow === true) {
-        console.warn("[ClaudeCodeBrowser] not saving a screenshot of a " +
+        console.warn("[ClaudeCodeBrowserX] not saving a screenshot of a " +
                      "private window");
         return;
       }
@@ -2501,4 +2501,4 @@ browser.contextMenus.onClicked.addListener((info, tab) => {
 
 // Initialize
 connectNativeHost();
-console.log("[ClaudeCodeBrowser] Background script initialized");
+console.log("[ClaudeCodeBrowserX] Background script initialized");

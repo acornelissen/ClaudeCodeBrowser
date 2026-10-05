@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP stdio wrapper for ClaudeCodeBrowser
+MCP stdio wrapper for ClaudeCodeBrowserX
 
 This wrapper translates between MCP stdio protocol and the HTTP-based browser server.
 It handles the JSON-RPC communication that Claude Code expects.
@@ -52,7 +52,7 @@ HTTP_URL = f'http://{HTTP_HOST}:{HTTP_PORT}'
 # Server process reference
 server_process = None
 
-_TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
+_TOKEN_FILE = Path.home() / '.claudecodebrowserx' / 'api_token'
 
 
 def _api_headers(extra: Optional[dict] = None) -> dict:
@@ -179,7 +179,7 @@ def handle_initialize(msg):
                 "tools": {}
             },
             "serverInfo": {
-                "name": "claudecodebrowser",
+                "name": "claudecodebrowserx",
                 "version": "1.9.7"
             }
         }

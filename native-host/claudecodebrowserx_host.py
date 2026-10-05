@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ClaudeCodeBrowser Native Messaging Host
+ClaudeCodeBrowserX Native Messaging Host
 
 This script acts as a bridge between the Firefox extension and the MCP server.
 It receives messages from the extension via native messaging and forwards them
@@ -33,7 +33,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Configure logging
-LOG_DIR = Path.home() / '.claudecodebrowser' / 'logs'
+LOG_DIR = Path.home() / '.claudecodebrowserx' / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / 'native_host.log'
 
@@ -142,7 +142,7 @@ MCP_SERVER_PORT = int(os.environ.get('CLAUDE_MCP_PORT', '8765'))
 MCP_SERVER_URL = f'http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}'
 
 # API token for authenticating requests to the MCP server
-_TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
+_TOKEN_FILE = Path.home() / '.claudecodebrowserx' / 'api_token'
 
 
 def _mcp_headers() -> dict:
@@ -690,7 +690,7 @@ def start_mcp_server():
     # Find server script - check multiple locations
     possible_paths = [
         Path(__file__).parent.parent / 'mcp-server' / 'server.py',
-        Path.home() / '.claudecodebrowser' / 'mcp-server' / 'server.py',
+        Path.home() / '.claudecodebrowserx' / 'mcp-server' / 'server.py',
     ]
 
     mcp_server_path = None
@@ -801,7 +801,7 @@ def _screenshots_dir():
         created = not path.is_dir()
         path.mkdir(parents=True, exist_ok=True)
     else:
-        path = Path.home() / '.claudecodebrowser' / 'screenshots'
+        path = Path.home() / '.claudecodebrowserx' / 'screenshots'
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         created = True
         try:
@@ -813,7 +813,7 @@ def _screenshots_dir():
     if created and not marker.exists():
         try:
             marker.write_text(
-                'Created by ClaudeCodeBrowser. Its presence allows the retention '
+                'Created by ClaudeCodeBrowserX. Its presence allows the retention '
                 'policy to delete *.png files in this directory. Remove it to '
                 'keep screenshots indefinitely.\n')
         except OSError as e:
@@ -1127,7 +1127,7 @@ def main():
     global health_monitor_running
 
     logger.info("=" * 60)
-    logger.info("ClaudeCodeBrowser Native Host starting...")
+    logger.info("ClaudeCodeBrowserX Native Host starting...")
     logger.info(f"MCP Server URL: {MCP_SERVER_URL}")
     logger.info(f"Health check interval: {HEALTH_CHECK_INTERVAL}s")
     logger.info("=" * 60)

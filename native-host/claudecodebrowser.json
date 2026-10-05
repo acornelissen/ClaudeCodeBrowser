@@ -1,9 +1,0 @@
-{
-  "name": "claudecodebrowser",
-  "description": "ClaudeCodeBrowser Native Messaging Host - Bridge between Firefox extension and MCP server",
-  "path": "/ABSOLUTE/PATH/TO/HOME/.claudecodebrowser/native-host/claudecodebrowser_host.py",
-  "type": "stdio",
-  "allowed_extensions": [
-    "{efac2f8e-6c88-4c94-a050-f45cd0298aeb}"
-  ]
-}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Headless browser backend for ClaudeCodeBrowser.
+Headless browser backend for ClaudeCodeBrowserX.
 
 Uses Playwright to drive Firefox, Chromium, or WebKit without a display.
 Activated when CLAUDE_BROWSERX_HEADLESS=1 or --headless is passed.
@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from safety import (env, prune_screenshots, resolve_screenshots_dir,
                     screenshot_filename)
 
-logger = logging.getLogger('ClaudeCodeBrowser.Headless')
+logger = logging.getLogger('ClaudeCodeBrowserX.Headless')
 
 SCREENSHOTS_DIR = resolve_screenshots_dir()
 
@@ -554,7 +554,7 @@ class HeadlessBrowser:
                 'Refused: the focused element is a credential field. '
                 'Credentials belong in a password manager, not automated '
                 'typing. Set "allow_password_typing": true in '
-                '~/.claudecodebrowser/safety.json to override.')
+                '~/.claudecodebrowserx/safety.json to override.')
 
     async def _assert_not_password(self, page, selector: str, args: Dict[str, Any]):
         """Refuse to fill credential fields unless the safety config allows it.
@@ -570,7 +570,7 @@ class HeadlessBrowser:
             raise RuntimeError(
                 'Refused: target is a password field. Credentials belong in a '
                 'password manager, not automated typing. Set '
-                '"allow_password_typing": true in ~/.claudecodebrowser/safety.json '
+                '"allow_password_typing": true in ~/.claudecodebrowserx/safety.json '
                 'to override.'
             )
 
@@ -950,7 +950,7 @@ class HeadlessBrowser:
                     'masked': True,
                     'note': 'Credential field value withheld. Set '
                             '"allow_password_typing": true in '
-                            '~/.claudecodebrowser/safety.json to read '
+                            '~/.claudecodebrowserx/safety.json to read '
                             'credentials through the agent.'
                 }
             value = await page.eval_on_selector(selector, 'el => el.value')
@@ -1078,7 +1078,7 @@ class HeadlessBrowser:
                             'out (a printable key types it one character at a '
                             'time; a clipboard shortcut pastes, copies or '
                             'cuts it). Set "allow_password_typing": true in '
-                            '~/.claudecodebrowser/safety.json to override.')
+                            '~/.claudecodebrowserx/safety.json to override.')
                 else:
                     await self._assert_focused_not_password(page, args)
 
@@ -1114,7 +1114,7 @@ class HeadlessBrowser:
                     # sends them round a loop that cannot succeed.
                     'note': 'Credential field text withheld. Use '
                             'browser_get_value with "allow_password_typing": '
-                            'true in ~/.claudecodebrowser/safety.json to read '
+                            'true in ~/.claudecodebrowserx/safety.json to read '
                             'credentials through the agent.',
                     'url': page.url
                 }

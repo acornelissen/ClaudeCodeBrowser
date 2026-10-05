@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ClaudeCodeBrowser MCP Server
+ClaudeCodeBrowserX MCP Server
 
 A Model Context Protocol (MCP) compatible server that provides browser automation
 capabilities to Claude Code and other AI assistants.
@@ -51,7 +51,7 @@ import threading
 import socket
 
 # Configure logging
-LOG_DIR = Path.home() / '.claudecodebrowser' / 'logs'
+LOG_DIR = Path.home() / '.claudecodebrowserx' / 'logs'
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / 'mcp_server.log'
 
@@ -97,7 +97,7 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
+logger = logging.getLogger('ClaudeCodeBrowserX.MCPServer')
 
 # Headless mode: CLAUDE_BROWSERX_HEADLESS=1 or --headless flag
 HEADLESS_MODE = env('HEADLESS', '0') == '1' or '--headless' in sys.argv
@@ -117,7 +117,7 @@ from safety import (get_safety_guard, prune_screenshots,
                     redact_arguments, resolve_screenshots_dir)
 
 # API token for localhost HTTP authentication
-_TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
+_TOKEN_FILE = Path.home() / '.claudecodebrowserx' / 'api_token'
 
 
 def _load_or_create_api_token() -> str:
@@ -178,7 +178,7 @@ _REFUSED_BODY_DRAIN_BYTES = 64 * 1024
 # caller abandoned it.
 COMMAND_QUEUE_TTL = float(env('COMMAND_TTL', '240'))
 
-# Screenshots directory: ~/.claudecodebrowser/screenshots (0700), or wherever
+# Screenshots directory: ~/.claudecodebrowserx/screenshots (0700), or wherever
 # CLAUDE_BROWSERX_SCREENSHOTS_DIR points.
 SCREENSHOTS_DIR = resolve_screenshots_dir()
 
@@ -378,7 +378,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_type",
-        description="Type text into an input field or editable element. Can target by selector, placeholder, name, or focus current element. Refused on a credential field (password, one-time code, card field, or a field whose name or id looks like a credential) unless allow_password_typing is set in ~/.claudecodebrowser/safety.json; an allow_password argument is ignored.",
+        description="Type text into an input field or editable element. Can target by selector, placeholder, name, or focus current element. Refused on a credential field (password, one-time code, card field, or a field whose name or id looks like a credential) unless allow_password_typing is set in ~/.claudecodebrowserx/safety.json; an allow_password argument is ignored.",
         input_schema={
             "type": "object",
             "required": ["text"],
@@ -1011,7 +1011,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Safety
     MCPTool(
         name="browser_safety_status",
-        description="Show the active safety guard policy and which mode you are in (attended Firefox or headless Playwright), including which tools are headless-only. Call this first if a tool returns 'Unknown action'. Policy: read-only mode, script toggle, credential guard state (enforced, enforced_except_scripts or advisory), protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
+        description="Show the active safety guard policy and which mode you are in (attended Firefox or headless Playwright), including which tools are headless-only. Call this first if a tool returns 'Unknown action'. Policy: read-only mode, script toggle, credential guard state (enforced, enforced_except_scripts or advisory), protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowserx/safety.json.",
         input_schema={
             "type": "object",
             "properties": {}

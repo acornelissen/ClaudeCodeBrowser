@@ -1,5 +1,5 @@
 /**
- * ClaudeCodeBrowser - Approval prompt
+ * ClaudeCodeBrowserX - Approval prompt
  *
  * Runs in an extension page (moz-extension:// origin) opened in its own
  * window. The page being automated cannot reach this document, restyle it,

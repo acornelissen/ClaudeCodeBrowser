@@ -4,7 +4,7 @@
   "version": "1.9.7",
   "description": "Browser automation for Claude Code: screenshots, clicking, typing and page interaction. A fork of ClaudeCodeBrowser, originally created by Andre Watson (Ligandal Inc.).",
   "author": "Albert Cornelissen",
-  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowser",
+  "homepage_url": "https://github.com/acornelissen/ClaudeCodeBrowserX",
 
   "permissions": [
     "activeTab",
@@ -55,7 +55,7 @@
     "gecko": {
       "id": "{efac2f8e-6c88-4c94-a050-f45cd0298aeb}",
       "strict_min_version": "78.0",
-      "update_url": "https://github.com/acornelissen/ClaudeCodeBrowser/releases/latest/download/updates.json"
+      "update_url": "https://github.com/acornelissen/ClaudeCodeBrowserX/releases/latest/download/updates.json"
     }
   },
 

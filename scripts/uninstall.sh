@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ClaudeCodeBrowser Uninstallation Script
+# ClaudeCodeBrowserX Uninstallation Script
 #
 
 set -e
@@ -10,17 +10,17 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-INSTALL_DIR="$HOME/.claudecodebrowser"
+INSTALL_DIR="$HOME/.claudecodebrowserx"
 if [ "$(uname)" = "Darwin" ]; then
     FIREFOX_NATIVE_MANIFESTS_DIR="$HOME/Library/Application Support/Mozilla/NativeMessagingHosts"
 else
     FIREFOX_NATIVE_MANIFESTS_DIR="$HOME/.mozilla/native-messaging-hosts"
 fi
 
-echo -e "${YELLOW}ClaudeCodeBrowser Uninstaller${NC}"
+echo -e "${YELLOW}ClaudeCodeBrowserX Uninstaller${NC}"
 echo ""
 
-read -p "This will remove ClaudeCodeBrowser. Continue? (y/N) " -n 1 -r
+read -p "This will remove ClaudeCodeBrowserX. Continue? (y/N) " -n 1 -r
 echo
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "Cancelled."
@@ -28,15 +28,20 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 # Remove native messaging manifest
+if [ -f "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowserx.json" ]; then
+    rm "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowserx.json"
+    echo -e "${GREEN}✓ Removed Firefox native messaging manifest${NC}"
+fi
+# The pre-rename host name the installer keeps pointing at the new host.
 if [ -f "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json" ]; then
     rm "$FIREFOX_NATIVE_MANIFESTS_DIR/claudecodebrowser.json"
-    echo -e "${GREEN}✓ Removed Firefox native messaging manifest${NC}"
+    echo -e "${GREEN}✓ Removed the pre-rename native messaging manifest${NC}"
 fi
 
 # Remove symlinks
-if [ -L "$HOME/bin/claudecodebrowser-server" ]; then
-    rm "$HOME/bin/claudecodebrowser-server"
-    echo -e "${GREEN}✓ Removed symlink: claudecodebrowser-server${NC}"
+if [ -L "$HOME/bin/claudecodebrowserx-server" ]; then
+    rm "$HOME/bin/claudecodebrowserx-server"
+    echo -e "${GREEN}✓ Removed symlink: claudecodebrowserx-server${NC}"
 fi
 
 if [ -L "$HOME/bin/browser-agent" ]; then
@@ -58,7 +63,7 @@ if [ -d "$INSTALL_DIR/screenshots" ] && [ "$(ls -A "$INSTALL_DIR/screenshots" 2>
 fi
 
 if [ "$KEEP_SCREENSHOTS" = "1" ]; then
-    KEEP_DIR="$HOME/claudecodebrowser-screenshots"
+    KEEP_DIR="$HOME/claudecodebrowserx-screenshots"
     mkdir -p "$KEEP_DIR"
     # cp -R then remove, so a failure cannot lose the originals.
     if cp -R "$INSTALL_DIR/screenshots/." "$KEEP_DIR/" 2>/dev/null; then
@@ -81,8 +86,8 @@ fi
 
 # The Chrome build instructs users to install a native-messaging manifest too.
 for CHROME_MANIFEST in \
-    "$HOME/.config/google-chrome/NativeMessagingHosts/claudecodebrowser.json" \
-    "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/claudecodebrowser.json"; do
+    "$HOME/.config/google-chrome/NativeMessagingHosts/claudecodebrowserx.json" \
+    "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/claudecodebrowserx.json"; do
     if [ -f "$CHROME_MANIFEST" ]; then
         rm "$CHROME_MANIFEST"
         echo -e "${GREEN}✓ Removed Chrome native messaging manifest${NC}"
@@ -90,15 +95,16 @@ for CHROME_MANIFEST in \
 done
 
 echo ""
-echo -e "${GREEN}ClaudeCodeBrowser has been uninstalled.${NC}"
+echo -e "${GREEN}ClaudeCodeBrowserX has been uninstalled.${NC}"
 echo ""
 echo "To remove the Firefox extension itself:"
 echo "  1. Open about:addons in Firefox (menu > Add-ons and themes)"
-echo "  2. Find ClaudeCodeBrowser under Extensions"
+echo "  2. Find ClaudeCodeBrowserX under Extensions"
 echo "  3. Click the ... menu next to it and choose Remove"
 echo ""
 echo "If it was loaded temporarily via about:debugging, it will disappear"
 echo "on the next Firefox restart."
 echo ""
 echo "If you registered the MCP server with Claude Code, also run:"
-echo "  claude mcp remove claudecodebrowser"
+echo "  claude mcp remove claudecodebrowserx"
+echo "  claude mcp remove claudecodebrowser    # if registered before the rename"

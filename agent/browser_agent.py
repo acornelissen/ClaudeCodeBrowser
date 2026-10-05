@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ClaudeCodeBrowser Agent
+ClaudeCodeBrowserX Agent
 
 A specialized agent for browser automation that can be called from Claude Code.
 This agent provides high-level browser automation capabilities using natural language.
@@ -50,7 +50,7 @@ def _env(name, default=None):
 
 
 MCP_SERVER_URL = _env('URL', 'http://127.0.0.1:8765')
-_TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
+_TOKEN_FILE = Path.home() / '.claudecodebrowserx' / 'api_token'
 
 # Argument names whose values must never be logged or retained. This client
 # printed them in the clear to the terminal, which lands in any tee'd session
@@ -708,7 +708,7 @@ class BrowserAutomationAgent:
                     'submitted and no later step ran. Credentials are refused '
                     "by default - use the browser's own password manager, or "
                     'set "allow_password_typing": true in '
-                    '~/.claudecodebrowser/safety.json.'))
+                    '~/.claudecodebrowserx/safety.json.'))
                 return results
 
         if submit_selector:
@@ -768,7 +768,7 @@ def interactive_mode(agent: BrowserAutomationAgent):
     """Run the agent in interactive mode."""
     print("""
 ╔══════════════════════════════════════════════════════════════╗
-║          ClaudeCodeBrowser Interactive Agent                 ║
+║          ClaudeCodeBrowserX Interactive Agent                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Commands:                                                   ║
 ║    screenshot [filename]  - Take a screenshot                ║
@@ -946,7 +946,7 @@ _COMMAND_SENSITIVE_ARG = {'type_text': 'text', 'search': 'text',
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='ClaudeCodeBrowser Agent')
+    parser = argparse.ArgumentParser(description='ClaudeCodeBrowserX Agent')
     parser.add_argument('--interactive', '-i', action='store_true', help='Run in interactive mode')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     parser.add_argument('--check', action='store_true', help='Check if MCP server is running')

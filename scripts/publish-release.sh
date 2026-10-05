@@ -18,14 +18,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$SCRIPT_DIR/extension"
 DIST="$SCRIPT_DIR/dist"
-REPO_SLUG="${CCB_REPO_SLUG:-acornelissen/ClaudeCodeBrowser}"
+REPO_SLUG="${CCB_REPO_SLUG:-acornelissen/ClaudeCodeBrowserX}"
 
 DRAFT=0
 [ "$1" = "--draft" ] && DRAFT=1
 
 VERSION=$(CCB_SRC="$SRC" python3 -c "import json,os; print(json.load(open(os.environ['CCB_SRC']+'/manifest.json'))['version'])")
 TAG="v${VERSION}"
-XPI="$DIST/claudecodebrowser-${VERSION}.xpi"
+XPI="$DIST/claudecodebrowserx-${VERSION}.xpi"
 UPDATES="$DIST/updates.json"
 
 # Both assets must exist, or auto-update would break (updates.json would point
@@ -99,9 +99,9 @@ if [ "$CI" != "success" ]; then
 fi
 echo "  verified: CI passed on ${HEAD_SHA}"
 
-NOTES="ClaudeCodeBrowser ${TAG}
+NOTES="ClaudeCodeBrowserX ${TAG}
 
-Install: download \`claudecodebrowser-${VERSION}.xpi\` and open it in Firefox
+Install: download \`claudecodebrowserx-${VERSION}.xpi\` and open it in Firefox
 (about:addons → gear → Install Add-on From File). Installed copies auto-update
 from this release's updates.json.
 

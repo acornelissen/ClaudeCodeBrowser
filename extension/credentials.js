@@ -1,5 +1,5 @@
 // Credential detection: the one definition of "this field, or this name,
-// holds a credential", shared by every part of ClaudeCodeBrowser that decides
+// holds a credential", shared by every part of ClaudeCodeBrowserX that decides
 // it.
 //
 //  - content.js, the field guard: refuse to type into a credential field and

@@ -41,14 +41,14 @@ class ScreenshotLocationTests(unittest.TestCase):
     def test_default_directory_is_under_the_home_directory(self):
         self.assertEqual(
             server.SCREENSHOTS_DIR,
-            Path(TEST_HOME) / '.claudecodebrowser' / 'screenshots')
+            Path(TEST_HOME) / '.claudecodebrowserx' / 'screenshots')
 
     def test_default_directory_is_not_in_shared_tmp(self):
         """The old default was a fixed directory in the shared /tmp. This
         used to assert the path did not start with /tmp/, which fails on
         Linux for the wrong reason: the suite's throwaway home lives there."""
         self.assertNotEqual(server.SCREENSHOTS_DIR,
-                            Path('/tmp/claudecodebrowser/screenshots'))
+                            Path('/tmp/claudecodebrowserx/screenshots'))
         self.assertTrue(server.SCREENSHOTS_DIR.is_relative_to(Path.home()))
 
     def test_directory_is_not_world_readable(self):
@@ -955,7 +955,7 @@ class NumericArgumentTests(unittest.TestCase):
 
 class ScreenshotSaveFlagTests(unittest.TestCase):
     """save_to_file is the privacy-relevant one: the PNG lands in
-    ~/.claudecodebrowser/screenshots and is kept for the retention window.
+    ~/.claudecodebrowserx/screenshots and is kept for the retention window.
     Driven through the real _save_screenshot - the handler stub used
     elsewhere never reaches it."""
 

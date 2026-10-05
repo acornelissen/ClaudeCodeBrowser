@@ -44,7 +44,7 @@ class ExtensionIdTests(unittest.TestCase):
         self.assertNotEqual(extension_id(), 'claudecodebrowser@ligandal.com')
 
     def test_native_host_template_allows_exactly_this_extension(self):
-        host = json.loads((ROOT / 'native-host' / 'claudecodebrowser.json').read_text())
+        host = json.loads((ROOT / 'native-host' / 'claudecodebrowserx.json').read_text())
         self.assertEqual(host['allowed_extensions'], [extension_id()])
 
     def test_installers_do_not_hardcode_an_id(self):
@@ -62,7 +62,7 @@ class ExtensionIdTests(unittest.TestCase):
     def test_update_url_points_at_this_fork(self):
         manifest = json.loads((ROOT / 'extension' / 'manifest.json').read_text())
         update_url = manifest['browser_specific_settings']['gecko']['update_url']
-        self.assertIn('acornelissen/ClaudeCodeBrowser', update_url,
+        self.assertIn('acornelissen/ClaudeCodeBrowserX', update_url,
                       'auto-update must not point at the upstream repository')
 
     def test_update_manifest_is_keyed_by_the_extension_id(self):
@@ -130,7 +130,7 @@ class AttributionTests(unittest.TestCase):
         'mcp-server/safety.py',
         'mcp-server/headless_backend.py',
         'mcp-server/stdio_wrapper.py',
-        'native-host/claudecodebrowser_host.py',
+        'native-host/claudecodebrowserx_host.py',
         'agent/browser_agent.py',
     )
 
