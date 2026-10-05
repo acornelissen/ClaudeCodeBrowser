@@ -316,8 +316,22 @@ function looksLikeCredentialName(name) {
 // testing - the HTML of a logged page arrived with the password in clear
 // while browser_get_page_info was correctly returning "***" for the same
 // field.
+// Anchored on the whitespace before the attribute, so data-type="password"
+// on an ordinary field is not read as type="password".
 const SECRET_INPUT_RE =
-  /type\s*=\s*["']?(password|hidden)|autocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc)/i;
+  /\stype\s*=\s*["']?(password|hidden)|\sautocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc)/i;
+
+// Two readings of where an opening tag ends, and the scrub runs with both.
+// Stepping over quoted values catches a '>' inside one (data-x="a>b"), which
+// [^>]* stopped at, so the name after it was never seen; but it cannot match
+// a tag with an unbalanced quote at all, which [^>]* still does. Folding a
+// lone-quote fallback into one pattern would make it ambiguous, and a page
+// could then make it backtrack exponentially; two linear passes cannot.
+const TAG_BODIES = [`(?:[^>"']|"[^"]*"|'[^']*')*`, `[^>]*`];
+const INPUT_TAG_RES = TAG_BODIES.map(
+  (body) => new RegExp(`<input\\b${body}>`, "gi"));
+const TEXTAREA_RES = TAG_BODIES.map((body) => new RegExp(
+  `(<textarea\\b${body}>)([\\s\\S]*?)(<\\/textarea\\s*>)`, "gi"));
 
 // Every name and id the tag carries. Only the first used to be judged, so
 // <input id="mfa" name="mfaCode"> was judged by id="mfa" and its value logged.
@@ -337,13 +351,19 @@ function redactHtmlInputValues(text) {
   // looks like a credential field, and each credential <textarea>'s contents.
   // Regex over HTML is crude, but this is best-effort redaction of a log, not
   // parsing.
-  return text.replace(/<input\b[^>]*>/gi, (tag) => {
-    if (!tagLooksSecret(tag)) return tag;
-    return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
-              .replace(/(\bvalue\s*=\s*)(?!["'])[^\s>]+/gi, '$1***');
-  }).replace(/(<textarea\b[^>]*>)([\s\S]*?)(<\/textarea\s*>)/gi,
-    (match, open, body, close) =>
-      (tagLooksSecret(open) && body ? `${open}***${close}` : match));
+  for (const inputTag of INPUT_TAG_RES) {
+    text = text.replace(inputTag, (tag) => {
+      if (!tagLooksSecret(tag)) return tag;
+      return tag.replace(/(\bvalue\s*=\s*)(["'])(?:(?!\2).)*\2/gi, '$1$2***$2')
+                .replace(/(\bvalue\s*=\s*)(?!["'])[^\s>]+/gi, '$1***');
+    });
+  }
+  for (const textarea of TEXTAREA_RES) {
+    text = text.replace(textarea, (match, open, body, close) =>
+      (tagLooksSecret(open) && body && body !== "***"
+        ? `${open}***${close}` : match));
+  }
+  return text;
 }
 
 // Walk a parsed structure, replacing any value under a credential-shaped key.
@@ -565,8 +585,10 @@ function redactUnparsedUrl(rawUrl) {
   // Userinfo of a scheme-relative or malformed absolute URL. Only in the
   // authority position, so an `@` further along a path is left alone.
   head = head.replace(/^((?:[a-z][a-z0-9+.-]*:)?[\\/]{2})[^\\/]*@/i, "$1");
-  // The path still gets the text passes, as the whole value did before.
-  head = redactTextPasses(head);
+  // The path still gets the text passes, as the whole value did before, and
+  // the same path-parameter scrub as an absolute URL: the text passes do not
+  // know that `code` or `sid` is a secret in a URL, so /cb;code=... leaked.
+  head = redactPathParams(redactTextPasses(head));
   const hashAt = tail.indexOf("#");
   const search = hashAt < 0 ? tail : tail.slice(0, hashAt);
   const hash = hashAt < 0 ? "" : tail.slice(hashAt);

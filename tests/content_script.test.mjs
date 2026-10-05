@@ -993,7 +993,16 @@ test('typing is paced to finish inside the server\'s wait', async () => {
   const quick = makeElement('input', { id: 'q', value: '' });
   ctx = loadContentScript({ '#q': quick }, { timers });
   await ctx.send({ action: 'type', selector: '#q', text: 'abc', delay: 0 });
-  assert.ok(total() <= 1000, `delay 0 still waited ${total()}ms`);
+  // Only the 100ms settle after focusing; 0 used to mean 50 per key.
+  assert.ok(total() <= 100, `delay 0 still waited ${total()}ms`);
+
+  // With no delay given, attended mode keeps its 50ms pace per key.
+  waits.length = 0;
+  const paced = makeElement('input', { id: 'q', value: '' });
+  ctx = loadContentScript({ '#q': paced }, { timers });
+  await ctx.send({ action: 'type', selector: '#q', text: 'abc' });
+  assert.equal(waits.filter(ms => ms === 50).length, 3,
+    `expected three 50ms keystrokes, waited ${JSON.stringify(waits)}`);
 });
 
 test('set_value reports a reformatted value as set, not as a failure', async () => {
@@ -1451,6 +1460,9 @@ test('the DOM name guard matches the same credential names as background.js', as
     // cookies, which carry session ids.
     'mfaCode', 'mfa_code', 'verificationCode', 'securityCode', 'cc_number',
     'ccNumber', 'creditCard', 'credit_card_number', 'pincode', 'cookie',
+    // All-lowercase legacy forms, a prefixed card field, and plural cookies.
+    'mfacode', 'verificationcode', 'securitycode', 'ccnumber', 'creditcard',
+    'billingCcNumber', 'payment_cc_number', 'cookies', 'sessionCookie',
   ];
   for (const name of credentials) {
     const el = makeElement('input', { id: 'f', name, type: 'text', value: 'hunter2' });

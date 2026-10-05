@@ -821,6 +821,9 @@ test('the credential-name list matches credentials and not ordinary words', () =
     // cookies, which carry session ids.
     'mfaCode', 'mfa_code', 'verificationCode', 'securityCode', 'cc_number',
     'ccNumber', 'creditCard', 'credit_card_number', 'pincode', 'cookie',
+    // All-lowercase legacy forms, a prefixed card field, and plural cookies.
+    'mfacode', 'verificationcode', 'securitycode', 'ccnumber', 'creditcard',
+    'billingCcNumber', 'payment_cc_number', 'cookies', 'sessionCookie',
   ];
   for (const name of credentials) {
     assert.ok(matches(name), `${name} must be treated as a credential`);
@@ -1112,6 +1115,28 @@ test('a Referer carrying a code is scrubbed', async () => {
   assert.ok(!JSON.stringify(entry).includes('REFERER-CODE-9'),
             JSON.stringify(entry.requestHeaders));
   assert.match(entry.requestHeaders.Referer, /app\.test\/cb\?code=\*\*\*&state=ok/);
+});
+
+test('path parameters are scrubbed in relative and absolute targets alike', async () => {
+  // The relative fallback sent the path through the body text passes only,
+  // which do not know that `code` and `sid` are secrets in a URL.
+  const cases = [
+    ['/cb;code=REL-PATH-1', 'REL-PATH-1'],
+    ['/x;sid=REL-PATH-2?y=1', 'REL-PATH-2'],
+    ['https://a.test/cb;code=ABS-PATH-3', 'ABS-PATH-3'],
+    ['https://a.test/x;jsession%69d=ENC-PATH-4', 'ENC-PATH-4'],
+  ];
+  for (const [location, secret] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', { includeAllTypes: true }, 7);
+    fireRequest(webRequest, {
+      url: 'https://a.test/start', statusCode: 302,
+      responseHeaders: [{ name: 'Location', value: location }]
+    });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.ok(!JSON.stringify(entry).includes(secret),
+              `${secret} leaked: ${entry.responseHeaders.Location}`);
+  }
 });
 
 test('a relative redirect target is scrubbed and kept as written', async () => {
@@ -1904,6 +1929,52 @@ test('a credential name after an ordinary id, and a credential textarea, are scr
   }
   assert.ok(body.includes('ordinary notes'), 'an ordinary textarea stays readable');
   assert.ok(body.includes('<textarea id="cvv">'), 'the markup stays intact');
+});
+
+test('the HTML scrub holds up against ordinary variations in markup', async () => {
+  // Each shape kept its credential through one of the earlier scrubs: the
+  // secret attribute first, a credential textarea after an ordinary one, a
+  // multi-line textarea, upper-case tags, spaces around =, and a '>' inside
+  // a quoted attribute, which ended the tag early so the name was never seen.
+  const secrets = {
+    'secret attribute first': ['<input name="mfaCode" id="mfa" value="S-ONE">', 'S-ONE'],
+    'after an ordinary textarea': ['<textarea name="notes">ok</textarea><textarea name="private_key">S-TWO</textarea>', 'S-TWO'],
+    'multi-line textarea': ['<textarea id="cvv">line one\nS-THREE</textarea>', 'S-THREE'],
+    'upper-case input': ['<INPUT NAME="mfaCode" VALUE="S-FOUR">', 'S-FOUR'],
+    'upper-case textarea': ['<TEXTAREA name="private_key">S-FIVE</TEXTAREA>', 'S-FIVE'],
+    'spaces around =': ['<input name = "otp" value="S-SIX">', 'S-SIX'],
+    "'>' in a textarea attribute": ['<textarea data-x="a>b" name="private_key">S-SEVEN</textarea>', 'S-SEVEN'],
+    "'>' in an input attribute": ['<input data-x="a>b" name="otp" value="S-EIGHT">', 'S-EIGHT'],
+    // Malformed: an unbalanced quote. Stepping over quoted values must not
+    // stop the tag being matched at all.
+    'unbalanced quote': ['<input name="otp value="S-NINE">', 'S-NINE'],
+    'unbalanced quote, textarea': ['<textarea name="otp x="y>S-TEN</textarea>', 'S-TEN'],
+  };
+  const ordinary = {
+    'data-name is not a name': ['<input data-name="password" name="q" value="ORD-ONE">', 'ORD-ONE'],
+    'data-type is not a type': ['<input data-type="password" name="q" value="ORD-TWO">', 'ORD-TWO'],
+    'ordinary textarea': ['<textarea name="notes">ORD-THREE</textarea>', 'ORD-THREE'],
+  };
+  const scrub = async (html) => {
+    const { command, webRequest, filters } = loadBackground();
+    await command('startLogging', { includeAllTypes: true }, 7);
+    fireRequest(webRequest, {
+      responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+      complete: false
+    });
+    filters[0].ondata({ data: new TextEncoder().encode(html) });
+    filters[0].onstop();
+    webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+    return (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
+  };
+  for (const [label, [html, secret]] of Object.entries(secrets)) {
+    const body = await scrub(html);
+    assert.ok(!body.includes(secret), `${label}: ${body}`);
+  }
+  for (const [label, [html, value]] of Object.entries(ordinary)) {
+    const body = await scrub(html);
+    assert.ok(body.includes(value), `${label} was masked: ${body}`);
+  }
 });
 
 test('ordinary markup is not mangled by the scrubber', async () => {
