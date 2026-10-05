@@ -44,20 +44,18 @@ echo "Packaging ClaudeCodeBrowser extension v${VERSION} (${EXT_ID})"
 # has been validated: written up front, an aborted run left updates.json
 # advertising a version with no matching .xpi.
 write_update_manifest() {
-# Firefox looks up only its own id in this map, so every id that has ever
-    # shipped needs an entry or those installs are stranded with no error. Extra
-    # ids come from CCB_LEGACY_EXT_IDS (comma-separated).
-CCB_LEGACY_EXT_IDS="${CCB_LEGACY_EXT_IDS:-}" \
+    # Only the current id. Offering this build under a retired id cannot
+    # rescue those installs: Firefox refuses an update whose id differs
+    # ("Refusing to upgrade addon X to different ID Y", XPIInstall), so the
+    # entry only made them download the .xpi and fail every update check.
 CCB_EXT_ID="$EXT_ID" CCB_VERSION="$VERSION" CCB_XPI_URL="$XPI_URL" \
 python3 > "$DIST/updates.json" <<'PYEOF'
 import json, os
 
 update = [{"version": os.environ["CCB_VERSION"],
            "update_link": os.environ["CCB_XPI_URL"]}]
-ids = [os.environ["CCB_EXT_ID"]]
-ids += [i.strip() for i in os.environ.get("CCB_LEGACY_EXT_IDS", "").split(",")
-        if i.strip()]
-print(json.dumps({"addons": {i: {"updates": update} for i in ids}}, indent=2))
+print(json.dumps({"addons": {os.environ["CCB_EXT_ID"]: {"updates": update}}},
+                 indent=2))
 PYEOF
 echo "Wrote update manifest: $DIST/updates.json"
 }

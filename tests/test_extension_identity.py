@@ -11,7 +11,10 @@ Run: python3 -m unittest discover -s tests -t . -v
 """
 
 import json
+import os
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -176,23 +179,21 @@ class PackagingGuardTests(unittest.TestCase):
                       "-x '*/.*' only covers nested dotfiles, so a stray "
                       "extension/.env shipped")
 
-    def test_upstream_id_is_never_offered_our_build(self):
-        """Listing upstream's id in updates.json would offer this fork's
-        build to their users, which is a hijack rather than a rescue. Checked
-        against the configured value, not the file, so the comment explaining
-        the exclusion does not trip it."""
-        mise = (ROOT / 'mise.toml').read_text()
-        configured = ''
-        for line in mise.splitlines():
-            if line.strip().startswith('CCB_LEGACY_EXT_IDS'):
-                configured = line.split('=', 1)[1].strip().strip('"')
-        ids = [i.strip() for i in configured.split(',') if i.strip()]
-        self.assertNotIn('claudecodebrowser@ligandal.com', ids)
-        for ext_id in ids:
-            self.assertNotIn('ligandal', ext_id.lower())
-        self.assertNotIn(extension_id(), ids,
-                         'the current id is added separately; listing it twice '
-                         'would emit a duplicate key')
+    def test_the_update_manifest_names_only_the_current_id(self):
+        """Firefox refuses an update whose id differs from the installed one,
+        so an entry for a retired id rescued nobody: those installs
+        downloaded the .xpi and failed every check. Listing upstream's id
+        would also offer this fork's build to their users. Runs the
+        manifest writer the script uses, so a re-added id shows up here."""
+        script = (ROOT / 'scripts' / 'package-extension.sh').read_text()
+        start = script.index("python3 > \"$DIST/updates.json\" <<'PYEOF'\n")
+        body = script[start:].split("<<'PYEOF'\n", 1)[1].split('\nPYEOF', 1)[0]
+        env = dict(os.environ, CCB_EXT_ID=extension_id(), CCB_VERSION='9.9.9',
+                   CCB_XPI_URL='https://example.test/x.xpi',
+                   CCB_LEGACY_EXT_IDS='{31c66d81-5dcd-4210-97ab-098400466392}')
+        out = subprocess.run([sys.executable, '-c', body], env=env,
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(list(json.loads(out)['addons']), [extension_id()])
 
     def test_signing_credentials_are_not_passed_in_argv(self):
         for script in ('scripts/package-extension.sh', 'scripts/package-extension.ps1'):

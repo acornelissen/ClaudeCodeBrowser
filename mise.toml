@@ -32,14 +32,6 @@ run = [
 description = "Build an unsigned .xpi into dist/ (temporary-load only)"
 run = "./scripts/package-extension.sh"
 
-[env]
-# Extension ids this fork has shipped and retired. Firefox looks up only its
-# own id in updates.json, so without these, installs of an older build poll
-# forever and are never offered an update. Upstream's
-# claudecodebrowser@ligandal.com is deliberately NOT listed: offering our
-# build to their users would be a hijack, not a rescue.
-CCB_LEGACY_EXT_IDS = "{31c66d81-5dcd-4210-97ab-098400466392}"
-
 [tasks.sign]
 description = "Build and AMO-sign an .xpi into dist/ (needs AMO_JWT_* in mise.local.toml)"
 run = "./scripts/package-extension.sh --sign"
