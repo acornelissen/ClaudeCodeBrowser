@@ -1002,6 +1002,50 @@ class HumanApprovalBranchTests(unittest.TestCase):
         self.assertNotIn('confirm_token', result)
         self.assertEqual(dispatched, [])
 
+    def test_an_approved_action_is_checked_again_as_human_approved(self):
+        """The approval satisfies only the protected-site confirmation. The
+        second pass is what still applies the rest of the policy, and what
+        records the call as allowed_by_human in the audit log."""
+        with unittest.mock.patch.object(
+                self.guard, 'check', wraps=self.guard.check) as spy:
+            result, dispatched = self._click({'success': True, 'approved': True})
+        self.assertTrue(result.get('success'), result)
+        self.assertEqual(dispatched, ['click'])
+        self.assertEqual([c.kwargs.get('human_approved', False)
+                          for c in spy.call_args_list], [False, True])
+
+    def test_an_approval_does_not_override_a_later_denial(self):
+        """Whatever the second pass refuses stays refused: the person approved
+        a protected action, not a rate limit or a blocklist hit."""
+        later = {'success': False, 'safety_decision': 'rate_limited',
+                 'error': 'too many calls'}
+        real_check = self.guard.check
+
+        def check(tool_name, arguments, human_approved=False):
+            return later if human_approved else real_check(tool_name, arguments)
+
+        with unittest.mock.patch.object(self.guard, 'check', check):
+            result, dispatched = self._click({'success': True, 'approved': True})
+        self.assertEqual(result, later)
+        self.assertEqual(dispatched, [])
+
+    def test_headless_mode_does_not_wait_for_a_human_who_is_not_there(self):
+        """Headless has nobody at the browser, so it keeps the token flow
+        rather than blocking on a prompt nobody will answer."""
+        def refuse(*args, **kwargs):
+            raise AssertionError('headless mode must not show a prompt')
+
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        handler._request_human_approval = refuse
+        dispatched = []
+        handler._dispatch_action = (
+            lambda action, tab_id, arguments: dispatched.append(action) or {})
+        with unittest.mock.patch.object(server, 'HEADLESS_MODE', True):
+            result = handler.execute_tool('browser_click', {'selector': '#send'})
+        self.assertFalse(result['success'])
+        self.assertTrue(result.get('confirmation_required'), result)
+        self.assertEqual(dispatched, [])
+
     def test_an_unprotected_page_is_not_prompted_about(self):
         self.guard.note_url({'url': 'https://example.com/page'})
 
