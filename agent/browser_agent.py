@@ -26,7 +26,30 @@ import urllib.request
 import urllib.error
 
 # Configuration
-MCP_SERVER_URL = os.environ.get('CLAUDE_BROWSER_URL', 'http://127.0.0.1:8765')
+# Environment variables are CLAUDE_BROWSERX_*. The CLAUDE_BROWSER_* names from
+# before the project was renamed are still read, with a warning, for one
+# release, so an existing configuration keeps working while it is updated.
+_ENV_PREFIX = 'CLAUDE_BROWSERX_'
+_LEGACY_ENV_PREFIX = 'CLAUDE_BROWSER' + '_'
+
+
+def _env(name, default=None):
+    """CLAUDE_BROWSERX_<name>, else the legacy CLAUDE_BROWSER_<name>.
+
+    A copy of env() in mcp-server/safety.py: this file is installed and run
+    on its own and cannot import it. Warns on stderr, never stdout."""
+    value = os.environ.get(_ENV_PREFIX + name)
+    if value is not None:
+        return value
+    legacy = os.environ.get(_LEGACY_ENV_PREFIX + name)
+    if legacy is not None:
+        sys.stderr.write(f"{_LEGACY_ENV_PREFIX}{name} is deprecated: set "
+                         f"{_ENV_PREFIX}{name} instead.\n")
+        return legacy
+    return default
+
+
+MCP_SERVER_URL = _env('URL', 'http://127.0.0.1:8765')
 _TOKEN_FILE = Path.home() / '.claudecodebrowser' / 'api_token'
 
 # Argument names whose values must never be logged or retained. This client
@@ -177,9 +200,9 @@ def _api_headers(url: Optional[str] = None) -> dict:
 
     The token is full control of the user's browser. MCP_SERVER_URL comes from
     the environment with no validation, so attaching the token unconditionally
-    meant one stray CLAUDE_BROWSER_URL in a shell profile or CI env sent it in
+    meant one stray CLAUDE_BROWSERX_URL in a shell profile or CI env sent it in
     cleartext to that host on the first call. Set
-    CLAUDE_BROWSER_ALLOW_REMOTE=1 to override deliberately.
+    CLAUDE_BROWSERX_ALLOW_REMOTE=1 to override deliberately.
     """
     # Read MCP_SERVER_URL at call time, not as a default argument: bound at
     # definition time it froze the value the module was imported with, so a
@@ -188,7 +211,7 @@ def _api_headers(url: Optional[str] = None) -> dict:
     if url is None:
         url = MCP_SERVER_URL
     headers = {'Content-Type': 'application/json'}
-    if not _is_loopback(url) and os.environ.get('CLAUDE_BROWSER_ALLOW_REMOTE') != '1':
+    if not _is_loopback(url) and _env('ALLOW_REMOTE') != '1':
         return headers
     try:
         if _TOKEN_FILE.exists():

@@ -42,9 +42,9 @@ MIT license with the original copyright retained.
 
 | Browser | Attended (extension) | Headless (Playwright) |
 |---------|---------------------|----------------------|
-| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSER_ENGINE=firefox` (default; not on macOS 27 from a terminal, see [Headless Mode](#headless-mode)) |
-| Chromium / Chrome | 🧪 Experimental build via `scripts/build-chrome.sh` (MV3) | ✅ `CLAUDE_BROWSER_ENGINE=chromium` |
-| WebKit (Safari engine) | — | ✅ `CLAUDE_BROWSER_ENGINE=webkit` |
+| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSERX_ENGINE=firefox` (default; not on macOS 27 from a terminal, see [Headless Mode](#headless-mode)) |
+| Chromium / Chrome | 🧪 Experimental build via `scripts/build-chrome.sh` (MV3) | ✅ `CLAUDE_BROWSERX_ENGINE=chromium` |
+| WebKit (Safari engine) | — | ✅ `CLAUDE_BROWSERX_ENGINE=webkit` |
 
 Attended mode drives your real browser with your logged-in sessions. Headless mode launches a fresh, isolated browser — best for CI, servers, and unattended tasks. See [Headless Mode](#headless-mode).
 
@@ -76,7 +76,7 @@ The WebSocket handshake refuses a browser `Origin` outright. WebSockets are
 exempt from CORS, so any page you visit could otherwise open a connection to
 the loopback port — the API token refused it, but only after the handshake
 had completed. A local client sending no `Origin` header still connects and
-is still token-checked. Override with `CLAUDE_BROWSER_WS_ORIGINS`:
+is still token-checked. Override with `CLAUDE_BROWSERX_WS_ORIGINS`:
 
 | Value | Effect |
 |-------|--------|
@@ -126,7 +126,7 @@ connection of its own.
 - Saves the screenshot taken from the context menu's *Take Screenshot for
   Claude*. Screenshots from `browser_screenshot` are saved by the server, at
   `~/.claudecodebrowser/screenshots/`, created `0700` (override with
-  `CLAUDE_BROWSER_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see
+  `CLAUDE_BROWSERX_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see
   [Screenshot retention](#screenshot-retention)
 - Starts the MCP server when it is not running, and restarts it if it dies.
   Before trusting whatever is on port 8765 it requires proof that the listener
@@ -471,31 +471,31 @@ By hand:
 python3 -m pip install playwright
 python3 -m playwright install firefox   # or: chromium / webkit
 
-CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSERX_HEADLESS=1 python3 mcp-server/server.py
 ```
 
 > **macOS 27: use Chromium.** Firefox is the default engine, but on macOS 27
 > it cannot start when the server was launched from a terminal (or from
 > Claude Code): the OS's app data protection denies such processes access to
 > `~/Library/Application Support/Firefox`, and Firefox exits with `Could not
-> find profile folder`. Set `CLAUDE_BROWSER_ENGINE=chromium`. Granting the
+> find profile folder`. Set `CLAUDE_BROWSERX_ENGINE=chromium`. Granting the
 > terminal access to other apps' data would work round it, but would also
 > expose your browser cookies to the agent's shell.
 
-Pick the engine with `CLAUDE_BROWSER_ENGINE`:
+Pick the engine with `CLAUDE_BROWSERX_ENGINE`:
 
 ```bash
-CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
-CLAUDE_BROWSER_ENGINE=webkit   CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSERX_ENGINE=chromium CLAUDE_BROWSERX_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSERX_ENGINE=webkit   CLAUDE_BROWSERX_HEADLESS=1 python3 mcp-server/server.py
 ```
 
 To use a browser you already have (a system install, or a Playwright build at
 a different revision) instead of running `playwright install`, point
-`CLAUDE_BROWSER_EXECUTABLE` at the binary:
+`CLAUDE_BROWSERX_EXECUTABLE` at the binary:
 
 ```bash
-CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_EXECUTABLE=/usr/bin/chromium \
-  CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
+CLAUDE_BROWSERX_ENGINE=chromium CLAUDE_BROWSERX_EXECUTABLE=/usr/bin/chromium \
+  CLAUDE_BROWSERX_HEADLESS=1 python3 mcp-server/server.py
 ```
 
 Headless mode supports the core toolset (navigate, screenshot, click, type,
@@ -505,7 +505,7 @@ returns a `tabId` usable with `tab_id` on every other tool. The same safety
 guards apply, except that a protected-site action always takes the
 `confirm_token` route, since no human is there to approve it. Startup takes
 ~15 seconds; the server holds the first command until the browser is ready
-(tunable via `CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT`, default 45s).
+(tunable via `CLAUDE_BROWSERX_HEADLESS_STARTUP_TIMEOUT`, default 45s).
 
 Not implemented headless, and answered with `Unsupported headless action`:
 console and network logging, `browser_observe_element` /
@@ -711,7 +711,7 @@ agent.call_tool("browser_stop_logging")
 > `native_host.log` is rotated only when the host starts and finds it over
 > 5 MB. The server and native host log at
 > INFO and record the shape of a command, not its payload — raise them with
-> `CLAUDE_BROWSER_DEBUG=1` / `CLAUDE_BROWSER_HOST_DEBUG=1` when you need the
+> `CLAUDE_BROWSERX_DEBUG=1` / `CLAUDE_BROWSERX_HOST_DEBUG=1` when you need the
 > detail, and remember that detail includes page content. Sensitive argument
 > values (`text`, `script`, `value`, `password`, `steps`, `action_script`,
 > `condition`, `key`, `url_pattern`) are replaced with `***` wherever they sit
@@ -916,7 +916,7 @@ curl -X POST http://localhost:8765/mcp/call \
 | Path | Description |
 |------|-------------|
 | `~/.claudecodebrowser/` | Main installation directory |
-| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`, each file `0600`; override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`). Pruned after 7 days / 500 files — see [Screenshot retention](#screenshot-retention) |
+| `~/.claudecodebrowser/screenshots/` | Saved screenshots (`0700`, each file `0600`; override with `CLAUDE_BROWSERX_SCREENSHOTS_DIR`). Pruned after 7 days / 500 files — see [Screenshot retention](#screenshot-retention) |
 | `~/.claudecodebrowser/logs/` | Log files, including the safety guard's `audit.jsonl` |
 | `~/.claudecodebrowser/api_token` | HTTP/WebSocket API token (`0600`, generated on first run) |
 | `~/.claudecodebrowser/safety.json` | Safety guard configuration (written with defaults on first run) |
@@ -934,8 +934,8 @@ defaults:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS` | `7` | Delete screenshots older than this. `0` disables the age sweep. |
-| `CLAUDE_BROWSER_SCREENSHOT_MAX_FILES` | `500` | Keep at most this many, oldest deleted first. `0` disables the cap. |
+| `CLAUDE_BROWSERX_SCREENSHOT_RETENTION_DAYS` | `7` | Delete screenshots older than this. `0` disables the age sweep. |
+| `CLAUDE_BROWSERX_SCREENSHOT_MAX_FILES` | `500` | Keep at most this many, oldest deleted first. `0` disables the cap. |
 
 Setting both to `0` keeps an indefinite visual record, which is a choice
 rather than an accident. An unparseable value (`7d`, `forever`) logs a
@@ -945,7 +945,7 @@ nowhere and you saw only restart backoff.
 
 **Pruning only ever touches a directory this project created.** It deletes
 `*.png` with no way to tell its own files from yours, and
-`CLAUDE_BROWSER_SCREENSHOTS_DIR` can point anywhere — `~/Pictures`,
+`CLAUDE_BROWSERX_SCREENSHOTS_DIR` can point anywhere — `~/Pictures`,
 `~/Desktop`, a repo's `docs/screenshots`. So a directory is prunable only if
 it contains a `.ccb-screenshots` marker file, which is written when the
 server creates the directory itself. Point the override at a directory that
@@ -953,7 +953,7 @@ already exists and nothing in it is ever deleted. If you *want* an existing
 directory swept, create the marker by hand:
 
 ```bash
-touch "$CLAUDE_BROWSER_SCREENSHOTS_DIR/.ccb-screenshots"
+touch "$CLAUDE_BROWSERX_SCREENSHOTS_DIR/.ccb-screenshots"
 ```
 
 A screenshot of a private-browsing window is never written to disk at all.
@@ -1009,7 +1009,7 @@ Tooling is pinned with [mise](https://mise.jdx.dev) (Python, Node and
 
 1. Start the MCP server with debug logging:
    ```bash
-   CLAUDE_BROWSER_DEBUG=1 python3 mcp-server/server.py
+   CLAUDE_BROWSERX_DEBUG=1 python3 mcp-server/server.py
    ```
 
 2. Load the extension temporarily in Firefox
@@ -1134,8 +1134,8 @@ the `browser_safety_status` tool.
 | **Blocklist scope** | `blocked_url_patterns` / `allowed_url_patterns` apply to the page a tool acts on, not only to a navigation argument, so blocking a domain also refuses reads on an already-open tab there. |
 | **Low-risk acts** | `browser_scroll`, `browser_scroll_and_capture`, `browser_hover`, `browser_highlight` and `browser_focus_tab` change state, so read-only mode blocks them, but they do not raise a protected-site prompt — prompting on every scroll teaches people to click Approve without reading. `browser_screenshot_all_tabs` is **not** observation: it activates and photographs every tab in every window. |
 | **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus the Approve/Deny window described above. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
-| **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
-| **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, `browser_inject_observer` and `browser_audit_page` entirely. `browser_audit_page` only observes, but it does so by running a fixed script in the page, so the toggle covers it; `browser_safety_status` lists every tool it covers as `script_tools`. |
+| **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSERX_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
+| **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSERX_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, `browser_inject_observer` and `browser_audit_page` entirely. `browser_audit_page` only observes, but it does so by running a fixed script in the page, so the toggle covers it; `browser_safety_status` lists every tool it covers as `script_tools`. |
 | **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
 | **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords, pressed keys, URL patterns) redacted at any depth and URLs reduced to scheme, host and path. Nothing is written while `"enabled": false`. |
 

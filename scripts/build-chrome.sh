@@ -7,7 +7,7 @@
 # (browser -> chrome, browserAction -> action) and an MV3 manifest. The result
 # loads in Chrome via chrome://extensions -> "Load unpacked", but is not yet
 # regularly tested there — treat it as a preview. For unattended Chromium
-# automation, the headless Playwright backend (CLAUDE_BROWSER_ENGINE=chromium)
+# automation, the headless Playwright backend (CLAUDE_BROWSERX_ENGINE=chromium)
 # is the supported path.
 #
 # Known MV3 caveats:
@@ -132,4 +132,4 @@ echo ""
 echo "This build is EXPERIMENTAL. Network logging captures metadata and headers"
 echo "but not response bodies (filterResponseData is Firefox-only). For reliable"
 echo "Chromium automation use the headless backend instead:"
-echo "  CLAUDE_BROWSER_ENGINE=chromium CLAUDE_BROWSER_HEADLESS=1"
+echo "  CLAUDE_BROWSERX_ENGINE=chromium CLAUDE_BROWSERX_HEADLESS=1"

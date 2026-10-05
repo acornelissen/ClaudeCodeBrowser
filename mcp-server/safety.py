@@ -50,9 +50,9 @@ browser. The guard enforces, in order:
 Configuration lives in ~/.claudecodebrowser/safety.json (created with safe
 defaults on first run). Environment overrides:
 
-  CLAUDE_BROWSER_READ_ONLY=1        force read-only mode
-  CLAUDE_BROWSER_ALLOW_SCRIPTS=0    disable script-execution tools
-  CLAUDE_BROWSER_SAFETY_CONFIG=path alternate config file
+  CLAUDE_BROWSERX_READ_ONLY=1        force read-only mode
+  CLAUDE_BROWSERX_ALLOW_SCRIPTS=0    disable script-execution tools
+  CLAUDE_BROWSERX_SAFETY_CONFIG=path alternate config file
 
 """
 
@@ -71,8 +71,31 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 
 logger = logging.getLogger('ClaudeCodeBrowser.Safety')
 
-_CONFIG_FILE = Path(os.environ.get(
-    'CLAUDE_BROWSER_SAFETY_CONFIG',
+# Environment variables are CLAUDE_BROWSERX_*. The CLAUDE_BROWSER_* names from
+# before the project was renamed are still read, with a warning, for one
+# release, so an existing configuration keeps working while it is updated.
+ENV_PREFIX = 'CLAUDE_BROWSERX_'
+LEGACY_ENV_PREFIX = 'CLAUDE_BROWSER' + '_'
+_warned_legacy_env = set()
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """The value of CLAUDE_BROWSERX_<name>, else the legacy CLAUDE_BROWSER_<name>."""
+    value = os.environ.get(ENV_PREFIX + name)
+    if value is not None:
+        return value
+    legacy = os.environ.get(LEGACY_ENV_PREFIX + name)
+    if legacy is not None:
+        if name not in _warned_legacy_env:
+            _warned_legacy_env.add(name)
+            logger.warning(
+                f"{LEGACY_ENV_PREFIX}{name} is deprecated: set "
+                f"{ENV_PREFIX}{name} instead. The old name stops working in "
+                f"the next release.")
+        return legacy
+    return default
+
+_CONFIG_FILE = Path(env('SAFETY_CONFIG',
     str(Path.home() / '.claudecodebrowser' / 'safety.json')
 ))
 _AUDIT_FILE = Path.home() / '.claudecodebrowser' / 'logs' / 'audit.jsonl'
@@ -491,13 +514,13 @@ def _env_number(name: str, default, cast):
     RETENTION_DAYS=7d into a server that never starts and a user who sees
     only restart backoff with no traceback anywhere.
     """
-    raw = os.environ.get(name)
+    raw = env(name)
     if raw is None or raw == '':
         return default
     try:
         value = cast(raw)
     except (TypeError, ValueError):
-        logger.warning(f"Ignoring {name}={raw!r}: not a number. "
+        logger.warning(f"Ignoring {ENV_PREFIX}{name}={raw!r}: not a number. "
                        f"Using {default}.")
         return default
     if value < 0:
@@ -508,12 +531,12 @@ def _env_number(name: str, default, cast):
 
 
 SCREENSHOT_RETENTION_DAYS = _env_number(
-    'CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS', 7.0, float)
+    'SCREENSHOT_RETENTION_DAYS', 7.0, float)
 SCREENSHOT_MAX_FILES = _env_number(
-    'CLAUDE_BROWSER_SCREENSHOT_MAX_FILES', 500, int)
+    'SCREENSHOT_MAX_FILES', 500, int)
 
 # Pruning only ever touches a directory this project created, and this file is
-# how it knows. CLAUDE_BROWSER_SCREENSHOTS_DIR can point anywhere - ~/Pictures,
+# how it knows. CLAUDE_BROWSERX_SCREENSHOTS_DIR can point anywhere - ~/Pictures,
 # ~/Desktop, a repo's docs/screenshots - and the retention pass deletes every
 # *.png older than the window with no way to tell ours from the user's. So an
 # override aimed at an existing directory is never pruned: a privacy feature
@@ -527,8 +550,8 @@ def prune_screenshots(directory: Path) -> Dict[str, int]:
     """Delete screenshots that are too old or too numerous.
 
     Retention is a deliberate default rather than "keep everything": set
-    CLAUDE_BROWSER_SCREENSHOT_RETENTION_DAYS=0 and
-    CLAUDE_BROWSER_SCREENSHOT_MAX_FILES=0 to disable, which is a choice to
+    CLAUDE_BROWSERX_SCREENSHOT_RETENTION_DAYS=0 and
+    CLAUDE_BROWSERX_SCREENSHOT_MAX_FILES=0 to disable, which is a choice to
     keep an indefinite visual record.
     """
     removed_age = 0
@@ -624,12 +647,12 @@ def resolve_screenshots_dir() -> Path:
     A screenshot can contain anything that was on screen — open mail, a
     logged-in dashboard — so the default lives in the user's own directory with
     0700 permissions rather than a world-readable shared /tmp. An explicit
-    CLAUDE_BROWSER_SCREENSHOTS_DIR is honoured as given: the location is then
+    CLAUDE_BROWSERX_SCREENSHOTS_DIR is honoured as given: the location is then
     the user's choice and its permissions are left alone. A directory this
     function creates is marked as ours so retention can prune it; one that
     already existed is not, because its other contents are not ours to delete.
     """
-    override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+    override = env('SCREENSHOTS_DIR')
     if override:
         path = Path(override).expanduser()
         existed = path.is_dir()
@@ -680,9 +703,9 @@ def _load_config() -> Dict[str, Any]:
         # A broken config must not silently disable the guard - keep defaults.
         logger.error(f"Failed to load {_CONFIG_FILE}, using defaults: {e}")
 
-    if os.environ.get('CLAUDE_BROWSER_READ_ONLY') == '1':
+    if env('READ_ONLY') == '1':
         config['read_only'] = True
-    if os.environ.get('CLAUDE_BROWSER_ALLOW_SCRIPTS') == '0':
+    if env('ALLOW_SCRIPTS') == '0':
         config['allow_script_execution'] = False
     return config
 
@@ -979,7 +1002,7 @@ class SafetyGuard:
         if self.config.get('read_only', False):
             return self._deny('read_only',
                               f"{tool_name} refused: safety guard is in read-only mode "
-                              f"(read_only in safety.json or CLAUDE_BROWSER_READ_ONLY=1). "
+                              f"(read_only in safety.json or CLAUDE_BROWSERX_READ_ONLY=1). "
                               f"Observation tools like browser_screenshot remain available.")
 
         # 4. Script rules: the toggle, and the protected-site refusal.
@@ -1032,7 +1055,7 @@ class SafetyGuard:
             return self._deny('scripts_disabled',
                               f"{tool_name} refused: script execution is disabled "
                               f"(allow_script_execution in safety.json or "
-                              f"CLAUDE_BROWSER_ALLOW_SCRIPTS=0).")
+                              f"CLAUDE_BROWSERX_ALLOW_SCRIPTS=0).")
 
         # Arbitrary JavaScript on a protected site is refused outright, not
         # merely confirmed. A script can read any field - the credential guard

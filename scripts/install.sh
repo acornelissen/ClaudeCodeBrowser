@@ -216,7 +216,7 @@ if [ "$HEADLESS" = "1" ]; then
             && python3 -m playwright install chromium; then
         echo -e "${GREEN}✓ Playwright and Chromium installed${NC}"
         echo "  To run headless, add to the claudecodebrowser server's env:"
-        echo '    "CLAUDE_BROWSER_HEADLESS": "1", "CLAUDE_BROWSER_ENGINE": "chromium"'
+        echo '    "CLAUDE_BROWSERX_HEADLESS": "1", "CLAUDE_BROWSERX_ENGINE": "chromium"'
     else
         echo -e "${RED}✗ Could not install Playwright; headless mode will not start${NC}"
     fi

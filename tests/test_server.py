@@ -341,6 +341,41 @@ class HeadlessDeadlineTests(unittest.TestCase):
                          'the schema must advertise the cap the backend applies')
 
 
+class RenamedEnvironmentTests(unittest.TestCase):
+    """The project was renamed to ClaudeCodeBrowserX, and its variables to
+    CLAUDE_BROWSERX_*. The old CLAUDE_BROWSER_* names keep working for one
+    release, with a warning, so an existing configuration does not silently
+    lose a setting - CLAUDE_BROWSER_READ_ONLY=1 quietly ignored would be a
+    guard switched off."""
+
+    NEW = 'CLAUDE_BROWSERX_CCB_ENV_TEST'
+    OLD = 'CLAUDE_BROWSER' + '_CCB_ENV_TEST'
+
+    def setUp(self):
+        safety._warned_legacy_env.discard('CCB_ENV_TEST')
+
+    def test_the_new_name_is_read(self):
+        with unittest.mock.patch.dict(os.environ, {self.NEW: 'new'}):
+            self.assertEqual(safety.env('CCB_ENV_TEST'), 'new')
+
+    def test_the_new_name_wins_over_the_old(self):
+        with unittest.mock.patch.dict(os.environ,
+                                      {self.NEW: 'new', self.OLD: 'old'}):
+            self.assertEqual(safety.env('CCB_ENV_TEST'), 'new')
+
+    def test_the_old_name_still_works_and_says_so(self):
+        with unittest.mock.patch.dict(os.environ, {self.OLD: 'old'}):
+            os.environ.pop(self.NEW, None)
+            with self.assertLogs(safety.logger, level='WARNING') as logs:
+                self.assertEqual(safety.env('CCB_ENV_TEST'), 'old')
+        self.assertIn(self.NEW, ''.join(logs.output))
+
+    def test_neither_gives_the_default(self):
+        for name in (self.NEW, self.OLD):
+            os.environ.pop(name, None)
+        self.assertEqual(safety.env('CCB_ENV_TEST', 'fallback'), 'fallback')
+
+
 class RetentionConfigTests(unittest.TestCase):
     """These two variables are read at import time and the native host runs
     the server with stderr=DEVNULL, so a bad value used to be a server that
@@ -348,7 +383,8 @@ class RetentionConfigTests(unittest.TestCase):
     backoff."""
 
     def _read(self, raw, default, cast):
-        with unittest.mock.patch.dict(os.environ, {'CCB_TEST_NUM': raw}):
+        with unittest.mock.patch.dict(os.environ,
+                                      {'CLAUDE_BROWSERX_CCB_TEST_NUM': raw}):
             return safety._env_number('CCB_TEST_NUM', default, cast)
 
     def test_an_unparseable_value_falls_back_to_the_default(self):
@@ -369,7 +405,7 @@ class RetentionConfigTests(unittest.TestCase):
 
     def test_an_unset_variable_uses_the_default(self):
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('CCB_TEST_NUM', None)
+            os.environ.pop('CLAUDE_BROWSERX_CCB_TEST_NUM', None)
             self.assertEqual(safety._env_number('CCB_TEST_NUM', 7.0, float),
                              7.0)
 
@@ -385,7 +421,7 @@ class ScreenshotPruningTests(unittest.TestCase):
         # Pruning only touches a directory this project created, so the tests
         # that expect deletion have to say the directory is ours.
         (self.dir / safety.OWNED_DIR_MARKER).touch()
-        # Both come from CLAUDE_BROWSER_SCREENSHOT_* at import time, so a
+        # Both come from CLAUDE_BROWSERX_SCREENSHOT_* at import time, so a
         # developer with either exported ran different tests from CI: with
         # RETENTION_DAYS=60 the month-old screenshot below survives and two
         # tests failed for a reason that had nothing to do with the code.
@@ -444,7 +480,7 @@ class ScreenshotPruningTests(unittest.TestCase):
         self.assertEqual(result, {'removed_age': 0, 'removed_count': 0})
 
     def test_a_directory_we_did_not_create_is_never_pruned(self):
-        """CLAUDE_BROWSER_SCREENSHOTS_DIR can point at ~/Pictures or a repo's
+        """CLAUDE_BROWSERX_SCREENSHOTS_DIR can point at ~/Pictures or a repo's
         docs/screenshots. Pruning every *.png older than the retention window
         there would delete the user's own files on the first screenshot, which
         is a worse failure than the retention it closes."""
@@ -465,9 +501,9 @@ class ScreenshotPruningTests(unittest.TestCase):
 
     def test_the_marker_is_written_for_the_default_directory(self):
         with unittest.mock.patch.dict(
-                os.environ, {'CLAUDE_BROWSER_SCREENSHOTS_DIR': ''},
+                os.environ, {'CLAUDE_BROWSERX_SCREENSHOTS_DIR': ''},
                 clear=False):
-            os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+            os.environ.pop('CLAUDE_BROWSERX_SCREENSHOTS_DIR')
             resolved = safety.resolve_screenshots_dir()
         self.assertTrue((resolved / safety.OWNED_DIR_MARKER).exists(),
                         'our own directory must be marked as prunable')
@@ -476,7 +512,7 @@ class ScreenshotPruningTests(unittest.TestCase):
         fresh = self.dir / 'fresh-override'
         with unittest.mock.patch.dict(
                 os.environ,
-                {'CLAUDE_BROWSER_SCREENSHOTS_DIR': str(fresh)}):
+                {'CLAUDE_BROWSERX_SCREENSHOTS_DIR': str(fresh)}):
             resolved = safety.resolve_screenshots_dir()
         self.assertTrue((resolved / safety.OWNED_DIR_MARKER).exists(),
                         'a directory we created is ours to prune')
@@ -486,7 +522,7 @@ class ScreenshotPruningTests(unittest.TestCase):
         theirs.mkdir()
         with unittest.mock.patch.dict(
                 os.environ,
-                {'CLAUDE_BROWSER_SCREENSHOTS_DIR': str(theirs)}):
+                {'CLAUDE_BROWSERX_SCREENSHOTS_DIR': str(theirs)}):
             resolved = safety.resolve_screenshots_dir()
         self.assertFalse((resolved / safety.OWNED_DIR_MARKER).exists(),
                          'a directory that already held the user\'s files '

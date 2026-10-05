@@ -3,8 +3,8 @@
 Headless browser backend for ClaudeCodeBrowser.
 
 Uses Playwright to drive Firefox, Chromium, or WebKit without a display.
-Activated when CLAUDE_BROWSER_HEADLESS=1 or --headless is passed.
-Pick the engine with CLAUDE_BROWSER_ENGINE=firefox|chromium|webkit (default firefox).
+Activated when CLAUDE_BROWSERX_HEADLESS=1 or --headless is passed.
+Pick the engine with CLAUDE_BROWSERX_ENGINE=firefox|chromium|webkit (default firefox).
 
 Install: pip install playwright && playwright install firefox   (or chromium/webkit)
 
@@ -23,7 +23,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from safety import (prune_screenshots, resolve_screenshots_dir,
+from safety import (env, prune_screenshots, resolve_screenshots_dir,
                     screenshot_filename)
 
 logger = logging.getLogger('ClaudeCodeBrowser.Headless')
@@ -51,12 +51,12 @@ MAX_WAIT_AND_ACT_TIMEOUT_MS = 30000
 MAX_TYPING_MS = 30000
 
 # Firefox vs Chromium vs WebKit: default Firefox to match the visible-mode extension
-BROWSER_TYPE = os.environ.get('CLAUDE_BROWSER_ENGINE', 'firefox')
+BROWSER_TYPE = env('ENGINE', 'firefox')
 
 # Optional path to a browser executable. Lets headless mode use a system
 # browser or a pre-installed Playwright build at a nonstandard revision,
 # instead of requiring "playwright install".
-EXECUTABLE_PATH = os.environ.get('CLAUDE_BROWSER_EXECUTABLE')
+EXECUTABLE_PATH = env('EXECUTABLE')
 
 
 # Argument coercion, mirroring parseFlag() in extension/background.js.
@@ -734,7 +734,7 @@ class HeadlessBrowser:
             # Captured into memory, not written by Playwright. Handing
             # Playwright a path= made it write the file with a plain
             # open(path, 'wb'): umask permissions (0644) and symlinks
-            # followed, so with a shared CLAUDE_BROWSER_SCREENSHOTS_DIR
+            # followed, so with a shared CLAUDE_BROWSERX_SCREENSHOTS_DIR
             # someone could pre-create a predictable name as a symlink and
             # have another of this user's files truncated. The attended path
             # (_save_screenshot in server.py) and the native host were both

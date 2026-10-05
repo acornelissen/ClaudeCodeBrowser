@@ -58,10 +58,12 @@ LOG_FILE = LOG_DIR / 'mcp_server.log'
 # INFO with rotation. At DEBUG this file grew without bound (~18 MB/day, most
 # of it /browser/poll access lines from the 500ms poll) and the WebSocket path
 # would have written entire tool results - page text, network bodies, base64
-# screenshots - into it. CLAUDE_BROWSER_DEBUG=1 restores DEBUG.
+# screenshots - into it. CLAUDE_BROWSERX_DEBUG=1 restores DEBUG.
 from logging.handlers import RotatingFileHandler
 
-_SERVER_DEBUG = os.environ.get('CLAUDE_BROWSER_DEBUG') == '1'
+from safety import env  # CLAUDE_BROWSERX_*, legacy names honoured
+
+_SERVER_DEBUG = env('DEBUG') == '1'
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
@@ -97,8 +99,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger('ClaudeCodeBrowser.MCPServer')
 
-# Headless mode: CLAUDE_BROWSER_HEADLESS=1 or --headless flag
-HEADLESS_MODE = os.environ.get('CLAUDE_BROWSER_HEADLESS', '0') == '1' or '--headless' in sys.argv
+# Headless mode: CLAUDE_BROWSERX_HEADLESS=1 or --headless flag
+HEADLESS_MODE = env('HEADLESS', '0') == '1' or '--headless' in sys.argv
 
 # The asyncio event loop owned by the main thread (started via asyncio.run in
 # main()). Published so ThreadingHTTPServer worker threads can dispatch onto it
@@ -108,7 +110,7 @@ MAIN_EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # How long a command waits for Playwright Firefox to finish booting before
 # giving up. Launching takes ~15s while the HTTP port binds immediately.
-HEADLESS_STARTUP_TIMEOUT = float(os.environ.get('CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT', '45'))
+HEADLESS_STARTUP_TIMEOUT = float(env('HEADLESS_STARTUP_TIMEOUT', '45'))
 
 from safety import (get_safety_guard, prune_screenshots,
                     screenshot_filename,
@@ -160,9 +162,9 @@ def _load_or_create_api_token() -> str:
 API_TOKEN = _load_or_create_api_token()
 
 # Configuration
-HOST = os.environ.get('CLAUDE_BROWSER_HOST', '127.0.0.1')
-HTTP_PORT = int(os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765'))
-WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
+HOST = env('HOST', '127.0.0.1')
+HTTP_PORT = int(env('HTTP_PORT', '8765'))
+WS_PORT = int(env('WS_PORT', '8766'))
 
 # Cap on a single request body. Nothing legitimate approaches this; without it
 # a bad Content-Length made the handler read unboundedly.
@@ -174,10 +176,10 @@ _REFUSED_BODY_DRAIN_BYTES = 64 * 1024
 # human-in-the-loop wait (solveCaptcha, 200s) so a legitimately slow approval
 # is not discarded, but finite so a command cannot execute long after the
 # caller abandoned it.
-COMMAND_QUEUE_TTL = float(os.environ.get('CLAUDE_BROWSER_COMMAND_TTL', '240'))
+COMMAND_QUEUE_TTL = float(env('COMMAND_TTL', '240'))
 
 # Screenshots directory: ~/.claudecodebrowser/screenshots (0700), or wherever
-# CLAUDE_BROWSER_SCREENSHOTS_DIR points.
+# CLAUDE_BROWSERX_SCREENSHOTS_DIR points.
 SCREENSHOTS_DIR = resolve_screenshots_dir()
 
 
@@ -1881,7 +1883,7 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
                 image_data = base64.b64decode(data)
 
             filepath = SCREENSHOTS_DIR / filename
-            # O_NOFOLLOW: with a shared CLAUDE_BROWSER_SCREENSHOTS_DIR an
+            # O_NOFOLLOW: with a shared CLAUDE_BROWSERX_SCREENSHOTS_DIR an
             # attacker can pre-create a predictable timestamped name as a
             # symlink and have an arbitrary file truncated as this user.
             flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
@@ -1933,7 +1935,7 @@ def run_http_server():
 
 
 def parse_ws_origins(raw: Optional[str]) -> Optional[List[Optional[str]]]:
-    """Parse CLAUDE_BROWSER_WS_ORIGINS into a websockets `origins` list.
+    """Parse CLAUDE_BROWSERX_WS_ORIGINS into a websockets `origins` list.
 
     None in the list means "a request with no Origin header is acceptable",
     which is the only shape a local non-browser client has; a web page always
@@ -1952,7 +1954,7 @@ def parse_ws_origins(raw: Optional[str]) -> Optional[List[Optional[str]]]:
 
     Empty or comma-only means unset rather than "allow nothing", because an
     empty allowlist that refuses everything is never what someone typing
-    CLAUDE_BROWSER_WS_ORIGINS= wanted, and a server nothing can reach is not
+    CLAUDE_BROWSERX_WS_ORIGINS= wanted, and a server nothing can reach is not
     a safety feature.
     """
     if raw is None:
@@ -1963,7 +1965,7 @@ def parse_ws_origins(raw: Optional[str]) -> Optional[List[Optional[str]]]:
         return [None]
     if '*' in entries:
         logger.warning(
-            "CLAUDE_BROWSER_WS_ORIGINS=* accepts a WebSocket handshake from "
+            "CLAUDE_BROWSERX_WS_ORIGINS=* accepts a WebSocket handshake from "
             "any origin, including any web page the user visits. The API "
             "token is then the only thing refusing it.")
         return None
@@ -1977,7 +1979,7 @@ def parse_ws_origins(raw: Optional[str]) -> Optional[List[Optional[str]]]:
 # Origins accepted at the WebSocket handshake. Extension pages present a
 # moz-extension:// origin; a local tool sends no Origin at all.
 ALLOWED_WS_ORIGINS = parse_ws_origins(
-    os.environ.get('CLAUDE_BROWSER_WS_ORIGINS'))
+    env('WS_ORIGINS'))
 
 
 async def websocket_handler(websocket, path=None):

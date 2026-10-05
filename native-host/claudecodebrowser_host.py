@@ -48,8 +48,31 @@ if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5 * 1024 * 1024:
 # message in both directions - page text, tab URLs and titles, typed text,
 # base64 screenshots - in cleartext, with no redaction anywhere in this file,
 # defeating the masking that server.py and safety.py apply to their own logs.
-# CLAUDE_BROWSER_HOST_DEBUG=1 restores it for debugging; see describe_message.
-_HOST_DEBUG = os.environ.get('CLAUDE_BROWSER_HOST_DEBUG') == '1'
+# CLAUDE_BROWSERX_HOST_DEBUG=1 restores it for debugging; see describe_message.
+# Environment variables are CLAUDE_BROWSERX_*. The CLAUDE_BROWSER_* names from
+# before the project was renamed are still read, with a warning, for one
+# release, so an existing configuration keeps working while it is updated.
+_ENV_PREFIX = 'CLAUDE_BROWSERX_'
+_LEGACY_ENV_PREFIX = 'CLAUDE_BROWSER' + '_'
+
+
+def _env(name, default=None):
+    """CLAUDE_BROWSERX_<name>, else the legacy CLAUDE_BROWSER_<name>.
+
+    A copy of env() in mcp-server/safety.py: this file is installed and run
+    on its own and cannot import it. Warns on stderr, never stdout."""
+    value = os.environ.get(_ENV_PREFIX + name)
+    if value is not None:
+        return value
+    legacy = os.environ.get(_LEGACY_ENV_PREFIX + name)
+    if legacy is not None:
+        sys.stderr.write(f"{_LEGACY_ENV_PREFIX}{name} is deprecated: set "
+                         f"{_ENV_PREFIX}{name} instead.\n")
+        return legacy
+    return default
+
+
+_HOST_DEBUG = _env('HOST_DEBUG') == '1'
 
 class _PrivateFileHandler(logging.FileHandler):
     """File handler that keeps its file to this user, including on re-open."""
@@ -772,7 +795,7 @@ def _screenshots_dir():
     pruned. One that already existed is left unmarked - its other contents
     are not ours to delete.
     """
-    override = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
+    override = _env('SCREENSHOTS_DIR')
     if override:
         path = Path(override).expanduser()
         created = not path.is_dir()
@@ -855,7 +878,7 @@ def handle_local_command(message):
             # 0600 and O_NOFOLLOW, matching _save_screenshot in server.py: a
             # plain open() wrote the file at umask permissions (0644) and
             # followed a symlink, so with a shared
-            # CLAUDE_BROWSER_SCREENSHOTS_DIR someone could pre-create a
+            # CLAUDE_BROWSERX_SCREENSHOTS_DIR someone could pre-create a
             # predictable name as a symlink and have another file of this
             # user's truncated.
             flags = (os.O_CREAT | os.O_WRONLY | os.O_TRUNC |

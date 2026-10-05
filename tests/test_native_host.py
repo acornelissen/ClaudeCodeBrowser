@@ -535,13 +535,13 @@ class ScreenshotRetentionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        previous = os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
+        previous = os.environ.pop('CLAUDE_BROWSERX_SCREENSHOTS_DIR', None)
         self.addCleanup(self._restore, previous)
 
     def _restore(self, previous):
-        os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
+        os.environ.pop('CLAUDE_BROWSERX_SCREENSHOTS_DIR', None)
         if previous is not None:
-            os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = previous
+            os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = previous
 
     def _save(self, filename='shot.png'):
         return host.handle_local_command({
@@ -550,14 +550,14 @@ class ScreenshotRetentionTests(unittest.TestCase):
 
     def test_a_directory_the_host_creates_is_marked(self):
         target = Path(self.tmp.name) / 'new-dir'
-        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = str(target)
+        os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = str(target)
         self.assertTrue(self._save()['success'])
         self.assertTrue((target / self.MARKER).is_file(),
                         'without the marker the server never prunes it')
 
     def test_an_existing_directory_is_not_claimed(self):
         target = Path(self.tmp.name)
-        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = str(target)
+        os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = str(target)
         self.assertTrue(self._save()['success'])
         self.assertFalse((target / self.MARKER).exists(),
                          'its other contents are not ours to delete')
@@ -571,7 +571,7 @@ class ScreenshotRetentionTests(unittest.TestCase):
         self.assertEqual(default.stat().st_mode & 0o077, 0)
 
     def test_the_file_is_always_a_png(self):
-        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = self.tmp.name
+        os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = self.tmp.name
         result = self._save('capture.jpg')
         self.assertTrue(result['filepath'].endswith('.png'), result)
 
@@ -593,15 +593,15 @@ class ExplicitScreenshotSaveTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        previous = os.environ.get('CLAUDE_BROWSER_SCREENSHOTS_DIR')
-        os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = self.tmp.name
+        previous = os.environ.get('CLAUDE_BROWSERX_SCREENSHOTS_DIR')
+        os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = self.tmp.name
         self.addCleanup(self._restore_env, previous)
 
     def _restore_env(self, previous):
         if previous is None:
-            os.environ.pop('CLAUDE_BROWSER_SCREENSHOTS_DIR', None)
+            os.environ.pop('CLAUDE_BROWSERX_SCREENSHOTS_DIR', None)
         else:
-            os.environ['CLAUDE_BROWSER_SCREENSHOTS_DIR'] = previous
+            os.environ['CLAUDE_BROWSERX_SCREENSHOTS_DIR'] = previous
 
     def _save(self, filename, data='data:image/png;base64,AAAA'):
         return host.handle_local_command({'action': 'saveScreenshot',

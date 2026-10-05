@@ -22,8 +22,31 @@ from pathlib import Path
 from typing import Optional
 
 # Configuration
-HTTP_HOST = os.environ.get('CLAUDE_BROWSER_HOST', '127.0.0.1')
-HTTP_PORT = int(os.environ.get('CLAUDE_BROWSER_HTTP_PORT', '8765'))
+# Environment variables are CLAUDE_BROWSERX_*. The CLAUDE_BROWSER_* names from
+# before the project was renamed are still read, with a warning, for one
+# release, so an existing configuration keeps working while it is updated.
+_ENV_PREFIX = 'CLAUDE_BROWSERX_'
+_LEGACY_ENV_PREFIX = 'CLAUDE_BROWSER' + '_'
+
+
+def _env(name, default=None):
+    """CLAUDE_BROWSERX_<name>, else the legacy CLAUDE_BROWSER_<name>.
+
+    A copy of env() in mcp-server/safety.py: this file is installed and run
+    on its own and cannot import it. Warns on stderr, never stdout."""
+    value = os.environ.get(_ENV_PREFIX + name)
+    if value is not None:
+        return value
+    legacy = os.environ.get(_LEGACY_ENV_PREFIX + name)
+    if legacy is not None:
+        sys.stderr.write(f"{_LEGACY_ENV_PREFIX}{name} is deprecated: set "
+                         f"{_ENV_PREFIX}{name} instead.\n")
+        return legacy
+    return default
+
+
+HTTP_HOST = _env('HOST', '127.0.0.1')
+HTTP_PORT = int(_env('HTTP_PORT', '8765'))
 HTTP_URL = f'http://{HTTP_HOST}:{HTTP_PORT}'
 
 # Server process reference

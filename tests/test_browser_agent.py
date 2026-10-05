@@ -363,7 +363,7 @@ class ApiTokenTests(AgentTestCase):
 
     # Regression test for defect D6.
     def test_the_token_is_not_sent_to_a_non_loopback_server(self):
-        """CLAUDE_BROWSER_URL chooses the server. The token is a local secret
+        """CLAUDE_BROWSERX_URL chooses the server. The token is a local secret
         for a loopback service, so it must not be attached to a request that
         leaves the machine: one stray environment variable otherwise
         exfiltrates full control of the user's browser."""
