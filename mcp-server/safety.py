@@ -391,6 +391,12 @@ SENSITIVE_ARGS = frozenset({
 URL_ARGS = frozenset({'url'})
 
 
+# `;name=value` inside a path. Servlet containers carry the session there
+# when cookies are off (/x;jsessionid=...); the query is dropped whole, and
+# a path parameter is no less likely to hold a secret.
+_PATH_PARAM_RE = re.compile(r';([^;/=]*)=[^;/]*')
+
+
 def redact_url(url: Any) -> Any:
     """Keep the part of a URL a log needs and drop the parts that carry secrets.
 
@@ -431,7 +437,8 @@ def redact_url(url: Any) -> Any:
     except ValueError:
         had_userinfo = True
     # _normalise_url has already dropped the userinfo from netloc.
-    redacted = f"{scheme}://{'***@' if had_userinfo else ''}{parts.netloc}{parts.path}"
+    redacted = (f"{scheme}://{'***@' if had_userinfo else ''}{parts.netloc}"
+                f"{_PATH_PARAM_RE.sub(r';\1=***', parts.path)}")
     if parts.query:
         redacted += '?***'
     if parts.fragment:

@@ -675,6 +675,16 @@ class RedactionListParityTests(unittest.TestCase):
         self.assertNotIn('PAGE-HELD-SECRET', json.dumps(safe), safe)
 
 
+class PathParamTests(AgentTestCase):
+    """Mirrors redact_url: a path parameter can carry a session id."""
+
+    def test_path_parameter_values_are_masked(self):
+        logged = json.dumps(browser_agent._redact(
+            {'url': 'https://a.test/app;jsessionid=SESS-AGENT-1/page'}))
+        self.assertNotIn('SESS-AGENT-1', logged)
+        self.assertIn('/app;jsessionid=***/page', logged)
+
+
 class NestedArgumentTests(AgentTestCase):
     """_redact looked at top-level keys only, so a credential nested in an
     argument went to verbose output and the action history whole."""

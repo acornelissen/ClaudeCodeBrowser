@@ -1126,6 +1126,27 @@ class NestedRedactionTests(unittest.TestCase):
                          'the caller\'s arguments are not modified')
 
 
+class PathParamRedactionTests(unittest.TestCase):
+    """redact_url dropped the query and fragment but kept the path as
+    written, so a session id carried as a path parameter - /x;jsessionid=...,
+    which servlet containers use when cookies are off - went into
+    audit.jsonl and the server log."""
+
+    def test_path_parameter_values_are_masked(self):
+        logged = safety.redact_url(
+            'https://a.test/app;jsessionid=SESS-AUDIT-1/page;v=SESS-AUDIT-2?q=1')
+        self.assertNotIn('SESS-AUDIT-1', logged)
+        self.assertNotIn('SESS-AUDIT-2', logged)
+        self.assertIn('/app;jsessionid=***/page', logged,
+                      'the path itself stays readable')
+
+    def test_the_audit_file_does_not_get_it(self):
+        g = guard()
+        g.check('browser_navigate',
+                {'url': 'https://a.test/x;jsessionid=SESS-AUDIT-3'})
+        self.assertNotIn('SESS-AUDIT-3', safety._AUDIT_FILE.read_text())
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""

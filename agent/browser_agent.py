@@ -13,6 +13,7 @@ Author: dre@ligandal.com
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import base64
@@ -109,7 +110,9 @@ def _reduce_url(value):
     if '@' in authority:
         authority = '***@' + authority.rpartition('@')[2]
     out = urllib.parse.urlunsplit(
-        (parts.scheme, authority, parts.path, '', ''))
+        (parts.scheme, authority,
+         # A path parameter can carry a session id (/x;jsessionid=...).
+         re.sub(r';([^;/=]*)=[^;/]*', r';\1=***', parts.path), '', ''))
     if parts.query:
         out += '?***'
     if parts.fragment:
