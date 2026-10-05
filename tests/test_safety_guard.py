@@ -755,6 +755,44 @@ class AuditLogTests(unittest.TestCase):
         for entry in entries:
             self.assertEqual(entry['args']['key'], '***')
 
+    def test_every_sensitive_argument_is_masked(self):
+        """Only 'text' and 'key' were pinned, so any other entry could fall
+        out of SENSITIVE_ARGS with the suite still green - and each one
+        carries something the log must not: a typed or set value, a
+        password, or a script that may hold one. Each key goes through a
+        tool that takes it, because the audit file is where it would leak."""
+        cases = {
+            'text': 'browser_type',
+            'value': 'browser_set_value',
+            # No tool declares 'password', but the guard sees whatever the
+            # agent sends, and this is the one name that is never safe.
+            'password': 'browser_type',
+            'script': 'browser_execute_script',
+            'steps': 'browser_run_workflow',
+            'action_script': 'browser_wait_and_act',
+            'condition': 'browser_wait_and_act',
+            'key': 'browser_press_key',
+        }
+        # One direction only: a key removed from SENSITIVE_ARGS has to fail
+        # on what reaches the log below, not on this bookkeeping.
+        self.assertLessEqual(set(safety.SENSITIVE_ARGS), set(cases),
+                             'a new sensitive key needs a case here')
+        g = guard()
+        g.note_url({'url': 'https://example.com/page'})
+        for key, tool in cases.items():
+            secret = f'S3CRET-{key}-value'
+            # steps is a list of step objects, and a list is logged as-is.
+            value = [{'action': 'type', 'text': secret}] \
+                if key == 'steps' else secret
+            with self.subTest(key=key):
+                g.check(tool, {'selector': '#x', key: value})
+                written = safety._AUDIT_FILE.read_text()
+                self.assertEqual(self._last_entry()['tool'], tool,
+                                 'the call has to reach the audit log')
+                self.assertNotIn(secret, written)
+                self.assertEqual(safety.redact_arguments({key: value}),
+                                 {key: '***'})
+
     def test_the_audit_file_is_not_world_readable(self):
         g = guard()
         g.check('browser_get_text', {})
