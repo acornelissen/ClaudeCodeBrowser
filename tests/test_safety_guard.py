@@ -198,6 +198,14 @@ class UrlPolicyTests(unittest.TestCase):
                 self.assertIsNotNone(denial, f'{url} is not localhost')
                 self.assertEqual(denial['safety_decision'], 'not_allowlisted')
 
+    def test_an_allowlisted_origin_with_no_path_is_permitted(self):
+        """The whole URL is one of the prefixes a pattern may cover. With
+        no path there is no delimiter after the host, so without that the
+        allowlist refuses the bare origin it was written for."""
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        self.assertIsNone(g.check('browser_navigate',
+                                  {'url': 'https://localhost'}))
+
     def test_an_allowlist_pattern_may_name_a_host_on_its_own(self):
         g = guard(allowed_url_patterns=[r'localhost'])
         g.note_url({'url': 'http://localhost:8080/x'})
@@ -546,6 +554,17 @@ class ScriptToggleTests(unittest.TestCase):
     def test_scripts_are_allowed_by_default(self):
         self.assertIsNone(guard().check('browser_execute_script', {'script': 'x'}))
 
+    def test_any_false_value_turns_scripts_off(self):
+        """safety.json is hand-written, so 0 and null turn up where false
+        was meant. Comparing against False exactly would read either one as
+        "scripts on", which is the opposite of what the person wrote."""
+        for value in (0, None, ''):
+            with self.subTest(value=value):
+                denial = guard(allow_script_execution=value).check(
+                    'browser_execute_script', {'script': 'x'})
+                self.assertIsNotNone(denial, f'{value!r} means off')
+                self.assertEqual(denial['safety_decision'], 'scripts_disabled')
+
 
 class AuditToolScriptTests(unittest.TestCase):
     """browser_audit_page runs a fixed inspection script. It was an observe
@@ -823,6 +842,24 @@ class AuditLogTests(unittest.TestCase):
                 self.assertEqual(self._last_entry()['tool'], tool)
                 self.assertNotIn('FILTER-S3CRET',
                                  safety._AUDIT_FILE.read_text())
+
+    def test_human_approval_is_recorded_only_when_the_call_went_through(self):
+        """Approval satisfies the protected-site prompt and nothing else, so
+        an approved call can still be refused - by read-only mode, the
+        blocklist, the script toggle. Recording that as allowed_by_human
+        would make the log say the person let through a call that never
+        ran, and hide the rule that stopped it."""
+        g = guard(read_only=True)
+        denial = g.check('browser_click', {'selector': '#x'},
+                         human_approved=True)
+        self.assertEqual(denial['safety_decision'], 'read_only')
+        self.assertEqual(self._last_entry()['decision'], 'read_only')
+
+        g = guard()
+        g.note_url({'url': 'https://www.chase.com/transfer'})
+        self.assertIsNone(g.check('browser_click', {'selector': '#x'},
+                                  human_approved=True))
+        self.assertEqual(self._last_entry()['decision'], 'allowed_by_human')
 
     def test_a_query_and_a_fragment_are_reduced_to_a_marker(self):
         g = guard()
