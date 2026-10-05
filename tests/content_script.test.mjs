@@ -1446,7 +1446,11 @@ test('the DOM name guard matches the same credential names as background.js', as
     'JSESSIONID', 'PHPSESSID',
     'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode',
     'sessId', 'phpSessId', 'sess_id', 'oneTimeCode', 'one_time_code',
-    'SSNNumber', 'userssn', 'clientSecret', 'bearerToken'
+    'SSNNumber', 'userssn', 'clientSecret', 'bearerToken',
+    // Approved 2026-10-05: second factors, card fields by other names, and
+    // cookies, which carry session ids.
+    'mfaCode', 'mfa_code', 'verificationCode', 'securityCode', 'cc_number',
+    'ccNumber', 'creditCard', 'credit_card_number', 'pincode', 'cookie',
   ];
   for (const name of credentials) {
     const el = makeElement('input', { id: 'f', name, type: 'text', value: 'hunter2' });
@@ -1463,6 +1467,8 @@ test('the DOM name guard matches the same credential names as background.js', as
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
     'spin', 'spinner', 'pinned',
+    // Near the new names, and not credentials.
+    'accNumber', 'account_number', 'spincode',
     'className', 'classNames', 'businessName', 'addressName', 'witnessName',
     'accessName', 'guessNumber',
     'email', 'username', 'title', 'views', 'published', 'tags', 'id', 'name',

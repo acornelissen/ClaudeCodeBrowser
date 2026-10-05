@@ -286,7 +286,10 @@ class HeadlessBrowser:
         '|api[-_]?key|private[-_]?key'
         '|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id'
         '|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer'
-        '|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$))'
+        '|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)'
+        '|mfa[-_]?code|verification[-_]?code|security[-_]?code'
+        '|(?:^|[^a-z])cc[-_]?number|credit[-_]?card'
+        '|(?:^|[^a-z])pin[-_]?code|cookie)'
     )
 
     # How many nested credential fields a single getText will mask. See

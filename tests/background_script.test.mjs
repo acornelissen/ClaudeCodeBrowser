@@ -816,7 +816,11 @@ test('the credential-name list matches credentials and not ordinary words', () =
     'JSESSIONID', 'PHPSESSID', 'sessId', 'phpSessId', 'sess_id',
     // Card and identity. SSNNumber and userssn have no boundary to find.
     'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'SSNNumber', 'userssn',
-    'pin', 'PIN', 'pinCode'
+    'pin', 'PIN', 'pinCode',
+    // Approved 2026-10-05: second factors, card fields by other names, and
+    // cookies, which carry session ids.
+    'mfaCode', 'mfa_code', 'verificationCode', 'securityCode', 'cc_number',
+    'ccNumber', 'creditCard', 'credit_card_number', 'pincode', 'cookie',
   ];
   for (const name of credentials) {
     assert.ok(matches(name), `${name} must be treated as a credential`);
@@ -827,6 +831,8 @@ test('the credential-name list matches credentials and not ordinary words', () =
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
     'spin', 'spinner', 'pinned',
+    // Near the new names, and not credentials.
+    'accNumber', 'account_number', 'spincode',
     // cla-SSN-ame: the single most common key in a React-shaped payload.
     'className', 'classNames', 'businessName', 'addressName', 'witnessName',
     'accessName', 'guessNumber',
