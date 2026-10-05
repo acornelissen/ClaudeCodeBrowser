@@ -9,7 +9,7 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
-## [Unreleased]
+## [1.9.6]
 
 ### Changed
 - **What counts as a credential is defined once,** in
