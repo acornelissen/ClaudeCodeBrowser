@@ -525,11 +525,14 @@ process.stdout.write(JSON.stringify(answers));
 
 # Reads {"script", "root"} on stdin and writes the reader's result as JSON.
 #
-# The root's children are the elements the fixture declares as its
-# querySelectorAll('[contenteditable], textarea') matches: which elements a
-# selector matches is the browser's job, and what is worth testing here is
-# what the scrub does with the matches - which secrets it collects, in what
-# order it replaces them and what it counts.
+# The root's children are its descendants, and querySelectorAll returns the
+# ones its selector matches. It used to return every child whatever selector
+# it was given, so narrowing the scrub's '[contenteditable], textarea' to
+# 'textarea', to '[contenteditable=true], textarea' or to '[contenteditable]'
+# changed nothing here and every test stayed green while the scrub stopped
+# finding the fields it exists for. Only the selector shapes the reader can
+# plausibly use are understood; anything else throws, so a selector this
+# harness cannot judge fails a test instead of matching everything.
 _READER_HARNESS = r"""
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const compiled = eval('(' + input.script + ')');
@@ -551,9 +554,26 @@ function withText(spec) {
   return el;
 }
 
+// One compound of a selector list: a bare tag name, [attr] or [attr=value].
+function matchesOne(el, selector) {
+  if (/^[a-z][a-z0-9-]*$/i.test(selector)) {
+    return el.tagName.toLowerCase() === selector.toLowerCase();
+  }
+  const attribute = /^\[([a-z-]+)(?:=(["']?)([^"'\]]*)\2)?\]$/i.exec(selector);
+  if (attribute) {
+    const actual = el.getAttribute(attribute[1]);
+    if (attribute[3] === undefined) return actual !== null;
+    return actual === attribute[3];
+  }
+  throw new Error('reader harness cannot match selector ' +
+                  JSON.stringify(selector));
+}
+
 const root = withText(input.root);
 const children = (input.root.children || []).map(withText);
-root.querySelectorAll = () => children;
+root.querySelectorAll = (selectors) => children.filter(
+  (el) => String(selectors).split(',').some(
+    (one) => matchesOne(el, one.trim())));
 process.stdout.write(JSON.stringify(compiled(root)));
 """.replace('__ELEMENT_FACTORY__', _ELEMENT_FACTORY_JS)
 
@@ -1943,6 +1963,68 @@ class RealTextScrubTests(unittest.TestCase):
                                         el_id='otp-code'),
                            allow_password=True)
         self.assertEqual(result['text'], '123456')
+
+    def test_every_copy_of_a_secret_is_masked(self):
+        """A page that shows the code it sent you AND holds it in the field
+        has it twice. Replacing the first occurrence only left the second in
+        the page dump."""
+        page = text_fixture(
+            'Your code is 123456. Code: 123456', tag='BODY',
+            children=[text_fixture('123456', tag='DIV', contenteditable='',
+                                   el_id='otp-code')])
+        result = self.read(page)
+        self.assertEqual(result['text'], 'Your code is ***. Code: ***')
+        self.assertNotIn('123456', result['text'])
+
+    def test_a_three_character_secret_is_masked(self):
+        """A card's CVC is three digits. The floor is there to spare one- and
+        two-character values, not this."""
+        page = text_fixture(
+            'CVC 737', tag='BODY',
+            children=[text_fixture('737', tag='DIV', contenteditable='',
+                                   el_id='cvc')])
+        result = self.read(page)
+        self.assertEqual(result['text'], 'CVC ***')
+        self.assertEqual(result['masked'], 1)
+
+    def test_a_field_whose_text_ends_in_a_newline_is_still_found(self):
+        """<div contenteditable>123456<br></div> has innerText '123456\\n',
+        and that string does not occur in the page text the field sits in;
+        compared untrimmed, the field never matched and the code leaked."""
+        page = text_fixture(
+            'code 123456 end', tag='BODY',
+            children=[text_fixture('123456\n', tag='DIV', contenteditable='',
+                                   el_id='otp-code')])
+        result = self.read(page)
+        self.assertEqual(result['text'], 'code *** end')
+
+    def test_every_spelling_of_contenteditable_is_scanned(self):
+        """[contenteditable] matches the attribute whatever its value: the
+        bare attribute and "plaintext-only" are as editable as "true"."""
+        for editable in ('', 'true', 'plaintext-only'):
+            with self.subTest(contenteditable=editable):
+                page = text_fixture(
+                    'pin 4321 here', tag='BODY',
+                    children=[text_fixture('4321', tag='DIV',
+                                           contenteditable=editable,
+                                           el_id='pin')])
+                result = self.read(page)
+                self.assertEqual(result['text'], 'pin *** here')
+
+    def test_text_the_page_does_not_show_is_not_returned(self):
+        """innerText is what is rendered. textContent also carries
+        display:none subtrees and <script> bodies, which is neither what
+        this tool promises nor safe to hand over. An empty innerText is
+        still the answer - falling through to textContent there handed back
+        a hidden template as the visible text."""
+        for visible, raw in (('a', 'a SECRET-hidden'),
+                             ('', 'hidden template')):
+            with self.subTest(innerText=visible):
+                page = {**text_fixture(visible, tag='DIV', el_id='plain'),
+                        'textContent': raw}
+                result = self.read(page)
+                self.assertEqual(result['text'], visible)
+                self.assertEqual(result['source'], 'innerText')
 
     def test_textcontent_is_the_fallback_and_the_result_says_so(self):
         """innerText is the visible text this tool promises, but it does not
