@@ -202,12 +202,52 @@ class HeadlessDeadlineTests(unittest.TestCase):
     blocked for the life of the process - one slow call wedged the backend."""
 
     def test_an_overrunning_call_is_cancelled_not_just_abandoned(self):
-        source = inspect.getsource(server.MCPHTTPHandler._dispatch_action)
-        self.assertIn('future.cancel()', source,
-                      'the future must be cancelled, or its coroutine keeps '
-                      'the headless lock for ever')
-        self.assertIn('concurrent.futures.TimeoutError', source,
-                      'the timeout has to be caught specifically to cancel it')
+        """This used to grep the source for future.cancel(), which stayed
+        green with the call wrapped in "if False:". Run a real overrunning
+        call instead and check the lock comes back."""
+        import headless_backend
+
+        class StuckBrowser:
+            def __init__(self):
+                self.lock = asyncio.Lock()
+                self.cancelled = threading.Event()
+
+            def is_ready(self):
+                return True
+
+            async def execute(self, action, tab_id, arguments):
+                async with self.lock:
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        self.cancelled.set()
+                        raise
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        stuck = StuckBrowser()
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        with unittest.mock.patch.object(server, 'HEADLESS_MODE', True), \
+                unittest.mock.patch.object(server, 'MAIN_EVENT_LOOP', loop), \
+                unittest.mock.patch.object(server, 'HEADLESS_CALL_TIMEOUT', 0.2), \
+                unittest.mock.patch.object(
+                    server.connection_manager, 'get_active_browser',
+                    lambda: None), \
+                unittest.mock.patch.object(
+                    headless_backend, 'get_headless_browser', lambda: stuck):
+            result = handler._dispatch_action('click', None, {'selector': '#x'})
+
+        self.assertFalse(result['success'])
+        self.assertIn('cancelled', result['error'])
+        self.assertTrue(stuck.cancelled.wait(2),
+                        'the coroutine is still running after the deadline')
+        locked = asyncio.run_coroutine_threadsafe(
+            asyncio.sleep(0, result=stuck.lock.locked()), loop).result(2)
+        self.assertFalse(locked, 'the headless lock is still held, so every '
+                                 'later headless tool would block for ever')
 
     def test_the_deadline_outlasts_the_wait_and_act_cap(self):
         """A legitimately slow browser_wait_and_act must finish rather than be

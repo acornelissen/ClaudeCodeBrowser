@@ -27,7 +27,6 @@ Run: python3 -m unittest tests.test_headless_backend -v
 import asyncio
 import base64
 import collections
-import inspect
 import json
 import logging
 import os
@@ -1549,13 +1548,22 @@ class GuardDefinitionMirrorTests(unittest.TestCase):
 
     def test_the_focused_path_uses_the_same_builder(self):
         """A second hand-written probe string is how the copies diverged
-        last time, so the focused path must interpolate the builder."""
-        source = inspect.getsource(
-            HeadlessBrowser._assert_focused_not_password)
-        self.assertIn('_credential_js', source)
-        self.assertNotIn('autocomplete', source,
-                         'the focused probe must not spell out its own '
-                         'predicate; build it with _credential_js')
+        last time, so the focused path must run the builder's predicate.
+        This used to grep the method's source, which a stray reference to
+        _credential_js beside a hand-written probe would satisfy; check the
+        script that actually reaches the page instead."""
+        scripts = []
+
+        class RecordingPage:
+            async def evaluate(self, script, *args):
+                scripts.append(script)
+                return False
+
+        asyncio.run(HeadlessBrowser()._assert_focused_not_password(
+            RecordingPage(), {}))
+        self.assertEqual(len(scripts), 1)
+        self.assertIn(HeadlessBrowser._credential_js(include_hidden=False),
+                      scripts[0])
 
 
 @requires_node
@@ -2234,13 +2242,6 @@ class WaitAndActTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('timeout_capped', result,
                          'a timeout that was honoured must not be reported '
                          'as capped')
-
-    def test_the_cap_leaves_room_before_the_future_is_abandoned(self):
-        """server.py gives a headless call 35s (future.result(timeout=35))
-        and does not cancel the coroutine when it gives up, so a call that
-        outlives that deadline keeps HeadlessBrowser._lock and blocks every
-        later headless tool. The cap has to come first."""
-        self.assertLess(headless_backend.MAX_WAIT_AND_ACT_TIMEOUT_MS, 35000)
 
 
 # ==========================================================================
