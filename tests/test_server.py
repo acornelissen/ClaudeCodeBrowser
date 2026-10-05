@@ -121,6 +121,36 @@ class CredentialGuardPlumbingTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIs(sent[0].data.get('allowPassword'), True, sent[0].data)
 
+    def test_the_agent_cannot_supply_the_password_flag_itself(self):
+        """Only the safety config may open the guard. getText reads the flag
+        in both modes but is not in the list the server overwrites, so an
+        agent sending allow_password: true got credential text unmasked.
+        content.js also accepts allowPassword, which camelize_args passes
+        through untouched."""
+        tools = self.PASSWORD_AWARE_TOOLS + (
+            'browser_get_text', 'browser_press_key', 'browser_click',
+            'browser_execute_script')
+        for tool in tools:
+            for spelling in ('allow_password', 'allowPassword', 'ALLOW_PASSWORD'):
+                with self.subTest(tool=tool, key=spelling):
+                    captured = {}
+
+                    def fake_dispatch(action, tab_id, arguments):
+                        captured.update(server.camelize_args(arguments))
+                        captured.update(arguments)
+                        return {'success': True}
+
+                    handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+                    handler._dispatch_action = fake_dispatch
+                    handler.execute_tool(tool, {'selector': '#pw', 'text': 'x',
+                                                'key': 'a', 'script': '1',
+                                                spelling: True})
+                    opened = {k: v for k, v in captured.items()
+                              if k.replace('_', '').lower() == 'allowpassword'
+                              and v is not False}
+                    self.assertEqual(opened, {},
+                                     'the agent opened the credential guard')
+
     def test_read_and_write_tools_all_carry_the_password_flag(self):
         for tool in self.PASSWORD_AWARE_TOOLS:
             with self.subTest(tool=tool):

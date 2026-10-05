@@ -1326,6 +1326,15 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         logger.info(f"Executing tool: {tool_name} with args: "
                     f"{redact_for_log(arguments)}")
 
+        # Only the safety config opens the credential guard, so drop any
+        # spelling of the flag the agent sent. The server set it for six tools
+        # and passed it through for the rest, so allow_password: true on
+        # browser_get_text unmasked credentials - and content.js also reads
+        # allowPassword, which camelize_args leaves as it is.
+        for key in [k for k in arguments
+                    if str(k).replace('_', '').lower() == 'allowpassword']:
+            del arguments[key]
+
         # Normalise tab_id before anything reads it. A JSON client sends
         # tab_id: "7", and from here the value goes to the approval prompt,
         # the command envelope and the headless backend, which looks the tab
