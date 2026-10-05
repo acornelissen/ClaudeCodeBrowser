@@ -799,21 +799,24 @@ test('the credential-name list matches credentials and not ordinary words', () =
     'user[password]', 'userpass',
     // WebAuthn.
     'passkey', 'passKey',
-    // One-time codes.
-    'one-time-code', 'otp', 'otp_code', 'otpCode', 'otpValue',
+    // One-time codes, including the autocomplete token in its JS spellings.
+    'one-time-code', 'oneTimeCode', 'one_time_code',
+    'otp', 'otp_code', 'otpCode', 'otpValue',
     // OAuth and HTTP auth.
     'authorization', 'Authorization', 'authentication', 'auth', 'x-auth',
-    'auth_token', 'authToken', 'authData', 'authz', 'authn',
+    'auth_token', 'authToken', 'authData', 'auth_header', 'authz', 'authn',
     'oauth', 'oauth_verifier',
     // Keys and tokens.
-    'secret', 'client_secret', 'token', 'access_token', 'refresh_token',
-    'credential', 'api_key', 'apiKey', 'private_key', 'jwt', 'bearer',
-    'signature',
-    // Sessions, including the servlet and PHP cookie names.
+    'secret', 'client_secret', 'clientSecret', 'token', 'access_token',
+    'refresh_token', 'credential', 'credentials', 'api_key', 'apiKey',
+    'apikey', 'private_key', 'jwt', 'bearer', 'bearerToken', 'signature',
+    // Sessions, including the servlet and PHP cookie names and the camelCase
+    // forms JavaScript gives them.
     'session', 'session_id', 'sessionToken', 'sessionValue',
-    'JSESSIONID', 'PHPSESSID',
-    // Card and identity.
-    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode'
+    'JSESSIONID', 'PHPSESSID', 'sessId', 'phpSessId', 'sess_id',
+    // Card and identity. SSNNumber and userssn have no boundary to find.
+    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'SSNNumber', 'userssn',
+    'pin', 'PIN', 'pinCode'
   ];
   for (const name of credentials) {
     assert.ok(matches(name), `${name} must be treated as a credential`);
@@ -823,7 +826,7 @@ test('the credential-name list matches credentials and not ordinary words', () =
     // The ones anchoring was introduced to stop masking.
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
-    'spinner', 'pinned',
+    'spin', 'spinner', 'pinned',
     // cla-SSN-ame: the single most common key in a React-shaped payload.
     'className', 'classNames', 'businessName', 'addressName', 'witnessName',
     'accessName', 'guessNumber',
