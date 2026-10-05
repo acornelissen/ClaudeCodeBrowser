@@ -621,6 +621,45 @@ class RedactionListParityTests(unittest.TestCase):
         self.assertNotIn('PAGE-HELD-SECRET', json.dumps(safe), safe)
 
 
+class ResultUrlTests(AgentTestCase):
+    """A URL comes back in results as well as going out in arguments:
+    browser_navigate, browser_get_text and browser_get_page_info all report
+    the page's url, and browser_get_tabs lists one per tab. That is the page
+    the browser LANDED on, so it carries whatever the redirect put there - a
+    reset token, an OAuth ?code=, an implicit-flow #id_token=. The client did
+    not send it, so the sent-value scrub cannot catch it; only reducing the
+    url key does."""
+
+    RAW = 'https://x.test/cb?code=S3CRET#id_token=EYJ'
+
+    def assert_reduced(self, text):
+        for secret in ('S3CRET', 'EYJ'):
+            self.assertNotIn(secret, text)
+        self.assertIn('x.test/cb', text,
+                      'the host and path are what a log is read for')
+
+    def test_a_url_in_a_result_is_reduced(self):
+        safe = browser_agent._redact_result({'url': self.RAW}, ())
+        self.assert_reduced(json.dumps(safe))
+
+    def test_a_url_nested_in_a_result_is_reduced(self):
+        # One tab under a key, and a list of tabs: the two shapes the
+        # extension uses, and the two branches of _scrub's recursion.
+        for result in ({'tab': {'id': 1, 'url': self.RAW}},
+                       {'tabs': [{'id': 1, 'url': self.RAW},
+                                 {'id': 2, 'url': self.RAW}]}):
+            with self.subTest(result=result):
+                safe = browser_agent._redact_result(result, ())
+                self.assert_reduced(json.dumps(safe))
+
+    def test_a_landed_url_is_not_printed_or_kept(self):
+        self.serve_ok(url=self.RAW, title='Signed in')
+        agent = browser_agent.BrowserAutomationAgent(verbose=True)
+        _, out = self.capture(agent.get_page_info)
+        self.assert_reduced(out)
+        self.assert_reduced(self.history_dump(agent))
+
+
 # --------------------------------------------------------------------------
 # 3. Selector interpolation into JavaScript
 # --------------------------------------------------------------------------
