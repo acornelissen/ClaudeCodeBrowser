@@ -25,3 +25,24 @@ jobs:
         run: mise exec -- python3 -m pip install websockets==17.2
       - name: Run the Python and extension suites
         run: mise run test
+
+  # The suites above drive the headless backend with a fake page, which
+  # cannot run the credential probes it injects. This job runs them in a
+  # real Chromium. Separate so the main job stays fast and free of a
+  # browser download.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Install websockets and playwright
+        run: mise exec -- python3 -m pip install websockets==17.2 playwright==1.63.0
+      - name: Install Chromium
+        run: mise exec -- python3 -m playwright install --with-deps chromium
+      # mise run test-e2e sets CCB_E2E_REQUIRE=1, so a missing playwright
+      # or browser fails the job instead of skipping to green.
+      - name: Run the end-to-end suite
+        run: mise run test-e2e
