@@ -292,6 +292,21 @@ class UrlPolicyTests(unittest.TestCase):
         self.assertIsNone(g.check('browser_screenshot', {}),
                           'the pattern still names stripe.com subdomains')
 
+    def test_a_delimiter_inside_the_query_or_fragment_grants_nothing(self):
+        r"""Cutting the URL at '?' is not enough on its own. A '/' after the
+        query starts is still a delimiter character, and a prefix ending
+        there lets ".*\.stripe\.com" cover text the page author chose. The
+        fragment is the same text by another name, so '#' has to end the
+        granting part as well as '?'."""
+        g = guard(allowed_url_patterns=[r'.*\.stripe\.com'])
+        for url in ('https://evil.com/?x=a.stripe.com/',
+                    'https://evil.com/#x.stripe.com'):
+            with self.subTest(url=url):
+                g.note_url({'url': url})
+                denial = g.check('browser_screenshot', {})
+                self.assertIsNotNone(denial, 'the host here is evil.com')
+                self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
     def test_a_pattern_whose_greedy_match_overshoots_still_permits(self):
         """The delimiter test is applied to a prefix that ends at a delimiter,
         not to whichever match the engine returns first. With
