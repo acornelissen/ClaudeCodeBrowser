@@ -10,6 +10,7 @@ import base64
 import inspect
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -664,6 +665,29 @@ class HttpAuthTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 403)
             self.assertIn(b'Unauthorized', ctx.exception.read(),
                           f'attempt {attempt}')
+
+    def test_a_refused_post_never_waits_on_a_claimed_body(self):
+        """The body is read before refusing only up to a small cap. A caller
+        without the token that claims a huge or negative length and then
+        sends almost nothing must still get its 403 at once: reading the
+        claimed length (or to EOF, for -1) would park the worker thread."""
+        for claimed in ('10000000', '-1'):
+            with self.subTest(content_length=claimed):
+                host, port = self.httpd.server_address
+                with socket.create_connection((host, port), timeout=5) as sock:
+                    sock.sendall(
+                        b'POST /mcp/call HTTP/1.1\r\n'
+                        b'Host: 127.0.0.1\r\nX-API-Key: wrong\r\n'
+                        b'Content-Length: ' + claimed.encode() + b'\r\n\r\n'
+                        b'{"a": 1}')
+                    sock.settimeout(2)
+                    try:
+                        status = sock.recv(64)
+                    except socket.timeout:
+                        self.fail('no answer: the server is waiting on a '
+                                  'body it was never going to accept')
+                self.assertTrue(status.startswith(b'HTTP/1.0 403')
+                                or status.startswith(b'HTTP/1.1 403'), status)
 
     def test_a_cors_preflight_is_refused(self):
         """With a preflight allowed, any web page the user visits could try
