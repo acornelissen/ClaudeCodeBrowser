@@ -11,6 +11,14 @@ are his releases. 1.5.0 onwards are from the fork at
 
 ## [Unreleased]
 
+### Changed
+- **The whole-page text scrub is shared too.** Masking credential fields
+  inside a whole-page `browser_get_text` was a second pair of hand-kept
+  copies, in `content.js` and the headless backend, and was where the
+  50-field cap, the prefix-ordering and the 3-character cut-off bugs had
+  lived. It is now `scrubNestedCredentials` in `credentials.js`, which both
+  modes run.
+
 ### Fixed
 - **A failed headless start no longer leaks the Playwright driver.** When the
   browser could not launch (a missing executable, say), `start()` raised

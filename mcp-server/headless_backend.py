@@ -351,16 +351,9 @@ class HeadlessBrowser:
         The element the caller named is checked directly, but a credential
         can also sit INSIDE it - and 'body' is the default, so a whole-page
         read returned a <div contenteditable> PIN in the middle of the page
-        dump. A port of withoutNestedCredentialText in content.js, including
-        the two bugs its comment records: filter before capping, or a busy
-        page with 50 ordinary editable cells never reaches the credential
-        after them; and replace longest first, or masking a short secret that
-        prefixes a longer one leaves the longer one's tail behind.
-
-        Stated honestly, as there it is: an <input> contributes nothing to
-        innerText whatever its value, so inputs cannot leak this way, and a
-        credential that reached the page as ordinary prose is not something
-        this can find.
+        dump. That scrub is scrubNestedCredentials in credentials.js, the
+        same function the extension runs; see its comments for what it can
+        and cannot find.
         """
         allowed = 'true' if allow_password else 'false'
         return (
@@ -376,38 +369,9 @@ class HeadlessBrowser:
             "const raw = (visible ? root.innerText : root.textContent) || '';\n"
             "const source = visible ? 'innerText' : 'textContent';\n"
             "if (ALLOW_PASSWORD || !raw) return {text: raw, masked: 0, source};\n"
-            "let candidates = [];\n"
-            "let capped = false;\n"
-            "try {\n"
-            "  const all = root.querySelectorAll\n"
-            "    ? Array.from(root.querySelectorAll('[contenteditable], textarea'))\n"
-            "        .filter(el => el !== root && isPasswordField(el))\n"
-            "    : [];\n"
-            "  capped = all.length > MAX_SCRUBBED_FIELDS;\n"
-            "  candidates = all.slice(0, MAX_SCRUBBED_FIELDS);\n"
-            "} catch (e) { candidates = []; }\n"
-            "const secrets = [];\n"
-            "for (const field of candidates) {\n"
-            "  const own = field.tagName === 'TEXTAREA'\n"
-            "    ? (field.value || '')\n"
-            "    : (typeof field.innerText === 'string'\n"
-            "        ? field.innerText : (field.textContent || ''));\n"
-            "  const secret = own.trim();\n"
-            # A one- or two-character "secret" is not worth masking every
-            # occurrence of across a whole page.
-            "  if (secret.length >= 3) secrets.push(secret);\n"
-            "}\n"
-            "secrets.sort((a, b) => b.length - a.length);\n"
-            "let out = raw;\n"
-            "let masked = 0;\n"
-            "for (const secret of secrets) {\n"
-            "  if (!out.includes(secret)) continue;\n"
-            "  out = out.split(secret).join('***');\n"
-            "  masked++;\n"
-            "}\n"
-            # masked counts secrets replaced, and two fields holding one
-            # value are one secret, so the field count goes back separately.
-            "return {text: out, masked, fields: secrets.length, capped, source};\n"
+            # The scrub is credentials.js's, the same function content.js
+            # runs, so the two modes cannot mask differently.
+            "return Object.assign(scrubNestedCredentials(raw, root), {source});\n"
             "}"
         )
 

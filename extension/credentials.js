@@ -124,3 +124,61 @@ function holdsEnteredText(element) {
   const raw = 'value' in element ? element.value : element.textContent;
   return raw !== undefined && raw !== null && String(raw).length > 0;
 }
+
+// Mask the text of credential fields nested inside a block of text read from
+// root - a whole-page read defaults to <body>, which would otherwise return a
+// <div contenteditable> PIN in the middle of the page dump. Returns
+// {text, masked, fields, capped}: masked counts distinct secrets replaced
+// (two fields holding one value are one secret), fields counts the fields.
+//
+// An <input> contributes nothing to innerText whatever its value, so inputs
+// cannot leak this way; and a credential that reached the page as ordinary
+// prose is not something this can find. Whether to run at all - the
+// allow_password_typing override - is the caller's decision.
+function scrubNestedCredentials(text, root) {
+  if (!text) return { text, masked: 0, fields: 0, capped: false };
+  let capped = false;
+  let candidates;
+  try {
+    // Filter FIRST, then cap. Capping the raw [contenteditable] list meant a
+    // Notion- or CMS-style page with 50 ordinary editable cells followed by
+    // one credential field never reached the credential field at all. The
+    // cap is on how many credentials are masked, not on how many elements
+    // are looked at.
+    const all = root.querySelectorAll
+      ? Array.from(root.querySelectorAll('[contenteditable], textarea'))
+          .filter(el => el !== root && isPasswordField(el))
+      : [];
+    capped = all.length > MAX_SCRUBBED_FIELDS;
+    candidates = all.slice(0, MAX_SCRUBBED_FIELDS);
+  } catch (e) {
+    candidates = [];
+  }
+
+  const secrets = [];
+  for (const field of candidates) {
+    const own = field.tagName === 'TEXTAREA'
+      ? (field.value || '')
+      : (typeof field.innerText === 'string'
+          ? field.innerText
+          : (field.textContent || ''));
+    const secret = own.trim();
+    // A one- or two-character "secret" is not worth masking every
+    // occurrence of across a whole page.
+    if (secret.length >= 3) secrets.push(secret);
+  }
+
+  // Longest first. Masking a shorter secret that is a PREFIX of a longer one
+  // destroys the longer one's text and leaves its tail behind: "SSS1" and
+  // "SSS10" came out as "*** ***0".
+  secrets.sort((a, b) => b.length - a.length);
+
+  let out = text;
+  let masked = 0;
+  for (const secret of secrets) {
+    if (!out.includes(secret)) continue;
+    out = out.split(secret).join('***');
+    masked++;
+  }
+  return { text: out, masked, fields: secrets.length, capped };
+}

@@ -1950,57 +1950,9 @@
   // credentials.js so headless applies the same one.
 
   function withoutNestedCredentialText(text, root, options) {
+    // The scrub itself is in credentials.js, shared with headless.
     if (!text || passwordAllowed(options)) return { text, masked: 0 };
-    let capped = false;
-    let candidates;
-    try {
-      // Filter FIRST, then cap. Capping the raw [contenteditable] list meant
-      // a Notion- or CMS-style page with 50 ordinary editable cells followed
-      // by one credential field never reached the credential field at all -
-      // so the exact leak this function exists to stop came back on any busy
-      // page. The cap is on how many credentials we mask, not on how many
-      // elements we look at.
-      const all = root.querySelectorAll
-        ? Array.from(root.querySelectorAll('[contenteditable], textarea'))
-            .filter(el => el !== root && isPasswordField(el))
-        : [];
-      capped = all.length > MAX_SCRUBBED_FIELDS;
-      candidates = all.slice(0, MAX_SCRUBBED_FIELDS);
-    } catch (e) {
-      candidates = [];
-    }
-
-    const secrets = [];
-    for (const field of candidates) {
-      const own = field.tagName === 'TEXTAREA'
-        ? (field.value || '')
-        : (typeof field.innerText === 'string'
-            ? field.innerText
-            : (field.textContent || ''));
-      const secret = own.trim();
-      // A one- or two-character "secret" is not worth masking every
-      // occurrence of across a whole page.
-      if (secret.length >= 3) secrets.push(secret);
-    }
-
-    // Longest first. In document order, masking a shorter secret that is a
-    // PREFIX of a longer one destroys the longer one's text and leaves its
-    // tail behind: two fields holding "SSS1" and "SSS10" came out as
-    // "*** ***0", so a fragment of the second credential survived and it was
-    // not even counted as masked.
-    secrets.sort((a, b) => b.length - a.length);
-
-    let out = text;
-    let masked = 0;
-    for (const secret of secrets) {
-      if (!out.includes(secret)) continue;
-      out = out.split(secret).join('***');
-      masked++;
-    }
-    // `masked` counts secrets replaced, and two fields holding the same value
-    // are one secret - so report the field count separately rather than let
-    // the caller infer it.
-    return { text: out, masked, fields: secrets.length, capped };
+    return scrubNestedCredentials(text, root);
   }
 
   // Select option

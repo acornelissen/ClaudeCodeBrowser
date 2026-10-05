@@ -375,19 +375,24 @@ def eval_field_predicate(script: str, el) -> bool:
 
 # The three scripts headless_backend sends into a page, told apart by what
 # they declare. Both readers carry an ALLOW_PASSWORD literal; only the
-# getText reader scrubs nested fields, so only it mentions querySelectorAll.
+# getText reader calls the shared nested-field scrub.
 def is_guard_probe(script: str) -> bool:
     return ('const ALLOW_PASSWORD =' not in script
             and 'function isPasswordField(' in script)
 
 
+# credentials.js, which every script carries, mentions querySelectorAll, so
+# the getText reader is told apart by its own call into the shared scrub.
+_TEXT_READ_MARK = 'scrubNestedCredentials(raw, root)'
+
+
 def is_text_read(script: str) -> bool:
-    return 'const ALLOW_PASSWORD =' in script and 'querySelectorAll' in script
+    return 'const ALLOW_PASSWORD =' in script and _TEXT_READ_MARK in script
 
 
 def is_element_info_read(script: str) -> bool:
     return ('const ALLOW_PASSWORD =' in script
-            and 'querySelectorAll' not in script)
+            and _TEXT_READ_MARK not in script)
 
 
 def is_typing_preparation(script: str) -> bool:
