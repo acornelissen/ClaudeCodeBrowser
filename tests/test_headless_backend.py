@@ -1058,6 +1058,52 @@ class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls_named(page, 'fill'),
                          [('fill', '[name="a\\"]b"]', 'x')])
 
+    async def test_locators_are_tried_in_content_js_order(self):
+        """findElement in content.js tries id, then name, then placeholder.
+        Given more than one, the field the caller is most specific about
+        wins - and a different order here would type into a different
+        field than attended mode for the same call."""
+        id_sel, name_sel, ph_sel = '[id="q"]', '[name="n"]', '[placeholder="P"]'
+        cases = (
+            ({'id': 'q', 'placeholder': 'P'}, id_sel),
+            ({'id': 'q', 'name': 'n'}, id_sel),
+            ({'name': 'n', 'placeholder': 'P'}, name_sel),
+            ({'id': 'q', 'name': 'n', 'placeholder': 'P'}, id_sel),
+        )
+        for locator, expected in cases:
+            with self.subTest(locator=sorted(locator)):
+                browser, page = make_browser(elements={
+                    id_sel: Element(), name_sel: Element(),
+                    ph_sel: Element()})
+                await browser._dispatch('type', None,
+                                        dict(locator, text='x'))
+                self.assertEqual([c[1] for c in calls_named(page, 'fill')],
+                                 [expected])
+
+
+class CssStringTests(unittest.TestCase):
+    """css_string quotes a locator value into an attribute selector, as
+    cssString in content.js does. Every escape it makes keeps the value
+    inside the string instead of ending it."""
+
+    def test_a_quote_is_escaped(self):
+        self.assertEqual(headless_backend.css_string('a"b'), '"a\\"b"')
+
+    def test_a_backslash_is_escaped(self):
+        """Unescaped, a trailing backslash escapes the closing quote, and
+        the rest of the selector is read as part of the string."""
+        self.assertEqual(headless_backend.css_string('a\\'), '"a\\\\"')
+
+    def test_a_line_break_becomes_a_hex_escape(self):
+        """A raw newline is not allowed inside a CSS string. The space ends
+        the hex escape, so a hex digit after it is not swallowed into it."""
+        self.assertEqual(headless_backend.css_string('a\nb'), '"a\\a b"')
+        self.assertEqual(headless_backend.css_string('a\r1'), '"a\\d 1"')
+        self.assertEqual(headless_backend.css_string('a\fb'), '"a\\c b"')
+
+    def test_a_non_string_value_is_quoted_as_text(self):
+        self.assertEqual(headless_backend.css_string(7), '"7"')
+
 
 class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
     """Typing with no selector goes to document.activeElement. This is the
@@ -1578,6 +1624,20 @@ class CredentialTextReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result['maskedFieldsCapped'], True)
         self.assertIn('NOT masked', result['note'])
         self.assertIn(str(HeadlessBrowser.MAX_SCRUBBED_FIELDS), result['note'])
+
+    async def test_get_text_allow_password_must_be_exactly_true(self):
+        """The same fail-closed rule as getValue and getElements: a truthy
+        string or number from a hand-written config must not unmask."""
+        for value in ['true', 1, {}, 'yes']:
+            with self.subTest(allow_password=value):
+                browser, page = make_browser(
+                    elements={'#f': Element(tag='TEXTAREA', name='passwd',
+                                            value=SECRET)})
+                result = await browser._dispatch(
+                    'getText', None,
+                    {'selector': '#f', 'allow_password': value})
+                self.assertEqual(result['text'], '***')
+                self.assertNotIn(SECRET, json.dumps(result))
 
     async def test_get_text_reads_and_decides_in_one_page_call(self):
         """Not two: a probe followed by a separate read leaves a window
