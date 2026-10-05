@@ -7,10 +7,10 @@ docs are versioned together.
 ClaudeCodeBrowser was created by Andre Watson
 ([@nanogenomic](https://github.com/nanogenomic), Ligandal Inc.); 1.1.0–1.4.0
 are his releases. 1.5.0 onwards are from the fork at
-<https://github.com/acornelissen/ClaudeCodeBrowserX>, since renamed
-ClaudeCodeBrowserX.
+<https://github.com/acornelissen/ClaudeCodeBrowserX>, renamed
+ClaudeCodeBrowserX in 2.0.0.
 
-## [Unreleased]
+## [2.0.0]
 
 ### Changed
 - **Renamed to ClaudeCodeBrowserX.** Everything user-facing moves:

@@ -180,7 +180,7 @@ def handle_initialize(msg):
             },
             "serverInfo": {
                 "name": "claudecodebrowserx",
-                "version": "1.9.7"
+                "version": "2.0.0"
             }
         }
     }
