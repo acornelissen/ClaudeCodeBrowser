@@ -341,8 +341,10 @@ function redactHtmlInputValues(text) {
 // comment below conceded that depth 13 is ordinary in GraphQL and paginated
 // responses, which meant an ordinary deep body had its deepest subtree
 // replaced with a withheld marker AND was forced through the lossy
-// re-serialisation. The limit exists only to bound recursion, and JSON.parse
-// has already bounded the depth by the time we get here.
+// re-serialisation. The limit exists only to bound recursion. JSON.parse does
+// not bound depth: `[[[[...]]]]` parses to thousands of levels inside the
+// body cap, so a page could otherwise choose how deep this walk recurses.
+// Anything past the limit is withheld, not returned (see below).
 const MAX_REDACT_DEPTH = 64;
 
 function redactStructure(value, depth = 0) {

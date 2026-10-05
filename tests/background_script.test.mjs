@@ -84,11 +84,16 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   let windowCreateFails = false;
   const nativeMessages = [];
   const menuListeners = [];
+  const nativeHostListeners = [];
+  // Everything the background script prints. The Browser Console keeps it
+  // for the session and can export it, so it is a place a secret can leak.
+  const consoleOutput = [];
+  const record = (...args) => { consoleOutput.push(args); };
 
   const browserStub = {
     runtime: {
       connectNative: () => ({
-        onMessage: { addListener() {} },
+        onMessage: { addListener: (fn) => nativeHostListeners.push(fn) },
         onDisconnect: { addListener() {} },
         // Recorded, not swallowed: what the extension says to the native
         // host is the whole of what a context-menu item does.
@@ -164,7 +169,8 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
 
   const sandbox = {
     browser: browserStub,
-    console: { log() {}, warn() {}, error() {}, info() {}, debug() {} },
+    console: { log: record, warn: record, error: record, info: record,
+               debug: record },
     TextDecoder,
     setTimeout, clearTimeout, setInterval, clearInterval,
     Date, Map, Set, RegExp, JSON, Math, Promise, Error,
@@ -198,6 +204,12 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
     failTabGet: () => { tabGetRejects = true; },
     setTabUrl: (url) => { tabUrl = url; },
     nativeMessages,
+    consoleOutput,
+    // A message arriving from the native host, through the listener the
+    // background script registered on the port.
+    fromNativeHost: (message) => {
+      for (const fn of nativeHostListeners) fn(message);
+    },
     clickMenuItem: async (menuItemId, info = {}) => {
       for (const fn of menuListeners) {
         await fn({ menuItemId, ...info }, { id: 7, url: 'http://stub.test/',
@@ -927,7 +939,9 @@ test('a credential nested deeper than the walk limit is not logged', async () =>
     for (let i = 0; i < n; i++) o = { a: o };
     return JSON.stringify(o);
   };
-  for (const depth of [5, 12, 13, 31]) {
+  // 70 is past MAX_REDACT_DEPTH (64): the depths below it never reached the
+  // limit, so a walk that handed back the raw subtree there passed.
+  for (const depth of [5, 12, 13, 31, 70]) {
     const { command, webRequest } = loadBackground();
     await command('startLogging', {}, 7);
     fireRequest(webRequest, {
@@ -1119,6 +1133,95 @@ test('a hash-route redirect does not keep its code', async () => {
   }
 });
 
+test('a redirect header is scrubbed whatever case its name arrives in', async () => {
+  // The set holds lowercase names and Firefox passes the server's own
+  // spelling through, so the lookup has to use the lowered name.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    statusCode: 302,
+    responseHeaders: [{ name: 'content-type', value: 'text/html' },
+                      { name: 'Location',
+                        value: 'https://app.test/cb?code=AUTHCODE-XYZ' }]
+  });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.responseHeaders.Location, 'https://app.test/cb?code=***');
+});
+
+test('every URL-only credential parameter is scrubbed', async () => {
+  // These names are credentials in a URL but not on their own, so the
+  // general name list cannot catch them and each one is listed. A name
+  // dropped from the list would leak with nothing else to notice it.
+  for (const name of ['code', 'key', 'sig', 'ticket', 'pw', 'sid', 'assertion']) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, { url: `https://app.test/cb?${name}=URL-SECRET&page=2` });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.equal(entry.url, `https://app.test/cb?${name}=***&page=2`,
+                 `?${name}= was not scrubbed`);
+  }
+});
+
+test('a URL parameter is scrubbed by credential name and in any case', async () => {
+  // client_secret is not in the URL-only list; it is caught because its
+  // name is credential-shaped. Parameter names are case-sensitive, but a
+  // server may accept either spelling, so ?Code= is scrubbed like ?code=.
+  const cases = [
+    ['https://app.test/token?client_secret=CS-LEAK&grant_type=x',
+     'https://app.test/token?client_secret=***&grant_type=x'],
+    ['https://app.test/cb?Code=AUTHCODE-UPPER&state=1',
+     'https://app.test/cb?Code=***&state=1']
+  ];
+  for (const [url, expected] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, { url });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.equal(entry.url, expected);
+  }
+});
+
+test('a token used as a URL username is dropped', async () => {
+  // GitHub, GitLab and npm all take a token as the username with no
+  // password (https://TOKEN@host/), so dropping userinfo only when a
+  // password is present leaked the token itself.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, { url: 'https://SECRETUSER@host.test/repo.git' });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.equal(entry.url, 'https://host.test/repo.git');
+});
+
+test('a credential inside an array in a body is scrubbed', async () => {
+  // Arrays have to be walked too, including a body that is an array at the
+  // top level - a GraphQL batch is exactly that.
+  for (const [body, secret] of [['{"items":[{"password":"hunter2"}]}', 'hunter2'],
+                                ['[{"tokens":["TOK1"]}]', 'TOK1']]) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, {
+      method: 'POST',
+      requestBody: { raw: [{ bytes: new TextEncoder().encode(body) }] }
+    });
+    const logged = (await command('getNetworkLogs', {}, 7)).logs[0].requestBody;
+    assert.ok(!logged.includes(secret), `${secret} leaked from ${body}: ${logged}`);
+  }
+});
+
+test('a command from the native host is not printed with its payload', async () => {
+  // The Browser Console keeps what is printed for the session and can export
+  // it, so logging the whole command put typed passwords and scripts there.
+  const ctx = loadBackground();
+  ctx.fromNativeHost({ action: 'type', requestId: 'r1', tabId: 7,
+                       data: { selector: '#pw', text: 'hunter2' } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const printed = JSON.stringify(ctx.consoleOutput, (key, value) =>
+    (value instanceof Error ? `${value.message} ${value.stack}` : value));
+  assert.ok(printed.includes('Received from native host'),
+            'the receipt is still logged, so the spy is on the right path');
+  assert.ok(!printed.includes('hunter2'), `the payload was printed: ${printed}`);
+});
+
 test('an attacker-chosen key name cannot exempt a body from redaction', async () => {
   // redactStructure built its output with `{}`, so `out["__proto__"] = x`
   // invoked the Object.prototype setter: the subtree became the prototype,
@@ -1141,6 +1244,21 @@ test('an attacker-chosen key name cannot exempt a body from redaction', async ()
     assert.ok(!/eyJhbGciOiJIUzI1NiJ9\.leak\.sig|hunter2/.test(logged),
               `a credential survived under a prototype key: ${logged}`);
   }
+});
+
+test('a __proto__ key is logged as a key, with its contents scrubbed', async () => {
+  // Not leaking is not enough: built on `{}`, the subtree became the
+  // prototype and the body logged as "{}" - no leak, and no record that the
+  // field was there at all.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    method: 'POST',
+    requestBody: { raw: [{ bytes: new TextEncoder().encode(
+      '{"__proto__":{"session_token":"x"}}') }] }
+  });
+  const logged = (await command('getNetworkLogs', {}, 7)).logs[0].requestBody;
+  assert.equal(logged, '{"__proto__":{"session_token":"***"}}');
 });
 
 test('an HTML form login does not log the password', async () => {
