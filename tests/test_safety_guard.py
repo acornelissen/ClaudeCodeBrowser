@@ -412,6 +412,20 @@ class ProtectedDomainNormalisationTests(unittest.TestCase):
             with self.subTest(url=url):
                 self.assertEqual(safety._normalise_url(url), expected)
 
+    def test_the_last_at_sign_ends_the_userinfo(self):
+        """The browser reads everything up to the authority's last '@' as
+        userinfo. Splitting at the first one instead leaves
+        'localhost:3000@' in front of the host, and a permit pattern
+        anchored on 'https://localhost' reads that while the browser loads
+        2606:4700::1."""
+        hostile = 'https://a@localhost:3000@[2606:4700::1]/x'
+        self.assertEqual(safety._normalise_url(hostile),
+                         'https://[2606:4700::1]/x')
+        g = guard(allowed_url_patterns=[r'^https://localhost'])
+        denial = g.check('browser_navigate', {'url': hostile})
+        self.assertIsNotNone(denial, 'this URL loads another host')
+        self.assertEqual(denial['safety_decision'], 'not_allowlisted')
+
     def test_userinfo_is_dropped_even_from_a_host_we_cannot_normalise(self):
         """A host still holding a forbidden character once decoded is a URL
         the browser refuses, so there is nothing to normalise it towards - but
