@@ -1419,7 +1419,9 @@ test('the DOM name guard matches the same credential names as background.js', as
     'signature',
     'session', 'session_id', 'sessionToken', 'sessionValue',
     'JSESSIONID', 'PHPSESSID',
-    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode'
+    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode',
+    'sessId', 'phpSessId', 'sess_id', 'oneTimeCode', 'one_time_code',
+    'SSNNumber', 'userssn', 'clientSecret', 'bearerToken'
   ];
   for (const name of credentials) {
     const el = makeElement('input', { id: 'f', name, type: 'text', value: 'hunter2' });
@@ -1435,7 +1437,7 @@ test('the DOM name guard matches the same credential names as background.js', as
   const ordinary = [
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
-    'spinner', 'pinned',
+    'spin', 'spinner', 'pinned',
     'className', 'classNames', 'businessName', 'addressName', 'witnessName',
     'accessName', 'guessNumber',
     'email', 'username', 'title', 'views', 'published', 'tags', 'id', 'name',
