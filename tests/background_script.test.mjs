@@ -309,6 +309,24 @@ test('a fetch-style request is captured', async () => {
   assert.equal(result.source, 'webRequest');
 });
 
+test('a busy tab keeps only the newest 500 requests', async () => {
+  // Without the cap a tab left logging grows the extension's memory for as
+  // long as the page keeps polling.
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+
+  for (let i = 0; i < 600; i++) {
+    fireRequest(webRequest, { requestId: `r${i}`,
+                              url: `http://api.stub.test/items/${i}` });
+  }
+
+  const result = await command('getNetworkLogs', { limit: 1000 }, 7);
+  assert.equal(result.totalCount, 500);
+  assert.equal(result.logs[0].url, 'http://api.stub.test/items/100',
+    'the oldest requests are the ones dropped');
+  assert.equal(result.logs.at(-1).url, 'http://api.stub.test/items/599');
+});
+
 test('requests from tabs that are not being logged are ignored', async () => {
   const { command, webRequest } = loadBackground();
   await command('startLogging', {}, 7);
