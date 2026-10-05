@@ -157,6 +157,7 @@ function loadContentScript(registry) {
   const originalConsoleLog = consoleStub.log;
 
   const createdElements = [];
+  const xpathAsked = [];
   // Every element the test registered can answer a scoped query too.
   for (const entry of all.values()) {
     for (const el of entry) {
@@ -184,7 +185,12 @@ function loadContentScript(registry) {
       return [];
     },
     getElementById: (id) => resolveOne(`#${id}`),
-    evaluate: () => ({ singleNodeValue: null }),
+    /** Records every expression it is asked, so a test can check what
+     *  findElement actually built rather than grepping the source for it. */
+    evaluate: (expression) => {
+      xpathAsked.push(expression);
+      return { singleNodeValue: null };
+    },
     createElement: (tag) => {
       const el = makeElement(tag);
       createdElements.push(el);
@@ -296,6 +302,7 @@ function loadContentScript(registry) {
 
   return { send, window, document, consoleStub, XMLHttpRequestStub,
            createdElements,
+           xpathAsked,
            observers: sandbox.__observers,
            /** Evaluate source inside the sandbox. An Error built out here is
             *  not `instanceof Error` in there, so a cross-realm object would
@@ -667,17 +674,39 @@ test('browser_click dispatches exactly one click', async () => {
 });
 
 test('a text selector containing a quote cannot graft on an XPath predicate', async () => {
-  const ctx = loadContentScript({});
-  let seen = null;
-  // Capture what findElement asks XPath for.
-  await ctx.send({ action: 'getText', selector: 'body' }).catch(() => {});
-  const evil = 'Accept")]|//a[@id="transfer-all"][contains(text(),"';
-  await ctx.send({ action: 'click', text: evil }).catch(() => {});
-  // The expression is built with concat() so the needle stays a single literal.
-  assert.ok(!SOURCE.includes('contains(text(), "${options.text}")'),
-    'the raw interpolation must be gone');
-  assert.ok(SOURCE.includes('xpathLiteral('),
-    'the text needle must be quoted through xpathLiteral');
+  // The attack: a needle that closes the literal, ends the predicate and
+  // unions in a path of its own choosing, so "click the Accept button" hits
+  // #transfer-all instead. Checked against the expression findElement hands
+  // to document.evaluate. A plain substring check on that expression cannot
+  // tell syntax from literal content - the correctly quoted needle still
+  // contains `]|//` - so string literals are cut out first and what is left
+  // has to be the bare skeleton, with the literals adding back up to the
+  // needle exactly.
+  const needles = [
+    'Accept")]|//a[@id="transfer-all"][contains(text(),"',
+    // Both quote kinds force the concat() form.
+    'Don\'t")]|//a[@id=\'transfer-all\'][contains(text(),"'
+  ];
+  // Every tool that takes a locator goes through findElement.
+  const actions = ['click', 'hover', 'getValue', 'getAttribute', 'focus',
+                   'highlight', 'getBoundingRect'];
+  for (const needle of needles) {
+    for (const action of actions) {
+      const ctx = loadContentScript({});
+      await ctx.send({ action, text: needle }).catch(() => {});
+
+      assert.equal(ctx.xpathAsked.length, 1,
+        `${action}: expected one XPath lookup by text`);
+      const expression = ctx.xpathAsked[0];
+      const literals = expression.match(/"[^"]*"|'[^']*'/g) || [];
+      const skeleton = expression.replace(/"[^"]*"|'[^']*'/g, 'L');
+      assert.match(skeleton,
+        /^\/\/\*\[contains\(text\(\), (?:L|concat\(L(?:, L)*\))\)\]$/,
+        `${action}: the needle escaped its literal: ${expression}`);
+      assert.equal(literals.map(l => l.slice(1, -1)).join(''), needle,
+        `${action}: the literal must spell the needle, nothing more or less`);
+    }
+  }
 });
 
 // --------------------------------------------------------------------------
