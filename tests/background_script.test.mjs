@@ -1033,6 +1033,27 @@ test('a credential in a request URL is scrubbed like one in a body', async () =>
   }
 });
 
+test('a session id in a path parameter is scrubbed', async () => {
+  // Servlet containers put the session in the path when cookies are off:
+  // /x;jsessionid=ABC. The query and fragment were scrubbed, the path was
+  // not, so the session id reached the agent whenever the URL parsed.
+  const cases = [
+    ['https://a.test/x;jsessionid=SESS-ONE?x=1', 'SESS-ONE', '/x;jsessionid=***'],
+    ['https://a.test/app;JSESSIONID=SESS-TWO/page', 'SESS-TWO', '/app;JSESSIONID=***/page'],
+    ['https://a.test/m;v=2;token=SESS-THREE', 'SESS-THREE', '/m;v=2;token=***'],
+  ];
+  for (const [url, secret, path] of cases) {
+    const { command, webRequest } = loadBackground();
+    await command('startLogging', {}, 7);
+    fireRequest(webRequest, { url });
+    const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+    assert.ok(!JSON.stringify(entry).includes(secret),
+              `${secret} leaked from ${url}: ${entry.url}`);
+    assert.ok(entry.url.includes(path),
+              `the rest of the path must stay as written: ${entry.url}`);
+  }
+});
+
 test('an ordinary query string is left readable', async () => {
   const { command, webRequest } = loadBackground();
   await command('startLogging', {}, 7);

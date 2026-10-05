@@ -526,6 +526,14 @@ function redactParamText(text) {
       (isSecretUrlParam(decodeParamName(name)) ? `${lead}${name}=***` : match));
 }
 
+// `;name=value` parameters inside a path, scrubbed in place by the same
+// name test as a query.
+function redactPathParams(path) {
+  return path.replace(/;([^;/=]*)=([^;/]*)/g,
+    (match, name) =>
+      (isSecretUrlParam(decodeParamName(name)) ? `;${name}=***` : match));
+}
+
 // A URL that new URL() will not take: a relative redirect target
 // (`/cb?code=...`, `//host/cb?code=...`, `cb?code=...`), or a malformed one.
 // The fallback used to be the body text passes, which do not know that `code`
@@ -564,6 +572,12 @@ function redactUrlForLog(rawUrl) {
     if (parsed.username || parsed.password) {
       parsed.username = "";
       parsed.password = "";
+    }
+    // Path parameters: servlet containers put the session in the path when
+    // cookies are off (/x;jsessionid=...), and the query and fragment passes
+    // never looked there.
+    if (parsed.pathname.includes(";")) {
+      parsed.pathname = redactPathParams(parsed.pathname);
     }
     if (parsed.search) {
       parsed.search = "?" + redactParamText(parsed.search.slice(1));
