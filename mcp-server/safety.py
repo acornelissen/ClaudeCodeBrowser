@@ -382,6 +382,15 @@ SENSITIVE_ARGS = frozenset({
 # see redact_url.
 URL_ARGS = frozenset({'url'})
 
+# Argument keys holding a pattern matched against whole tab URLs, query string
+# included. A pattern can name a reset token to find the tab that holds it,
+# and it is a regex rather than a URL, so redact_url cannot reduce it to a
+# host and path - escapes and quantifiers make its '?' and '/' mean something
+# else. Masked outright instead. A separate set rather than an entry in
+# SENSITIVE_ARGS only because agent/browser_agent.py mirrors that list and
+# a parity test holds the two together; the client should mask this too.
+URL_FILTER_ARGS = frozenset({'url_pattern'})
+
 
 def redact_url(url: Any) -> Any:
     """Keep the part of a URL a log needs and drop the parts that carry secrets.
@@ -396,9 +405,18 @@ def redact_url(url: Any) -> Any:
     A scheme the guard refuses outright keeps only its name: a javascript: or
     data: URL is a payload rather than a location, and the refusal is what
     the log is recording.
+
+    Anything that is not a string is masked whole. The schema says string,
+    but the agent writes the JSON, and {'href': 'https://a:pw@x/'} used to
+    be handed back untouched - into audit.jsonl and the server log both.
+    Picking a URL out of an arbitrary structure is guesswork, and a value
+    the browser cannot navigate to says nothing a log needs. None stays None:
+    it is how the audit entry says no URL was known.
     """
-    if not isinstance(url, str) or not url:
+    if url is None or url == '':
         return url
+    if not isinstance(url, str):
+        return '***'
     normalised = _normalise_url(url)
     try:
         parts = urlsplit(normalised)
@@ -425,7 +443,7 @@ def redact_url(url: Any) -> Any:
 def redact_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """A log-safe copy of a tool's arguments."""
     return {
-        k: ('***' if k in SENSITIVE_ARGS
+        k: ('***' if k in SENSITIVE_ARGS or k in URL_FILTER_ARGS
             else redact_url(v) if k in URL_ARGS
             else v)
         for k, v in arguments.items()

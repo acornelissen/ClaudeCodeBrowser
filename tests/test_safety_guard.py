@@ -727,6 +727,41 @@ class AuditLogTests(unittest.TestCase):
         self.assertNotIn('TRACKED-RESET-T0KEN', written)
         self.assertNotIn('frag-T0KEN', written)
 
+    def test_a_url_that_is_not_a_string_is_masked(self):
+        """redact_url handed anything that was not a string back untouched,
+        so {'url': {'href': 'https://a:hunter2@x/'}} reached audit.jsonl,
+        and the server log through the same function, with the password in
+        it. The schema says string, but the agent writes the JSON."""
+        g = guard()
+        for value in ({'href': 'https://a:N0NSTR-PW@x.test/'},
+                      ['https://a:N0NSTR-PW@x.test/'],
+                      ('https://x.test/reset?token=N0NSTR-PW',)):
+            with self.subTest(value=value):
+                self.assertEqual(safety.redact_arguments({'url': value}),
+                                 {'url': '***'})
+                g.check('browser_navigate', {'url': value})
+                self.assertEqual(self._last_entry()['tool'],
+                                 'browser_navigate')
+                self.assertNotIn('N0NSTR-PW', safety._AUDIT_FILE.read_text())
+
+    def test_a_url_filter_is_masked(self):
+        """url_pattern is a regex matched against whole tab URLs, query
+        string included, so the agent can put a reset token in it to find
+        the one tab that holds it. It is not a URL, so redact_url cannot
+        reduce it to a host and path; it is masked outright."""
+        g = guard()
+        pattern = r'reset\?token=FILTER-S3CRET'
+        for tool in ('browser_get_tabs', 'browser_find_tabs',
+                     'browser_reload_by_url', 'browser_screenshot_all_tabs'):
+            with self.subTest(tool=tool):
+                self.assertEqual(
+                    safety.redact_arguments({'url_pattern': pattern}),
+                    {'url_pattern': '***'})
+                g.check(tool, {'url_pattern': pattern})
+                self.assertEqual(self._last_entry()['tool'], tool)
+                self.assertNotIn('FILTER-S3CRET',
+                                 safety._AUDIT_FILE.read_text())
+
     def test_a_query_and_a_fragment_are_reduced_to_a_marker(self):
         g = guard()
         g.check('browser_navigate',
