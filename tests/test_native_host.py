@@ -22,7 +22,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 from tests import TEST_HOME  # noqa: F401  (redirects HOME before the import below)
 
@@ -72,6 +74,11 @@ class ProcessOwnershipTests(unittest.TestCase):
             'node esbuild.js --watch src mcp-server/server.py',
             'grep -r pattern mcp-server/server.py',
             'python3 -m http.server 8765 # mcp-server/server.py',
+            # An interpreter, but running some other script that merely
+            # mentions ours as an argument. Only the script itself counts;
+            # the two cases above that hold our path stop at the interpreter
+            # check and never reach that rule.
+            'python3 /opt/other/app.py --ref /x/mcp-server/server.py',
         ):
             with self.subTest(command=command):
                 self._with_command(command)
@@ -129,6 +136,112 @@ class KillTargetSelectionTests(unittest.TestCase):
         host.kill_existing_server()
 
         self.assertEqual(self.killed, [])
+
+
+class FakeResponse:
+    """The slice of an HTTP response that the identity probe reads."""
+
+    def __init__(self, body):
+        self.status = 200
+        self._body = body
+
+    def read(self, limit=-1):
+        return self._body if limit < 0 else self._body[:limit]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+TOOL_LIST = json.dumps({'tools': [{'name': 'browser_screenshot'},
+                                  {'name': 'browser_click'}]}).encode('utf-8')
+
+
+class ServerIdentityTests(unittest.TestCase):
+    """Whatever passes this probe is sent every browser command, typed
+    credentials included, and whatever it hands back from /browser/poll runs
+    in the browser. A process that got to port 8765 first must not pass.
+
+    Every listener here is a fake urlopen: nothing touches the network."""
+
+    TOKEN = 'a' * 64
+
+    def setUp(self):
+        token = mock.patch.object(host, '_read_api_token',
+                                  return_value=self.TOKEN)
+        token.start()
+        self.addCleanup(token.stop)
+        self.keys_sent = []
+
+    def _listen(self, answer):
+        """Install a listener: answer(api_key) returns a response or raises."""
+        def fake_urlopen(request, timeout=None):
+            api_key = request.get_header('X-api-key')
+            self.keys_sent.append(api_key)
+            return answer(api_key)
+
+        patcher = mock.patch('urllib.request.urlopen', fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _forbidden():
+        return urllib.error.HTTPError(host.MCP_SERVER_URL + '/mcp/tools', 403,
+                                      'Forbidden', {}, None)
+
+    def test_our_server_proves_itself(self):
+        def ours(api_key):
+            if api_key == self.TOKEN:
+                return FakeResponse(TOOL_LIST)
+            raise self._forbidden()
+
+        self._listen(ours)
+        self.assertTrue(host._server_proves_identity())
+        self.assertEqual(self.keys_sent, [self.TOKEN, '0' * 64],
+                         'both probes must have been made')
+
+    def test_a_listener_that_accepts_any_key_is_foreign(self):
+        """Echoing our tool list is easy; enforcing a token it cannot have
+        read is not. A 200 for a wrong key means nothing is checked."""
+        self._listen(lambda api_key: FakeResponse(TOOL_LIST))
+        self.assertFalse(host._server_proves_identity())
+
+    def test_a_listener_that_refuses_our_token_is_foreign(self):
+        def squatter(api_key):
+            raise self._forbidden()
+
+        self._listen(squatter)
+        self.assertFalse(host._server_proves_identity())
+
+    def test_a_listener_without_our_tool_list_is_foreign(self):
+        """200 for our token and 403 for the wrong one, but not our server's
+        answer: some other service that happens to check an X-API-Key."""
+        def other_service(api_key):
+            if api_key == self.TOKEN:
+                return FakeResponse(b'{"ok": true}')
+            raise self._forbidden()
+
+        self._listen(other_service)
+        self.assertFalse(host._server_proves_identity())
+
+    def test_an_unreachable_listener_is_not_ours(self):
+        for error in (urllib.error.URLError(ConnectionRefusedError()),
+                      TimeoutError('timed out')):
+            with self.subTest(error=error):
+                def unreachable(api_key, error=error):
+                    raise error
+
+                self._listen(unreachable)
+                self.assertFalse(host._server_proves_identity())
+
+    def test_without_a_token_nothing_is_asked_or_trusted(self):
+        """No token file means no server of ours has run yet."""
+        host._read_api_token.return_value = None
+        self._listen(lambda api_key: FakeResponse(TOOL_LIST))
+        self.assertFalse(host._server_proves_identity())
+        self.assertEqual(self.keys_sent, [])
 
 
 class ScreenshotWriteTests(unittest.TestCase):
