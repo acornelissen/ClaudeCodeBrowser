@@ -26,14 +26,14 @@ MIT license with the original copyright retained.
 
 ## Features
 
-- **Screenshots** - Capture visible area or full page screenshots
+- **Screenshots** - Capture the visible area (full page in headless mode only)
 - **Click Automation** - Click elements by CSS selector, XPath, text, or coordinates
 - **Typing** - Type text into inputs with simulated keystrokes
 - **Page Navigation** - Navigate to URLs, create/close/focus tabs
 - **Page Refresh** - Force refresh tabs after server restarts (bypass cache)
 - **Element Inspection** - Find elements, get page info, highlight elements
 - **JavaScript Execution** - Run arbitrary JS in browser context
-- **Console & Network Logging** - Capture console output and network traffic (fetch, XHR, WebSocket, beacons) for debugging
+- **Console & Network Logging** - Capture network traffic (fetch, XHR, WebSocket, beacons) and page errors for debugging. In Firefox the page's own `console.log` calls are not visible (see *Console & Network Logging* below). Attended mode only
 - **Safety Guards** - URL restrictions, protected-site confirmation, read-only mode, rate limiting, credential-field protection, audit log ([details](#safety-guards))
 - **Headless Mode** - Unattended automation via Playwright: Firefox, Chromium, or WebKit
 - **MCP Integration** - Model Context Protocol server for Claude Code
@@ -42,7 +42,7 @@ MIT license with the original copyright retained.
 
 | Browser | Attended (extension) | Headless (Playwright) |
 |---------|---------------------|----------------------|
-| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSER_ENGINE=firefox` (default) |
+| Firefox | ✅ Primary target (Manifest V2, AMO-signable) | ✅ `CLAUDE_BROWSER_ENGINE=firefox` (default; not on macOS 27 from a terminal, see [Headless Mode](#headless-mode)) |
 | Chromium / Chrome | 🧪 Experimental build via `scripts/build-chrome.sh` (MV3) | ✅ `CLAUDE_BROWSER_ENGINE=chromium` |
 | WebKit (Safari engine) | — | ✅ `CLAUDE_BROWSER_ENGINE=webkit` |
 
@@ -66,11 +66,11 @@ ClaudeCodeBrowser uses a **dual-server architecture** for maximum reliability an
 | Server | Port | Protocol | Purpose |
 |--------|------|----------|---------|
 | **HTTP Server** | 8765 | HTTP REST | MCP tool calls, health checks, command polling, screenshot retrieval |
-| **WebSocket Server** | 8766 | WebSocket | Real-time browser communication (reserved for future use) |
+| **WebSocket Server** | 8766 | WebSocket | Optional browser channel; the shipped extension does not use it |
 
 **Why Two Servers?**
-- **HTTP (8765)**: Primary communication channel. Claude Code's MCP client sends tool requests here. The browser extension polls this server every 500ms for pending commands.
-- **WebSocket (8766)**: Reserved for real-time bidirectional communication when instant responses are needed.
+- **HTTP (8765)**: The channel in use. Claude Code's MCP client sends tool requests here, and the native messaging host polls it every 500ms for pending commands and posts the extension's results back.
+- **WebSocket (8766)**: Accepts a token-authenticated browser client and uses it in preference to polling when one is connected. Nothing in this repository connects to it: the Firefox extension talks only to the native host.
 
 The WebSocket handshake refuses a browser `Origin` outright. WebSockets are
 exempt from CORS, so any page you visit could otherwise open a connection to
@@ -101,19 +101,33 @@ flowchart TB
 
 ### Request Flow (Step by Step)
 
-1. **Claude Code → MCP Server**: Tool call via HTTP POST to `localhost:8765/mcp/call`
+1. **Claude Code → MCP Server**: Tool call over stdio to `stdio_wrapper.py`, which POSTs it to `localhost:8765/mcp/call`
 2. **MCP Server → Command Queue**: Command is queued with unique ID
-3. **Browser Extension → MCP Server**: Extension polls `localhost:8765/browser/poll` every 500ms
-4. **MCP Server → Extension**: Pending command returned to extension
+3. **Native Host → MCP Server**: The native host polls `localhost:8765/browser/poll` every 500ms
+4. **Native Host → Extension**: The pending command is passed to the extension over native messaging
 5. **Extension → Web Page**: Command executed (screenshot, click, type, etc.)
-6. **Extension → MCP Server**: Response posted to `localhost:8765/browser/response`
+6. **Extension → Native Host → MCP Server**: The result goes back over native messaging and the host posts it to `localhost:8765/browser/response`
 7. **MCP Server → Claude Code**: Result returned to original MCP call
 
-### Native Host (Optional Path)
+In headless mode the server drives Playwright directly and none of steps 2–6 apply.
 
-The native messaging host (`claudecodebrowser_host.py`) provides an alternative communication path:
-- Used when the browser extension needs to communicate with the local file system
-- Handles screenshot saving directly to disk at `~/.claudecodebrowser/screenshots/`, created `0700` (override with `CLAUDE_BROWSER_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see [Screenshot retention](#screenshot-retention)
+### Native Host
+
+The native messaging host (`claudecodebrowser_host.py`) is how the Firefox
+extension reaches the server; the extension makes no HTTP or WebSocket
+connection of its own.
+- Polls the server for commands and relays them to the extension, and posts
+  the extension's results to the server. Results go to the server only, not
+  back to the extension.
+- Firefox drops any message over 1 MB from the host to the extension. A
+  command over that size is not sent: the call fails at once with a reason
+  rather than waiting out its timeout. Results travel the other way, where
+  the host accepts up to 64 MB, so a large screenshot is fine.
+- Saves the screenshot taken from the context menu's *Take Screenshot for
+  Claude*. Screenshots from `browser_screenshot` are saved by the server, at
+  `~/.claudecodebrowser/screenshots/`, created `0700` (override with
+  `CLAUDE_BROWSER_SCREENSHOTS_DIR`), pruned after 7 days or 500 files — see
+  [Screenshot retention](#screenshot-retention)
 - Starts the MCP server when it is not running, and restarts it if it dies.
   Before trusting whatever is on port 8765 it requires proof that the listener
   holds the shared API token, so a process that squats the port cannot receive
@@ -126,7 +140,9 @@ The native messaging host (`claudecodebrowser_host.py`) provides an alternative 
 
 ### Prerequisites
 
-**System Python websockets** (required for WebSocket server on port 8766):
+**Python 3.** Nothing else is required for attended mode.
+
+**System Python websockets** (optional, for the WebSocket server on port 8766):
 ```bash
 sudo apt install python3-websockets      # Linux
 python3 -m pip install websockets        # macOS
@@ -136,7 +152,10 @@ Use `python3 -m pip`, not `pip3`: on a machine with both mise and Homebrew
 Pythons they can be different interpreters, and the server only sees the one
 `python3` resolves to.
 
-Without this, the server runs in HTTP-only mode and `browsers_connected` will always show 0. Everything else still works over HTTP.
+Without it the server runs HTTP-only, which is all the Firefox extension
+uses. `browsers_connected` (in `/health` and `browser_safety_status`) counts
+WebSocket clients only, so it reads 0 with the extension connected either
+way.
 
 ### Quick Install (Linux and macOS)
 
@@ -278,7 +297,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package-extension.ps1 -Sign
 not auto-update:
 
 - Open `about:debugging#/runtime/this-firefox`
-- Find ClaudeCodeBrowser and click **Reload**, or remove it and load the new
+- Find ClaudeCodeBrowserX and click **Reload**, or remove it and load the new
   `manifest.json`/`.xpi` again
 - It is removed on Firefox restart, so you reload it each session
 
@@ -434,11 +453,19 @@ The server runs on:
 Run without any visible browser — ideal for CI, servers, and unattended tasks:
 
 ```bash
-pip install playwright
-playwright install firefox        # or: chromium / webkit
+python3 -m pip install playwright
+python3 -m playwright install firefox   # or: chromium / webkit
 
 CLAUDE_BROWSER_HEADLESS=1 python3 mcp-server/server.py
 ```
+
+> **macOS 27: use Chromium.** Firefox is the default engine, but on macOS 27
+> it cannot start when the server was launched from a terminal (or from
+> Claude Code): the OS's app data protection denies such processes access to
+> `~/Library/Application Support/Firefox`, and Firefox exits with `Could not
+> find profile folder`. Set `CLAUDE_BROWSER_ENGINE=chromium`. Granting the
+> terminal access to other apps' data would work round it, but would also
+> expose your browser cookies to the agent's shell.
 
 Pick the engine with `CLAUDE_BROWSER_ENGINE`:
 
@@ -460,9 +487,27 @@ Headless mode supports the core toolset (navigate, screenshot, click, type,
 scroll, element queries, script execution, eval chains, waiting, history,
 keyboard, text extraction) with real multi-tab management — `browser_create_tab`
 returns a `tabId` usable with `tab_id` on every other tool. The same safety
-guards apply. Startup takes ~15 seconds; the server holds the first command
-until the browser is ready (tunable via
-`CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT`, default 45s).
+guards apply, except that a protected-site action always takes the
+`confirm_token` route, since no human is there to approve it. Startup takes
+~15 seconds; the server holds the first command until the browser is ready
+(tunable via `CLAUDE_BROWSER_HEADLESS_STARTUP_TIMEOUT`, default 45s).
+
+Not implemented headless, and answered with `Unsupported headless action`:
+console and network logging, `browser_observe_element` /
+`browser_stop_observing`, `browser_wait_for_change`,
+`browser_click_and_wait`, `browser_scroll_and_capture`,
+`browser_hard_refresh`, `browser_reload_all`, `browser_reload_by_url`,
+`browser_get_tab_info`, `browser_find_tabs` and
+`browser_screenshot_all_tabs`. `browser_get_page_info` returns only the URL
+and title. Three tools work **only** headless: `browser_eval_chain`,
+`browser_wait_and_act` and `browser_inject_observer`.
+
+`browser_type` honours `clear`, `press_enter` and `delay` as the extension
+does, and lowers `delay` so the whole text types within 30 seconds (about 25
+in Firefox). With no `selector` it types into whatever has focus, so the
+credential check follows focus through shadow roots and same-origin frames
+to the real field; focus inside a cross-origin frame cannot be checked and
+is refused.
 
 ### Using the Browser Agent
 
@@ -518,7 +563,7 @@ agent.fill_form({
 #### Core Navigation & Screenshots
 | Tool | Description |
 |------|-------------|
-| `browser_screenshot` | Take a screenshot (visible area or full page) |
+| `browser_screenshot` | Take a screenshot of the visible area (`full_page` works headless only; Firefox falls back to the viewport with `fullPageCaptured: false`) |
 | `browser_navigate` | Navigate to a URL, optionally in new tab |
 | `browser_go_back` | Navigate back in tab history |
 | `browser_go_forward` | Navigate forward in tab history |
@@ -531,10 +576,10 @@ agent.fill_form({
 | Tool | Description |
 |------|-------------|
 | `browser_click` | Click element by selector, XPath, text, or coordinates |
-| `browser_type` | Type text into an input field |
+| `browser_type` | Type text into an input field. Refused on a credential field |
 | `browser_scroll` | Scroll page or element (up/down/left/right/top/bottom) |
 | `browser_hover` | Hover over an element to trigger hover effects |
-| `browser_get_value` | Get the value of an input element |
+| `browser_get_value` | Get the value of an input element. Credential and hidden fields read back as `***` |
 | `browser_set_value` | Set input value directly (no typing simulation) |
 | `browser_select_option` | Select an option in a dropdown |
 | `browser_press_key` | Press a keyboard key (Enter, Escape, arrows, shortcuts) |
@@ -546,7 +591,7 @@ agent.fill_form({
 | `browser_get_text` | Extract visible text of the page or an element |
 | `browser_get_elements` | Find elements matching a CSS selector |
 | `browser_highlight` | Highlight an element for visual debugging |
-| `browser_execute_script` | Execute JavaScript in browser context |
+| `browser_execute_script` | Execute JavaScript in browser context. Not constrained by the credential guard: a script can read any field |
 
 #### Tab Management
 | Tool | Description |
@@ -577,16 +622,16 @@ agent.fill_form({
 #### Console & Network Logging
 | Tool | Description |
 |------|-------------|
-| `browser_start_logging` | Start capturing console output and network traffic. `capture_bodies=false` for headers/metadata only; `include_all_types=true` to include images, fonts and stylesheets |
-| `browser_stop_logging` | Stop capturing (logs are preserved; page globals are restored) |
-| `browser_get_console_logs` | Retrieve captured console.log/error/warn/info/debug |
-| `browser_get_network_logs` | Retrieve captured requests and responses (credential headers redacted) |
+| `browser_start_logging` | Start capturing network traffic and page errors on this tab, until `browser_stop_logging` or a navigation to another origin. `capture_bodies=false` for headers/metadata only; `include_all_types=true` to include images, fonts and stylesheets |
+| `browser_stop_logging` | Stop capturing (logs are preserved) |
+| `browser_get_console_logs` | Retrieve uncaught page errors, unhandled rejections and the extension's own console output (including what `browser_execute_script` prints). **Not** the page's own `console.log` calls, which a content script cannot see |
+| `browser_get_network_logs` | Retrieve captured requests and responses (credential headers, URL parameters and body fields scrubbed) |
 | `browser_clear_logs` | Clear all captured logs |
 
 #### Human Approval, Workflows & Auditing
 | Tool | Description |
 |------|-------------|
-| `browser_request_approval` | Ask the human at the browser to Approve/Deny an action (in-page banner + OS notification) |
+| `browser_request_approval` | Ask the human at the browser to Approve/Deny an action (extension window + OS notification) |
 | `browser_solve_captcha` | Detect a captcha and hand it to the human to solve, then continue (never auto-solves) |
 | `browser_run_workflow` | Run a declarative multi-step workflow with assertions — an end-to-end test runner for web apps |
 | `browser_audit_page` | One-call page audit: headings, missing alt text, unlabeled inputs, meta info + screenshot for visual critique |
@@ -594,110 +639,127 @@ agent.fill_form({
 #### Safety
 | Tool | Description |
 |------|-------------|
-| `browser_safety_status` | Show active safety policy, rate-limit state, and audit log location |
+| `browser_safety_status` | Show active safety policy, mode (attended or headless), headless-only tools, credential guard state, rate-limit state, and audit log location |
+
+#### Headless only
+In attended Firefox these return `Unknown action`.
+
+| Tool | Description |
+|------|-------------|
+| `browser_eval_chain` | Run a sequence of JavaScript expressions sharing state, with per-step console capture |
+| `browser_wait_and_act` | Poll a condition, then run an action script (timeout capped at 30s) |
+| `browser_inject_observer` | Record DOM mutations into `window.__ccb_mutations`, read back with `browser_execute_script` |
 
 ### Console & Network Logging
 
-Essential for debugging AI chat interfaces and monitoring API communications:
+Essential for debugging AI chat interfaces and monitoring API communications.
+Attended (Firefox) mode only: the headless backend implements none of the
+logging tools.
 
-```bash
-# Start logging before performing actions
-browser-agent --start-logging
+The `browser-agent` command line has no logging options; call the tools from
+Python through `call_tool`:
 
-# Perform actions that you want to monitor...
+```python
+agent = BrowserAutomationAgent()
 
-# Get console logs (errors, warnings, debug output)
-browser-agent --get-console-logs
+# Start on the site you want to watch: navigating the tab to another origin
+# ends the session.
+agent.navigate("https://example.com/chat")
+agent.call_tool("browser_start_logging", clear_existing=True)
 
-> **How much the credential guard actually guarantees.** It constrains the
-> dedicated tools — typing, reading, element metadata — in both attended and
-> headless mode. It does **not** constrain `browser_execute_script`, which can
-> read any field including a password. `browser_safety_status` reports which
-> of three states you are in: `enforced` (scripts off),
-> `enforced_except_scripts` (the default: scripts on, but refused on protected
-> sites), or `advisory` (scripts on everywhere). That is stated in the tool
-> output rather than only here, because it is the kind of thing an agent
-> should be able to find out.
+agent.type_text("Hello!", selector="#chat-input")
+agent.click(selector="#send-button")
+
+errors = agent.call_tool("browser_get_console_logs", level="error")
+for log in errors.get("logs", []):
+    print(f"[{log['level']}] {log['message']}")
+
+network = agent.call_tool("browser_get_network_logs", url_pattern="api/chat")
+for req in network.get("logs", []):
+    print(f"{req['method']} {req['url']} -> {req.get('status')}")
+    print(f"Response: {str(req.get('responseBody', ''))[:200]}")
+
+agent.call_tool("browser_stop_logging")
+```
+
+> **What console capture sees.** A content script cannot see the page's own
+> console, so the page's `console.log` calls are **not** captured. What is
+> captured: uncaught page errors and unhandled promise rejections
+> (`source: "page"`), and output from the extension's own scripts, including
+> anything `browser_execute_script` prints (`source: "extension"`). An empty
+> result does not mean the page logged nothing; the result says so with
+> `capturesPageConsole: false`.
 
 > **Logs on disk.** `~/.claudecodebrowser/logs/` holds `mcp_server.log`,
-> `native_host.log` and the guard's `audit.jsonl`. All three are created `0600`
-> in a `0700` directory and rotate at 5 MB. The server and native host log at
+> `native_host.log` and the guard's `audit.jsonl`, all created `0600` in a
+> `0700` directory. `mcp_server.log` and `audit.jsonl` rotate at 5 MB;
+> `native_host.log` is rotated only when the host starts and finds it over
+> 5 MB. The server and native host log at
 > INFO and record the shape of a command, not its payload — raise them with
 > `CLAUDE_BROWSER_DEBUG=1` / `CLAUDE_BROWSER_HOST_DEBUG=1` when you need the
 > detail, and remember that detail includes page content. Sensitive argument
 > values (`text`, `script`, `value`, `password`, `steps`, `action_script`,
-> `condition`, `key`) are replaced with `***` in both the application log and
-> the audit log, from one list in `safety.py` that both read. A `url` argument
+> `condition`, `key`, `url_pattern`) are replaced with `***` wherever they sit
+> in the arguments, nested objects and lists included, in both the
+> application log and the audit log, from one list in `safety.py` that both
+> read. `url_pattern` is masked outright: it is a regex matched against whole
+> URLs, so it can name a reset token. A `url` argument
 > is **reduced rather than masked**: the scheme, host and path are kept, and
 > the userinfo, query and fragment — where a password, a reset token or an SSO
 > code lives — become a marker, so an entry reads
 > `https://***@intranet.example.com/wiki/Home` or
 > `https://example.com/reset?***`. A URL in a scheme the guard refuses keeps
 > only its scheme (`data:***`), because such a URL is a payload and not a
-> location. `audit.jsonl` still records which pages were visited, which is the
-> point of an audit log and also a browsing history.
+> location, and a `url` that is not a string is masked whole. `audit.jsonl`
+> still records which pages were visited, which is the point of an audit log
+> and also a browsing history.
 
 > **How network capture works.** Requests are recorded in the extension's
 > background script through Firefox's `webRequest` API, not by replacing the
 > page's `fetch`/`XHR`. That means `fetch` is captured (Firefox's content-script
 > sandbox makes `window.fetch` read-only, so a content script can only ever see
 > XHR), pages with a strict CSP are captured, and no page global is touched.
-> Capture is off until `browser_start_logging` and stops at
-> `browser_stop_logging`; while nothing is being logged, no listeners are
-> attached at all. Credential-bearing headers (`Authorization`, `Cookie`,
-> `Set-Cookie`, `X-API-Key`, …) are reported as `***`. Response bodies are
-> collected for textual content types up to 5000 characters, and can be
-> switched off with `capture_bodies: false`, which suppresses request **and**
-> response bodies. Bodies are additionally run through a credential-key
-> scrubber, because redacting an `Authorization` header is worth little if the
-> body that minted the token is kept verbatim. By default only API-shaped
+> Capture is off until `browser_start_logging`, and stops at
+> `browser_stop_logging` or as soon as the tab navigates to a different
+> origin, so start it on the site you want to watch rather than on
+> `about:blank`. It is refused on a private-browsing tab. While nothing is
+> being logged, no listeners are attached at all. By default only API-shaped
 > traffic is logged — pass `include_all_types: true` for images, fonts and
 > stylesheets, which also attaches a response filter to documents and scripts.
-> Console capture stays in the content script, since console output only exists
-> inside the page.
-
-# Get network logs (API requests and responses)
-browser-agent --get-network-logs
-
-# Filter console logs by level
-browser-agent --get-console-logs --level error
-
-# Filter network logs by URL pattern
-browser-agent --get-network-logs --url-pattern "api/chat"
-
-# Stop logging
-browser-agent --stop-logging
-```
-
-#### Python API for Logging
-```python
-agent = BrowserAutomationAgent()
-
-# Start logging
-agent.start_logging(clear_existing=True)
-
-# Perform actions...
-agent.navigate("https://example.com/chat")
-agent.type_text("Hello!", selector="#chat-input")
-agent.click(selector="#send-button")
-
-# Get console logs
-console_logs = agent.get_console_logs(level="error")  # Filter by level
-for log in console_logs['logs']:
-    print(f"[{log['level']}] {log['message']}")
-
-# Get network logs
-network_logs = agent.get_network_logs(url_pattern="api/chat")
-for req in network_logs['logs']:
-    print(f"{req['method']} {req['url']} -> {req['status']}")
-    print(f"Response: {req['responseBody'][:200]}...")
-
-# Stop logging
-agent.stop_logging()
-```
+> Response bodies are collected for textual content types up to 5000
+> characters and request bodies up to 1000; `capture_bodies: false`
+> suppresses both.
+>
+> What is scrubbed before the agent sees it:
+>
+> - **Headers.** Credential-bearing headers (`Authorization`,
+>   `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`,
+>   `X-CSRF-Token`, …) are reported as `***`.
+> - **URLs.** The request URL and the `Location`, `Content-Location`,
+>   `Refresh` and `Referer` headers lose their userinfo, and credential
+>   parameters are masked in the query, the fragment (including a hash
+>   router's `#/callback?code=...`) and `;name=value` path parameters. `code`,
+>   `token`, `access_token`, `sid`, `ticket` and similar count here although
+>   they are ordinary names in a body. Relative redirect targets get the same
+>   treatment; a URL that cannot be taken apart is withheld.
+> - **Bodies.** A JSON body is walked structurally and every value under a
+>   credential-shaped key is masked, however deep; form data, multipart
+>   fields and `key=value` / `key: "value"` text are scrubbed by name. In
+>   HTML, an `<input>` whose tag marks it as a credential (`type=password` or
+>   `hidden`, a password, one-time-code, card-number or CVC `autocomplete`
+>   token, or a credential-shaped `name` or `id`) has its `value` masked, and
+>   a credential `<textarea>` its contents. Redacting an `Authorization`
+>   header is worth little if the body that minted the token is kept
+>   verbatim.
+>
+> **What is not scrubbed:** a credential in the free text of a captured HTML
+> page, the contents of a `contenteditable` element, and a custom element such
+> as `<sl-input type="password" value="...">` (only `<input>` and
+> `<textarea>` tags are examined). The scrub is pattern matching over a log,
+> not a parser, so treat captured bodies as sensitive.
 
 #### Use Cases
-- **Debug AI Chat Interfaces**: See console errors and API request/response data
+- **Debug AI Chat Interfaces**: See uncaught page errors and API request/response data
 - **Monitor API Communications**: Track requests with bodies, captured at the network layer
 - **Troubleshoot Errors**: Filter console logs by error level
 - **Verify Integrations**: Confirm API calls are being made correctly
@@ -780,6 +842,11 @@ agent.reload_by_url(url_pattern=r"localhost:500[0-9]")
 }
 ```
 
+`delay` is per keystroke: 50ms by default in Firefox, none headless. It is
+lowered so the whole text types within about 25 seconds in Firefox and 30
+headless, inside the server's wait for a reply. Headless reports the
+lowering with `delay_capped`; Firefox lowers it without saying so.
+
 #### browser_scroll
 ```json
 {
@@ -795,12 +862,17 @@ agent.reload_by_url(url_pattern=r"localhost:500[0-9]")
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Server health check |
+| `/health` | GET | Server health check (the only endpoint that needs no token) |
 | `/mcp/tools` | GET | List available MCP tools |
 | `/mcp/call` | POST | Execute an MCP tool |
 | `/screenshots` | GET | List saved screenshots |
 | `/browser/command` | POST | **Gone** — returns `410`. It queued a command and reported success having run nothing; use the MCP tool interface. |
-| `/browser/response` | POST | Receive browser response |
+| `/browser/poll` | GET | Next pending command, polled by the native host |
+| `/browser/response` | POST | Receive browser response (posted by the native host) |
+
+Every endpoint except `/health` requires the `X-API-Key` header, holding the
+token from `~/.claudecodebrowser/api_token`; without it the server answers
+`403`.
 
 ### Example API Calls
 
@@ -808,17 +880,19 @@ agent.reload_by_url(url_pattern=r"localhost:500[0-9]")
 # Health check
 curl http://localhost:8765/health
 
+KEY="X-API-Key: $(cat ~/.claudecodebrowser/api_token)"
+
 # List tools
-curl http://localhost:8765/mcp/tools
+curl -H "$KEY" http://localhost:8765/mcp/tools
 
 # Take screenshot
 curl -X POST http://localhost:8765/mcp/call \
-  -H "Content-Type: application/json" \
+  -H "$KEY" -H "Content-Type: application/json" \
   -d '{"name": "browser_screenshot", "arguments": {}}'
 
 # Click element
 curl -X POST http://localhost:8765/mcp/call \
-  -H "Content-Type: application/json" \
+  -H "$KEY" -H "Content-Type: application/json" \
   -d '{"name": "browser_click", "arguments": {"selector": "button.login"}}'
 ```
 
@@ -920,7 +994,7 @@ Tooling is pinned with [mise](https://mise.jdx.dev) (Python, Node and
 
 1. Start the MCP server with debug logging:
    ```bash
-   python3 mcp-server/server.py
+   CLAUDE_BROWSER_DEBUG=1 python3 mcp-server/server.py
    ```
 
 2. Load the extension temporarily in Firefox
@@ -944,8 +1018,8 @@ points.
 
 ```bash
 mise run test            # everything
-mise run test-python     # MCP server, safety guard, native host, identity
-mise run test-extension  # content script + background script
+mise run test-python     # MCP server, safety guard, headless backend, native host, stdio wrapper, agent, identity
+mise run test-extension  # content script, background script, approval page
 ```
 
 What the suites cover, beyond the obvious:
@@ -966,7 +1040,7 @@ What the suites cover, beyond the obvious:
 
 ```bash
 mise run package   # unsigned .xpi (temporary load only)
-mise run sign      # AMO-signed .xpi + updates.json  (see Signing below)
+mise run sign      # AMO-signed .xpi + updates.json  (see Updating the Firefox Extension)
 mise run release   # GitHub release with both assets
 ```
 
@@ -1017,6 +1091,16 @@ development workflows. Policy lives in `~/.claudecodebrowser/safety.json`
 (created with safe defaults on first run) and can be inspected at runtime with
 the `browser_safety_status` tool.
 
+> **How much the credential guard actually guarantees.** It constrains the
+> dedicated tools — typing, reading, element metadata — in both attended and
+> headless mode. It does **not** constrain `browser_execute_script`, which can
+> read any field including a password. `browser_safety_status` reports which
+> of three states you are in: `enforced` (scripts off),
+> `enforced_except_scripts` (the default: scripts on, but refused on protected
+> sites), or `advisory` (scripts on everywhere). That is stated in the tool
+> output rather than only here, because it is the kind of thing an agent
+> should be able to find out.
+
 ### What the guard enforces
 
 | Guard | Behavior |
@@ -1025,20 +1109,20 @@ the `browser_safety_status` tool.
 | **Blocklist / allowlist** | `blocked_url_patterns` refuses matching URLs; a non-empty `allowed_url_patterns` switches to allowlist mode where only matching URLs may be visited. A list that *refuses* matches loosely (anywhere in the URL), because a near miss there errs towards refusing. A list that *grants* — `allowed_url_patterns`, `trusted_url_patterns` — is matched **anchored**: a pattern grants access when it covers the whole of the URL up to one of its delimiters (`:`, `/`, `?`, `#`), or matches a whole hostname. The query string and fragment cannot satisfy a pattern. So `^https://localhost` covers `https://localhost:3000/app` but not `https://localhost.evil.com/x`, which a loose match used to allow. An unanchored mid-URL pattern such as `stripe\.com/dashboard` therefore no longer grants anything; write `^https://stripe\.com/` instead. A pattern that names a host must match **the whole host**: `example\.com` covers `example.com` and **not** `www.example.com` — write `(.+\.)?example\.com` for a whole domain tree. Do **not** start a permit pattern with `.*`: `.*\.stripe\.com` is satisfied by a path segment on any host, so it grants `https://evil.com/a.stripe.com`. (A permit pattern can no longer be satisfied by the query string or fragment, so `https://evil.com/?x=a.stripe.com` is refused.) `.*` on its own still means everything. |
 | **Broken patterns** | A pattern in `allowed_url_patterns` or `trusted_url_patterns` that does not compile is dropped, and if **none** of them compile the restriction stays on and permits nothing — a granting list is never allowed to evaporate into "allow everything". `browser_safety_status` reports every failure in `pattern_errors`. |
 | **URL normalisation** | Every pattern sees the URL the browser will actually load: leading/trailing control characters and spaces stripped, tab/CR/LF removed, `\` treated as `/`. Firefox loads `https://www.irs.gov\payments` as `https://www.irs.gov/payments`, and without this a backslash walked straight past the protected-domain check. The host is also percent-decoded, lowercased and stripped of trailing dots, and userinfo is ignored, because the browser loads `https://%63hase.com/`, `https://chase.com./` and `https://localhost:3000@evil.com/` as `chase.com`, `chase.com` and `evil.com`. The guard judges a normalised copy; the URL sent to the browser is the one you asked for. |
-| **Protected sites** | State-changing actions (click, type, navigate, script execution) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. |
-| **Password fields (writing)** | Typing into a credential field is refused by default in both attended and headless modes, from one definition the two share and a test pins. "Credential field" means `<input type="password">`, any of the `autocomplete` credential tokens, a `name` or `id` that looks like a credential (`passwd`, `cvv`, `otpCode`, `user[password]`, `apiKey`), or a non-`<input>` holder of an entered value — a `<textarea>`, a `contenteditable`, or a custom element such as `<sl-input type="password">`, which is what component libraries ship and therefore what an agent has to target. (Until recently the headless backend recognised only the first two of those, so eight shapes were refused in Firefox and written in headless.) Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override. |
-| **Credential fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. In the Firefox extension one function decides this for `browser_get_value`, `browser_get_elements`, `browser_get_page_info`, `browser_get_tab_info`, `browser_get_text`, `browser_scroll_and_capture` and `browser_observe_element` — the last two were *not* covered until a data-flow review found them, which is why this sentence now names the set instead of asserting completeness. "Credential" covers `type=password`, `autocomplete` of `current-password`/`new-password`/`one-time-code`/`cc-*` (matched case-insensitively across the token list), and `type=hidden` — hidden inputs carry CSRF and session tokens. The same `allow_password_typing` setting lifts it. `browser_execute_script` can still read any field — see below. Nor does it apply to `browser_screenshot`: a revealed password (a "show password" toggle makes the field `type=text`), an on-screen one-time code or a visible account number is captured as pixels and kept under the retention policy. "Credential" also covers a field whose `name` or `id` looks like one (`passwd`, `cvv`, `otp`, `ssn`, `user[password]`) and a custom element carrying `type="password"`, which is how component libraries ship a field — so a `***` can come from an ordinary text input. `browser_get_text` on a credential field returns `***`, and a whole-page `browser_get_text` masks the text of any editable credential field inside it, reporting `maskedFields`. |
+| **Protected sites** | State-changing actions (click, type, navigate) on banking, payment, health, and government sites require explicit confirmation — by default from the **human at the browser** (see below), with an agent-side `confirm_token` round trip as the fallback. Read-only actions (screenshots, inspection) are unaffected. Scripts are refused outright by default — see *Scripts on protected sites*. |
+| **Password fields (writing)** | Typing into a credential field is refused by default in both attended and headless modes, from one definition the two share and a test pins. A "credential field" is any of: an element with `type="password"`, including a custom element such as `<sl-input type="password">`, which is what component libraries ship and therefore what an agent has to target; an element whose `autocomplete` holds `current-password`, `new-password`, `one-time-code`, `cc-number`, `cc-csc`, `cc-exp`, `cc-exp-month` or `cc-exp-year`; or an element that holds an entered value — `<input>`, `<textarea>`, `<select>`, a `contenteditable`, a custom element — whose `name` or `id` looks like a credential (`passwd`, `cvv`, `otpCode`, `user[password]`, `apiKey`, `mfaCode`, `verificationCode`, `securityCode`, `cc_number`, `creditCard`, `pincode`, `cookie`, `recoveryCodes`, `backup_codes`, `cardCode`). `browser_type`, `browser_set_value` and, in headless mode, `browser_press_key` (whose keys really type there) are covered. Credentials belong in the browser's own password manager. Set `"allow_password_typing": true` to override; an `allow_password` argument sent by the agent, in any spelling, is dropped, so only `safety.json` can open the guard. |
+| **Credential fields (reading)** | Reading one back is guarded too: `browser_get_value` returns `***` with `masked: true`, and `browser_get_elements` / `browser_get_page_info` mask the value in element metadata. In the Firefox extension one function decides this for `browser_get_value`, `browser_get_elements`, `browser_get_page_info`, `browser_get_tab_info`, `browser_get_text`, `browser_scroll_and_capture` and `browser_observe_element` — the last two were *not* covered until a data-flow review found them, which is why this sentence names the set instead of asserting completeness. The fields masked are the credential fields defined in the row above, plus `type=hidden` inputs, which carry CSRF and session tokens; a `***` can therefore come from an ordinary text input. `browser_get_text` on a credential field returns `***`, and a whole-page `browser_get_text` masks the text of any credential `<textarea>` or `contenteditable` inside it, reporting `maskedFields`. `allow_password_typing` lifts the mask for `browser_get_value`, `browser_get_elements` and `browser_get_page_info` only; the other readers mask whatever it says. `browser_execute_script` can still read any field — see below. Nor does the mask apply to `browser_screenshot`: a revealed password (a "show password" toggle makes the field `type=text`), an on-screen one-time code or a visible account number is captured as pixels and kept under the retention policy. |
 | **Human approval** | The Approve/Deny decision is taken in an **extension window** (`moz-extension://`), which the page being automated cannot read, restyle or click. Only trusted events count, and only the extension's own pages may answer — a content script's attempt is refused. Closing the window is a denial. If no window can be opened the in-page banner is used as a fallback, rendered in a closed shadow root, and the result is marked `degraded: true` because a prompt sharing the DOM with the page is not equivalent. If the prompt cannot be completed, the action is **refused** rather than falling back to a token the agent could satisfy itself. Firefox does not support buttons on notifications, so the notification remains an attention-getter. |
 | **Scripts on protected sites** | The script tools — `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, `browser_inject_observer`, and `browser_audit_page`, which runs a fixed inspection script — are **refused outright** on a protected URL, not merely confirmed: a script can read any field on the page, so the credential guard does not constrain it, and a confirmation the agent can satisfy is no control over arbitrary JavaScript. Turn it off with `"deny_scripts_on_protected_urls": false`. |
 | **Unlisted domains** | `protected_url_patterns` is a denylist of ~16 finance, health and government patterns, so everything else — your mail, your cloud console, your admin panels — is unprotected by default. Set `"unlisted_domains": "confirm"` to invert that, and list your normal work in `trusted_url_patterns`. Expect a lot of prompts until that list is right; prompt fatigue is its own hazard, which is why it is opt-in. |
 | **Confirmation tokens** | A `confirm_token` is bound to a hash of the exact call — tool, arguments and URL — so one earned on a harmless call cannot be spent on a dangerous one. Single-use, 120s. |
 | **Blocklist scope** | `blocked_url_patterns` / `allowed_url_patterns` apply to the page a tool acts on, not only to a navigation argument, so blocking a domain also refuses reads on an already-open tab there. |
-| **Low-risk acts** | `browser_scroll`, `browser_hover`, `browser_highlight` and `browser_focus_tab` change state, so read-only mode blocks them, but they do not raise a protected-site prompt — prompting on every scroll teaches people to click Approve without reading. `browser_screenshot_all_tabs` is **not** observation: it activates and photographs every tab in every window. |
-| **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus an Approve/Deny banner on the current page. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
+| **Low-risk acts** | `browser_scroll`, `browser_scroll_and_capture`, `browser_hover`, `browser_highlight` and `browser_focus_tab` change state, so read-only mode blocks them, but they do not raise a protected-site prompt — prompting on every scroll teaches people to click Approve without reading. `browser_screenshot_all_tabs` is **not** observation: it activates and photographs every tab in every window. |
+| **Human approval (Duo-style)** | With `protected_approval` set to `"auto"` (default) or `"human"`, a protected action triggers an OS notification plus the Approve/Deny window described above. The action proceeds only if the person clicks **Approve** (60s timeout = deny). `"token"` forces the agent-side flow; headless mode always uses tokens since no human is present. |
 | **Read-only mode** | Set `"read_only": true` or `CLAUDE_BROWSER_READ_ONLY=1` to block every state-changing tool while keeping screenshots, page inspection, and log reading available. Useful for "look but don't touch" sessions. |
 | **Script toggle** | Set `"allow_script_execution": false` or `CLAUDE_BROWSER_ALLOW_SCRIPTS=0` to disable `browser_execute_script`, `browser_eval_chain`, `browser_wait_and_act`, `browser_inject_observer` and `browser_audit_page` entirely. `browser_audit_page` only observes, but it does so by running a fixed script in the page, so the toggle covers it; `browser_safety_status` lists every tool it covers as `script_tools`. |
 | **Rate limiting** | A sliding-window cap (`max_actions_per_minute`, default 120) prevents runaway automation loops. |
-| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords, pressed keys) redacted and URLs reduced to scheme, host and path. |
+| **Audit log** | Every decision (allowed, denied, confirmation requested) is appended to `~/.claudecodebrowser/logs/audit.jsonl` with sensitive argument values (typed text, scripts, passwords, pressed keys, URL patterns) redacted at any depth and URLs reduced to scheme, host and path. Nothing is written while `"enabled": false`. |
 
 ### Example `safety.json`
 
@@ -1052,14 +1136,18 @@ the `browser_safety_status` tool.
   "audit_log": true,
   "blocked_url_patterns": ["internal-admin\\.mycompany\\.com"],
   "allowed_url_patterns": [],
-  "protected_url_patterns": ["paypal\\.com", "chase\\.com", "\\.gov(/|$)"]
+  "protected_url_patterns": ["paypal\\.com", "chase\\.com", "\\.gov([:/?#]|$)"],
+  "deny_scripts_on_protected_urls": true,
+  "allow_password_typing": false
 }
 ```
 
 The defaults include a starter set of protected patterns for common banking,
 payment, brokerage, government, and health domains — edit the file to match
-your own risk tolerance. Setting `"enabled": false` turns the guard off
-entirely (not recommended).
+your own risk tolerance. Setting `"enabled": false` turns off every policy
+check and the audit log (not recommended). The scheme guard still refuses
+`file:`, `javascript:`, `data:` and the rest, and the credential guard, which
+`allow_password_typing` controls, stays on.
 
 ### Credentials and 2FA: what this project deliberately does NOT do
 
@@ -1113,7 +1201,7 @@ without an API.
 ### Remove the Firefox add-on
 
 1. Open `about:addons` in Firefox (or menu → Add-ons and themes)
-2. Find **ClaudeCodeBrowser** under Extensions
+2. Find **ClaudeCodeBrowserX** under Extensions
 3. Click the `…` menu next to it and choose **Remove**
 
 If the extension was loaded temporarily via `about:debugging`, it disappears
@@ -1127,7 +1215,9 @@ on its own the next time Firefox restarts — or click **Remove** on the
 ```
 
 This removes the native messaging manifest, the `~/.claudecodebrowser`
-install directory, and any symlinks. If you registered the MCP server with
+install directory, and its own symlinks in `~/bin`. If there are saved
+screenshots it asks first, and can keep a copy in
+`~/claudecodebrowser-screenshots`. If you registered the MCP server with
 Claude Code, also run:
 
 ```bash
@@ -1155,7 +1245,9 @@ claude mcp remove claudecodebrowser
 - Network capture is off until you ask for it, happens in the extension's
   background script via `webRequest`, and never replaces a page's own
   `fetch`, `XMLHttpRequest` or `console`
-- Credential-bearing headers are redacted out of captured network logs
+- Credential-bearing headers, credential URL parameters and credential
+  fields in bodies are scrubbed out of captured network logs (best effort;
+  see *How network capture works*)
 - No data is sent to external servers
 
 ## License
