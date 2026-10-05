@@ -592,6 +592,20 @@ class ChildReapingTests(unittest.TestCase):
                          'the health monitor must reap a dead child')
 
 
+class RecordingStream(io.BytesIO):
+    """Records how many bytes each read asked for. A refused frame raises
+    FramingError whether it was refused up front or ran out of bytes, so
+    the requests are the only way to tell the two apart."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.requested = []
+
+    def read(self, count=-1):
+        self.requested.append(count)
+        return super().read(count)
+
+
 def framed(payload: bytes) -> bytes:
     """One native-messaging frame: native-order length prefix, then bytes."""
     return struct.pack(host.NATIVE_LENGTH_FORMAT, len(payload)) + payload
@@ -617,10 +631,13 @@ class FramingTests(unittest.TestCase):
         # The same length written the other way round reads as hundreds of
         # megabytes, so it is refused rather than silently mis-framed. True
         # on either endianness: each order looks huge read as the other.
+        # Checked through the reads: a short body raises FramingError too, so
+        # expecting the error alone stayed green with the size bound removed.
         other_order = '>I' if sys.byteorder == 'little' else '<I'
+        stream = RecordingStream(struct.pack(other_order, len(payload)) + payload)
         with self.assertRaises(host.FramingError):
-            host.read_message(io.BytesIO(
-                struct.pack(other_order, len(payload)) + payload))
+            host.read_message(stream)
+        self.assertEqual(stream.requested, [4])
 
     def test_a_valid_frame_round_trips(self):
         message = {'action': 'ping', 'requestId': 'abc'}
@@ -673,15 +690,6 @@ class FramingTests(unittest.TestCase):
         alone could not fail: with only the prefix to read, a short body
         raises FramingError too, so dropping the size bound kept it green.
         """
-        class RecordingStream(io.BytesIO):
-            def __init__(self, data):
-                super().__init__(data)
-                self.requested = []
-
-            def read(self, count=-1):
-                self.requested.append(count)
-                return super().read(count)
-
         stream = RecordingStream(struct.pack(
             host.NATIVE_LENGTH_FORMAT, host.MAX_INCOMING_MESSAGE_BYTES + 1))
         with self.assertRaises(host.FramingError):
