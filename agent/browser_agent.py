@@ -160,16 +160,13 @@ def _redact_result(result, secrets=()):
 
 
 def _redact(arguments: dict) -> dict:
-    """A log-safe and history-safe copy of a tool's arguments."""
-    out = {}
-    for k, v in (arguments or {}).items():
-        if k in _SENSITIVE_ARGS:
-            out[k] = '***'
-        elif k in _URL_ARGS:
-            out[k] = _reduce_url(v)
-        else:
-            out[k] = v
-    return out
+    """A log-safe and history-safe copy of a tool's arguments, at every depth.
+
+    Top-level keys only used to be looked at, so a credential nested in an
+    argument was printed whole. _scrub with no sent values does exactly the
+    key pass, recursively.
+    """
+    return _scrub(arguments or {}, ())
 
 
 def _api_headers(url: Optional[str] = None) -> dict:

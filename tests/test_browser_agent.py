@@ -675,6 +675,19 @@ class RedactionListParityTests(unittest.TestCase):
         self.assertNotIn('PAGE-HELD-SECRET', json.dumps(safe), safe)
 
 
+class NestedArgumentTests(AgentTestCase):
+    """_redact looked at top-level keys only, so a credential nested in an
+    argument went to verbose output and the action history whole."""
+
+    def test_nested_arguments_are_redacted(self):
+        args = {'options': {'password': 'NESTED-PW',
+                            'inner': [{'url': 'https://x.test/r?token=NESTED-TOK'}]}}
+        logged = json.dumps(browser_agent._redact(args))
+        for secret in ('NESTED-PW', 'NESTED-TOK'):
+            self.assertNotIn(secret, logged)
+        self.assertIn('x.test/r', logged)
+
+
 class ResultUrlTests(AgentTestCase):
     """A URL comes back in results as well as going out in arguments:
     browser_navigate, browser_get_text and browser_get_page_info all report

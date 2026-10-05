@@ -440,13 +440,21 @@ def redact_url(url: Any) -> Any:
 
 
 def redact_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """A log-safe copy of a tool's arguments."""
-    return {
-        k: ('***' if k in SENSITIVE_ARGS
-            else redact_url(v) if k in URL_ARGS
-            else v)
-        for k, v in arguments.items()
-    }
+    """A log-safe copy of a tool's arguments, at every depth.
+
+    Top-level keys only used to be looked at, and the agent writes the JSON,
+    so {"options": {"password": ...}} reached both logs whole.
+    """
+    def walk(value):
+        if isinstance(value, dict):
+            return {k: ('***' if k in SENSITIVE_ARGS
+                        else redact_url(v) if k in URL_ARGS
+                        else walk(v))
+                    for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [walk(v) for v in value]
+        return value
+    return walk(arguments)
 
 
 # Accepted values for the two string-valued policy choices. Read through

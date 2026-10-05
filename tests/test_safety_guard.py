@@ -1062,6 +1062,25 @@ class TabFilterUrlTests(unittest.TestCase):
         self.assertIsNotNone(g.check('browser_find_tabs', {'url': 'https://x'}))
 
 
+class NestedRedactionTests(unittest.TestCase):
+    """Redaction looked at top-level keys only. The agent writes the JSON,
+    so {"options": {"password": ...}} or a url inside a list reached
+    audit.jsonl and the server log whole."""
+
+    def test_nested_sensitive_keys_and_urls_are_redacted(self):
+        args = {'selector': '#a',
+                'options': {'password': 'NESTED-PW',
+                            'inner': [{'url': 'https://x.test/r?token=NESTED-TOK'}]},
+                'list': [{'text': 'NESTED-TEXT'}]}
+        logged = json.dumps(safety.redact_arguments(args))
+        for secret in ('NESTED-PW', 'NESTED-TOK', 'NESTED-TEXT'):
+            self.assertNotIn(secret, logged)
+        self.assertIn('x.test/r', logged, 'a nested url is reduced, not lost')
+        self.assertIn('#a', logged)
+        self.assertEqual(args['options']['password'], 'NESTED-PW',
+                         'the caller\'s arguments are not modified')
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""
