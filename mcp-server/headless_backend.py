@@ -562,6 +562,29 @@ class HeadlessBrowser:
                 return False
             raise CredentialProbeFailed(message) from e
 
+    @classmethod
+    def _focused_credential_js(cls) -> str:
+        """Probe for "is the focused element a credential field".
+
+        document.activeElement is the <iframe> itself when focus is inside
+        one, so the probe follows it into the frame's document. A frame it
+        cannot read - cross-origin, which is where an embedded card or login
+        form lives - answers 'opaque', and the caller refuses: nothing can
+        tell what has focus in there.
+        """
+        predicate = cls._credential_js(include_hidden=False)
+        return (
+            "() => {\n"
+            "let el = document.activeElement;\n"
+            "while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {\n"
+            "  let doc = null;\n"
+            "  try { doc = el.contentDocument; } catch (e) {}\n"
+            "  if (!doc) return 'opaque';\n"
+            "  el = doc.activeElement;\n"
+            "}\n"
+            f"return ({predicate})(el);\n"
+            "}")
+
     async def _assert_focused_not_password(self, page, args: Dict[str, Any]):
         """Refuse to type into a focused credential field.
 
@@ -572,15 +595,17 @@ class HeadlessBrowser:
         if args.get('allow_password') is True:
             return
         try:
-            predicate = self._credential_js(include_hidden=False)
-            is_password = await page.evaluate(
-                "() => { const el = document.activeElement; "
-                f"return ({predicate})(el); }}")
+            is_password = await page.evaluate(self._focused_credential_js())
         except Exception as e:
             raise RuntimeError(
                 'Refused: could not determine whether the focused element is a '
                 f'credential field ({e}). Refusing rather than risk typing a '
                 'credential into one.') from e
+        if is_password == 'opaque':
+            raise RuntimeError(
+                'Refused: focus is inside a frame from another site, so '
+                'whether it is a credential field cannot be checked. Name '
+                'the field with "selector" instead.')
         if is_password:
             raise RuntimeError(
                 'Refused: the focused element is a credential field. '

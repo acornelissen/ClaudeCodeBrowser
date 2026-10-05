@@ -2040,6 +2040,69 @@ class GuardDefinitionMirrorTests(unittest.TestCase):
                       scripts[0])
 
 
+# Reads {"script", "active"} and writes what the focused-element probe
+# returns. "active" is an element spec, or {"frame": <spec>} for an iframe
+# whose document has that element focused, or {"frame": "opaque"} for a
+# cross-origin iframe, whose contentDocument a page cannot read.
+_FOCUSED_FRAME_HARNESS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const probe = eval('(' + input.script + ')');
+__ELEMENT_FACTORY__
+function focused(spec) {
+  if (spec && spec.frame !== undefined) {
+    const frame = element({ tag: 'IFRAME' });
+    frame.contentDocument = spec.frame === 'opaque'
+      ? null : { activeElement: focused(spec.frame) };
+    return frame;
+  }
+  return element(spec);
+}
+global.document = { activeElement: focused(input.active) };
+process.stdout.write(JSON.stringify(probe()));
+""".replace('__ELEMENT_FACTORY__', _ELEMENT_FACTORY_JS)
+
+
+@requires_node
+class FocusedFrameTests(unittest.TestCase):
+    """The focused-element guard read document.activeElement, which is the
+    <iframe> itself when focus is inside one. pressKey types for real in
+    headless, so a credential field in an embedded login frame took keys
+    unguarded."""
+
+    def probe(self, active):
+        return _run_node(_FOCUSED_FRAME_HARNESS,
+                         {'script': HeadlessBrowser._focused_credential_js(),
+                          'active': active})
+
+    def test_a_credential_field_inside_a_frame_is_seen(self):
+        password = spec(tag='INPUT', input_type='password')
+        self.assertTrue(self.probe({'frame': password}))
+        self.assertTrue(self.probe({'frame': {'frame': password}}),
+                        'a frame inside a frame')
+
+    def test_an_ordinary_field_inside_a_frame_is_not_refused(self):
+        self.assertFalse(self.probe({'frame': spec(tag='INPUT', input_type='text')}))
+
+    def test_a_frame_the_page_cannot_see_into_is_refused(self):
+        """A cross-origin frame is where an embedded card or login form
+        lives, and nothing can tell what has focus in it."""
+        self.assertEqual(self.probe({'frame': 'opaque'}), 'opaque')
+
+    def test_an_opaque_answer_is_a_refusal(self):
+        class OpaqueFramePage:
+            async def evaluate(self, script):
+                return 'opaque'
+
+        with self.assertRaises(RuntimeError) as ctx:
+            asyncio.run(HeadlessBrowser()._assert_focused_not_password(
+                OpaqueFramePage(), {}))
+        self.assertIn('frame from another site', str(ctx.exception))
+
+    def test_outside_a_frame_nothing_changes(self):
+        self.assertTrue(self.probe(spec(tag='INPUT', input_type='password')))
+        self.assertFalse(self.probe(spec(tag='INPUT', input_type='text')))
+
+
 @requires_node
 class CredentialPredicateParityTests(unittest.TestCase):
     """The extension's predicate and the headless one, over one table.
