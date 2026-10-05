@@ -211,13 +211,19 @@ The install script handles these automatically, but if you are installing manual
    - Select `extension/manifest.json`
 
 4. **Configure Claude Code MCP:**
-   Add to `~/.claude/settings.json`:
+   Claude Code does not read MCP servers from `settings.json`. Add it for
+   every project (stored in `~/.claude.json`):
+   ```bash
+   claude mcp add --scope user claudecodebrowser -- \
+       python3 ~/.claudecodebrowser/mcp-server/stdio_wrapper.py
+   ```
+   Or for one project, in that project's `.mcp.json`:
    ```json
    {
      "mcpServers": {
        "claudecodebrowser": {
          "command": "python3",
-         "args": ["/home/YOUR_USER/.claudecodebrowser/mcp-server/stdio_wrapper.py"]
+         "args": ["${HOME}/.claudecodebrowser/mcp-server/stdio_wrapper.py"]
        }
      }
    }
@@ -258,7 +264,12 @@ extension (step 1 below) and add the printed MCP config to Claude Code.
    ```
 
 3. **Configure Claude Code MCP:**
-   Add to `%USERPROFILE%\.claude\settings.json`:
+   Claude Code does not read MCP servers from `settings.json`. Add it for
+   every project (stored in `%USERPROFILE%\.claude.json`):
+   ```powershell
+   claude mcp add --scope user claudecodebrowser -- python C:/path/to/ClaudeCodeBrowser/mcp-server/stdio_wrapper.py
+   ```
+   Or for one project, in that project's `.mcp.json`:
    ```json
    {
      "mcpServers": {

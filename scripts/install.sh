@@ -252,16 +252,11 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${YELLOW}Claude Code MCP Configuration:${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo "Add this to your Claude Code settings (~/.claude/settings.json):"
+echo "Register the server with Claude Code (all projects; stored in ~/.claude.json):"
 echo ""
-echo '{
-  "mcpServers": {
-    "claudecodebrowser": {
-      "command": "python3",
-      "args": ["'$INSTALL_DIR'/mcp-server/stdio_wrapper.py"]
-    }
-  }
-}'
+echo "  claude mcp add --scope user claudecodebrowser -- python3 $INSTALL_DIR/mcp-server/stdio_wrapper.py"
+echo ""
+echo "Claude Code does not read MCP servers from settings.json."
 echo ""
 
 # Print usage instructions
