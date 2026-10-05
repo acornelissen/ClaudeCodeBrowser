@@ -193,6 +193,14 @@ them is part of releasing, and that is being held for approval.
   action history while printing `null`.
 
 ### Fixed
+- **`browser_type` ignored `id`, `name` and `placeholder`.** In Firefox,
+  `findElement` read `text` as a locator before any of them, so the call
+  searched the page for the text being typed rather than the named field. In
+  headless mode only `selector` was read, so the text went into whatever had
+  focus. All three now find the field they name, in both modes.
+- An `X-API-Key` with a non-ASCII character dropped the connection instead of
+  getting a 403: `compare_digest` raises on a non-ASCII `str`. It failed
+  closed, so nothing was let through.
 - The native host wrote a `.png` for **any** successful response carrying a
   `data` field, so page text and structured results landed on disk as junk
   files and real screenshots were duplicated (`server.py` already saves them).
@@ -413,6 +421,18 @@ against the source it replaced. Several fixtures were found to be hiding the
 bugs they were meant to cover: `attachShadow()` discarded its argument, so
 changing the approval prompt's shadow root from `closed` to `open` — which
 would let the page read it and click its buttons — kept every test green.
+
+**A mutation run found the server's authentication had no real test.** With
+HTTP auth switched off, with the token reduced to a prefix match, and with
+the WebSocket handshake accepting anyone or failing open, the suite stayed
+green: every endpoint test stubbed the check out. The handlers are now driven
+over real sockets. The same run found guards nothing would notice breaking:
+the native host's check that the listener on 8765 is really ours, its promise
+not to log payloads, the approval page (`approve.js`, untested until now), the
+`=== true` approval decision, the second policy pass after a human approves,
+camelCase credential names in `content.js`, and several caps and file modes.
+Each now fails a test when broken, and five tests that grepped the source or
+could not fail for other reasons were rewritten to check behaviour.
 
 ## [1.8.0]
 
