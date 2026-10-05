@@ -9,6 +9,38 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [1.9.4]
+
+### Security
+- **Path parameters no longer reach the logs.** A session id carried in a URL
+  path (`/x;jsessionid=...`) was written to `audit.jsonl` and the server log;
+  the value of every `;name=value` path parameter is now masked there and in
+  the agent client's output.
+- **Card-expiry fields are scrubbed from captured HTML.** The body scrub knew
+  five autocomplete tokens and the field guard eight; `cc-exp`,
+  `cc-exp-month` and `cc-exp-year` were missing. A test now holds the two
+  lists together.
+
+### Changed
+- `browser_safety_status` no longer advises turning script execution off when
+  it already is.
+- `updates.json` lists only the current extension id. Offering the build to
+  the retired id could not work: Firefox refuses an update whose id changes,
+  so those installs downloaded the package and failed every check.
+- `./scripts/install.sh --headless` installs Playwright (pinned) and Chromium,
+  so headless mode works after a normal install.
+- Releases are cut only from a commit CI passed, and tagged on that commit.
+
+### Removed
+- The extension's unused native-host request path (`sendToNativeHost`).
+
+### Docs
+- The README, agent notes and tool descriptions were checked against the code
+  and corrected: logging flags and methods that never existed are gone,
+  console capture is described as what it is (page errors), network scrubbing
+  and its limits are documented, and the MCP setup uses `claude mcp add`
+  rather than `settings.json`, which Claude Code does not read for servers.
+
 ## [1.9.3]
 
 ### Security
