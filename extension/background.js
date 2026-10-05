@@ -10,8 +10,6 @@
 const NATIVE_HOST_NAME = "claudecodebrowser";
 let nativePort = null;
 let isConnected = false;
-let pendingRequests = new Map();
-let requestCounter = 0;
 
 // Reconnection settings
 let reconnectAttempts = 0;
@@ -1238,12 +1236,6 @@ function handleDisconnect(port) {
   isConnected = false;
   nativePort = null;
 
-  // Reject all pending requests with a descriptive error
-  for (const [id, { reject }] of pendingRequests) {
-    reject(new Error("Native host disconnected - reconnecting..."));
-  }
-  pendingRequests.clear();
-
   // Schedule reconnection with exponential backoff
   scheduleReconnect();
 }
@@ -1262,92 +1254,12 @@ function handleNativeMessage(message) {
       ? Object.keys(message.data) : undefined
   });
 
-  if (message.requestId && pendingRequests.has(message.requestId)) {
-    const { resolve, reject } = pendingRequests.get(message.requestId);
-    pendingRequests.delete(message.requestId);
-
-    if (message.error) {
-      reject(new Error(message.error));
-    } else {
-      resolve(message);
-    }
-  } else if (message.action) {
-    // Handle incoming commands from native host
+  // Commands from the server, relayed by the native host. Nothing here
+  // sends the host a request and waits for an answer, so anything without an
+  // action is not for us.
+  if (message.action) {
     handleCommand(message);
   }
-}
-
-function sendToNativeHost(message, retryCount = 0) {
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY = 1000;
-
-  return new Promise((resolve, reject) => {
-    // Try to connect if not connected
-    if (!isConnected || !nativePort) {
-      connectNativeHost();
-
-      // Wait a bit for connection to establish
-      setTimeout(() => {
-        if (!isConnected || !nativePort) {
-          if (retryCount < MAX_RETRIES) {
-            console.log(`[ClaudeCodeBrowser] Not connected, retrying (${retryCount + 1}/${MAX_RETRIES})...`);
-            setTimeout(() => {
-              sendToNativeHost(message, retryCount + 1)
-                .then(resolve)
-                .catch(reject);
-            }, RETRY_DELAY);
-          } else {
-            reject(new Error("Not connected to native host after retries"));
-          }
-          return;
-        }
-
-        // Now connected, send the message
-        doSend();
-      }, 500);
-      return;
-    }
-
-    doSend();
-
-    function doSend() {
-      const requestId = ++requestCounter;
-      message.requestId = requestId;
-      pendingRequests.set(requestId, { resolve, reject });
-
-      // Timeout after 30 seconds
-      const timeoutId = setTimeout(() => {
-        if (pendingRequests.has(requestId)) {
-          pendingRequests.delete(requestId);
-          reject(new Error("Request timeout"));
-        }
-      }, 30000);
-
-      // Store timeout for potential cleanup
-      pendingRequests.get(requestId).timeoutId = timeoutId;
-
-      try {
-        nativePort.postMessage(message);
-      } catch (error) {
-        pendingRequests.delete(requestId);
-        clearTimeout(timeoutId);
-
-        // Connection might have died, try to reconnect and retry
-        if (retryCount < MAX_RETRIES) {
-          console.log(`[ClaudeCodeBrowser] Send failed, reconnecting and retrying...`);
-          isConnected = false;
-          nativePort = null;
-          setTimeout(() => {
-            sendToNativeHost(message, retryCount + 1)
-              .then(resolve)
-              .catch(reject);
-          }, RETRY_DELAY);
-        } else {
-          reject(error);
-        }
-      }
-    }
-  });
 }
 
 // Handle commands from native host
