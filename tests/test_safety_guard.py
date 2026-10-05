@@ -1147,6 +1147,65 @@ class PathParamRedactionTests(unittest.TestCase):
         self.assertNotIn('SESS-AUDIT-3', safety._AUDIT_FILE.read_text())
 
 
+class SupersededDefaultTests(unittest.TestCase):
+    """safety.json is written once, at first run, so a default fixed later
+    never reaches an existing install. \\.gov(/|$) shipped from v1.1.0 and
+    let https://www.irs.gov?x=1, #a and :443/ skip the protected
+    confirmation; installs kept it after the default was fixed."""
+
+    OLD = r'\.gov(/|$)'
+    NEW = r'\.gov([:/?#]|$)'
+
+    def test_the_old_default_is_judged_as_the_new_one(self):
+        g = guard(protected_url_patterns=[self.OLD])
+        for url in ('https://www.irs.gov?x=1', 'https://www.irs.gov#a',
+                    'https://www.irs.gov:443/pay'):
+            with self.subTest(url=url):
+                denial = g.check('browser_click', {'url': url, 'selector': '#a'})
+                self.assertIsNotNone(denial, 'the old default let this through')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
+
+    def test_status_says_what_was_upgraded(self):
+        status = guard(protected_url_patterns=[self.OLD]).status()
+        self.assertEqual(status['pattern_upgrades'], [{
+            'key': 'protected_url_patterns', 'from': self.OLD, 'to': self.NEW}])
+        self.assertEqual(guard().status()['pattern_upgrades'], [])
+
+    def test_compiling_again_keeps_the_upgrade(self):
+        g = guard(protected_url_patterns=[self.OLD])
+        g._compile_patterns()
+        self.assertEqual(len(g.status()['pattern_upgrades']), 1)
+        denial = g.check('browser_click',
+                         {'url': 'https://www.irs.gov?x=1', 'selector': '#a'})
+        self.assertEqual(denial['safety_decision'], 'confirmation_required')
+
+    def test_a_pattern_the_user_wrote_is_left_alone(self):
+        mine = r'\.gov/'
+        g = guard(protected_url_patterns=[mine])
+        self.assertEqual(g.status()['pattern_upgrades'], [])
+        self.assertIn(mine, g.status()['protected_url_patterns'])
+
+    def test_the_config_file_is_not_rewritten(self):
+        """Stricter in memory only: the file is the user's, and an upgrade
+        written back would hide that it was ever weak."""
+        original = safety._CONFIG_FILE.read_text() \
+            if safety._CONFIG_FILE.exists() else None
+        try:
+            safety._CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            safety._CONFIG_FILE.write_text(json.dumps(
+                {'protected_url_patterns': [self.OLD]}))
+            before = safety._CONFIG_FILE.read_text()
+            g = safety.SafetyGuard()
+            self.assertEqual(g.status()['pattern_upgrades'][0]['to'], self.NEW)
+            self.assertEqual(safety._CONFIG_FILE.read_text(), before)
+        finally:
+            if original is None:
+                safety._CONFIG_FILE.unlink()
+            else:
+                safety._CONFIG_FILE.write_text(original)
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""

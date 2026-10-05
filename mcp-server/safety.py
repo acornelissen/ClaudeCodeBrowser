@@ -650,6 +650,19 @@ def resolve_screenshots_dir() -> Path:
     return path
 
 
+# Defaults this project shipped and later had to fix, mapped to the fix.
+# safety.json is written once, at first run, so a default corrected later
+# never reaches an existing install: \.gov(/|$) shipped from v1.1.0 and let
+# https://www.irs.gov?x=1, #a and :443/ skip the protected confirmation long
+# after the default was fixed. Only an exact match is upgraded - a pattern
+# the user wrote is theirs - and only ever to something stricter.
+SUPERSEDED_DEFAULT_PATTERNS = {
+    'protected_url_patterns': {
+        r'\.gov(/|$)': r'\.gov([:/?#]|$)',
+    },
+}
+
+
 def _load_config() -> Dict[str, Any]:
     """Load safety.json, writing defaults on first run. Unknown keys are kept."""
     config = dict(DEFAULT_CONFIG)
@@ -695,13 +708,35 @@ class SafetyGuard:
         # the server with stderr=DEVNULL.
         self._pattern_errors: List[str] = []
 
+        # Old shipped defaults, judged as their fix. In memory only: the
+        # file is the user's, and browser_safety_status names each upgrade
+        # so they can make it there too.
+        # self.config keeps what the file says; only what is compiled
+        # changes, so this gives the same answer however often it runs.
+        self._pattern_upgrades: List[Dict[str, str]] = []
+        effective: Dict[str, List[Any]] = {}
+        for key, fixes in SUPERSEDED_DEFAULT_PATTERNS.items():
+            upgraded = []
+            for pattern in self.config.get(key, []) or []:
+                newer = fixes.get(pattern) if isinstance(pattern, str) else None
+                if newer is not None:
+                    self._pattern_upgrades.append(
+                        {'key': key, 'from': pattern, 'to': newer})
+                    logger.warning(
+                        f"safety.json {key} has {pattern!r}, an old default "
+                        f"that is weaker than intended; using {newer!r}. "
+                        f"Update {_CONFIG_FILE} to match.")
+                    pattern = newer
+                upgraded.append(pattern)
+            effective[key] = upgraded
+
         def record_error(key, pattern, error):
             self._pattern_errors.append(f'{key}: {pattern!r} ({error})')
             logger.error(f"Invalid regex in safety.json {key}: {pattern!r} ({error})")
 
         def compile_list(key):
             patterns = []
-            for pattern in self.config.get(key, []) or []:
+            for pattern in effective.get(key, self.config.get(key, []) or []):
                 try:
                     patterns.append(re.compile(pattern, re.IGNORECASE))
                 except re.error as e:
@@ -878,6 +913,9 @@ class SafetyGuard:
             # for and did not get, so it is part of the status, not just a log
             # line the native host throws away.
             'pattern_errors': list(self._pattern_errors),
+            # Old shipped defaults this guard is applying as their fix; the
+            # file still holds the old pattern until the user changes it.
+            'pattern_upgrades': [dict(u) for u in self._pattern_upgrades],
             'config_file': str(_CONFIG_FILE),
             'audit_log': str(_AUDIT_FILE) if self.config.get('audit_log', True) else None,
         }

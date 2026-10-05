@@ -9,6 +9,18 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Security
+- **Old installs keep an old, weaker `.gov` pattern.** `safety.json` is
+  written once, at first run, so the `\.gov(/|$)` default that shipped from
+  1.1.0 stayed in existing files after it was fixed - and it let
+  `https://www.irs.gov?x=1`, `#a` and `:443/` skip the protected-site
+  confirmation. The guard now recognises superseded defaults exactly and
+  applies the fix in memory, logs a warning, and lists it under
+  `pattern_upgrades` in `browser_safety_status`. The file is not rewritten,
+  and patterns you wrote are never changed.
+
 ## [1.9.4]
 
 ### Security

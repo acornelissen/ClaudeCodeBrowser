@@ -1164,6 +1164,14 @@ check and the audit log (not recommended). The scheme guard still refuses
 `file:`, `javascript:`, `data:` and the rest, and the credential guard, which
 `allow_password_typing` controls, stays on.
 
+`safety.json` is written once, on first run, so it keeps whatever defaults
+were current then. When a default turns out to be weaker than intended and is
+fixed, an existing file still holds the old pattern. The guard recognises
+those old defaults exactly, applies the fix in memory, logs a warning and
+lists it under `pattern_upgrades` in `browser_safety_status`; it does not
+rewrite your file, so update it to match. A pattern you wrote yourself is
+never changed.
+
 ### Credentials and 2FA: what this project deliberately does NOT do
 
 - **No password vault.** ClaudeCodeBrowser never stores credentials, and by
