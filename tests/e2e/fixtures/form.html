@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>e2e form</title></head>
+<body>
+<!-- Submitting is counted and cancelled, so an implicit submission from
+     Enter is observable without navigating away. -->
+<form id="form" onsubmit="window.__submitted = (window.__submitted || 0) + 1; return false">
+  <input id="q" name="q" placeholder="Search"
+         onkeydown="if (event.key === 'Enter') window.__enter = (window.__enter || 0) + 1">
+  <input id="pw" type="password">
+  <input id="mfa" name="mfaCode" type="text">
+  <button type="submit">Go</button>
+</form>
+<iframe id="same" src="/frame.html"></iframe>
+<iframe id="cross"></iframe>
+<script>
+  // The second origin's port is only known at run time, so the test passes
+  // it in the query string.
+  const port = new URLSearchParams(location.search).get('cross');
+  if (port) document.getElementById('cross').src = 'http://127.0.0.1:' + port + '/frame.html';
+</script>
+</body>
+</html>

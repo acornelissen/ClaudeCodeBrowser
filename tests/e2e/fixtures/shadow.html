@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>e2e shadow</title></head>
+<body>
+<my-login></my-login>
+<script>
+  // An OPEN shadow root: document.activeElement stops at <my-login>, so a
+  // guard that judges the host alone misses the password field inside it.
+  customElements.define('my-login', class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: 'open' }).innerHTML = '<input id="inner" type="password">';
+    }
+  });
+</script>
+</body>
+</html>

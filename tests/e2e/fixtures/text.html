@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>e2e text</title></head>
+<body>
+<p>Your code is 482915, do not share it.</p>
+<p>Repeat: enter 482915 to continue.</p>
+<div id="otp-code" contenteditable="true">482915</div>
+<!-- A textarea's value is not part of innerText, so the CVV is also shown as
+     prose: the mask must find it there because the textarea holds it. -->
+<textarea id="cvv">731</textarea>
+<p>Card check digits: 731.</p>
+<p>VISIBLE-MARKER</p>
+<script>window.__state = { csrf: "SCRIPT-SECRET-9" };</script>
+<div style="display:none">HIDDEN-TEXT-7</div>
+<form>
+  <input id="pw-filled" type="password">
+  <input id="pw-empty" type="password">
+</form>
+</body>
+</html>

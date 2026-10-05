@@ -20,6 +20,11 @@ run = [
 description = "Run the Python test suite"
 run = "python3 -m unittest discover -s tests -t . -v"
 
+[tasks.test-e2e]
+description = "Run the headless backend against real Chromium (needs playwright and its chromium)"
+env = { CCB_E2E_REQUIRE = "1" }
+run = "python3 -m unittest tests.e2e.test_headless_chromium -v"
+
 [tasks.test-extension]
 description = "Run the extension test suites"
 run = [
