@@ -15,6 +15,29 @@ Not yet released. Version strings are deliberately still on 1.8.0 — bumping
 them is part of releasing, and that is being held for approval.
 
 ### Security
+- **The agent could switch off credential masking itself.** The server set
+  `allow_password` for six tools and passed it through for the rest, so
+  `browser_get_text` with `allow_password: true` returned credential fields
+  unmasked, and `allowPassword` worked on any tool in Firefox. Every spelling
+  the agent sends is now dropped; only `safety.json` sets it.
+- **`https:///evil.com/` got past anchored patterns.** The browser reads any
+  run of slashes after `https:` as `//`; the guard saw a URL with no host, so
+  `^https?://evil\.com` did not block it and an anchored protected pattern
+  asked for no confirmation. A `url` that is not a string is now refused
+  rather than ignored.
+- **OAuth codes and session ids in redirects reached the agent.** A relative
+  `Location: /cb?code=...`, a hash-route `#/callback?code=...`, a `Refresh`
+  target and a `;jsessionid=` path parameter were all logged whole.
+- **Headless:** Shift+Insert, Control+Insert and Shift+Delete pasted, copied
+  or cut in a credential field; focus inside an iframe skipped the focused
+  credential check (a cross-origin frame is now refused); and a whole-page
+  `getText` masked only the first 50 nested credential fields, silently.
+- **More field names count as credentials:** `mfaCode`, `verificationCode`,
+  `securityCode`, `cc_number`/`ccNumber`, `creditCard`, `pincode` and
+  `cookie`, in all three copies of the pattern. `cookieConsent` and similar
+  are masked too.
+- **Logs:** `url_pattern`, a non-string `url`, and in the agent client
+  `requestedUrl`, `href` and `protectedUrl` were written whole.
 - **The WebSocket handshake now rejects a browser `Origin`.** WebSockets are
   exempt from CORS, so any page you visit could open a connection to the
   loopback port; the API token refused it, but only after the handshake
@@ -193,6 +216,12 @@ them is part of releasing, and that is being held for approval.
   action history while printing `null`.
 
 ### Fixed
+- **Headless `browser_type` ignored `clear`, `press_enter` and `delay`.** It
+  always replaced the field and never pressed Enter. It now appends unless
+  `clear` is set, as Firefox does, and refuses a target that cannot take text.
+- **Typing could outlast the call.** The per-key `delay` had no cap, so a long
+  text kept typing after the server had given up waiting. It is now lowered
+  so the whole text types within about 25s, and `delay: 0` means none.
 - **`browser_type` ignored `id`, `name` and `placeholder`.** In Firefox,
   `findElement` read `text` as a locator before any of them, so the call
   searched the page for the text being typed rather than the named field. In
