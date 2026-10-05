@@ -289,7 +289,8 @@ class HeadlessBrowser:
         '|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)'
         '|mfa[-_]?code|verification[-_]?code|security[-_]?code'
         '|(?:^|[^a-z])cc[-_]?number|credit[-_]?card'
-        '|(?:^|[^a-z])pin[-_]?code|cookie)'
+        '|(?:^|[^a-z])pin[-_]?code|cookie'
+        '|recovery[-_]?codes?|backup[-_]?codes?|(?:^|[^a-z])card[-_]?code)'
     )
 
     # How many nested credential fields a single getText will mask. See

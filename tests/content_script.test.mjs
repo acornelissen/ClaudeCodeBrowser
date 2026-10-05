@@ -1463,6 +1463,9 @@ test('the DOM name guard matches the same credential names as background.js', as
     // All-lowercase legacy forms, a prefixed card field, and plural cookies.
     'mfacode', 'verificationcode', 'securitycode', 'ccnumber', 'creditcard',
     'billingCcNumber', 'payment_cc_number', 'cookies', 'sessionCookie',
+    // Approved 2026-10-05: two-factor recovery codes, and the CVV as cardCode.
+    'recoveryCodes', 'recovery_code', 'backup_codes', 'backupCode', 'cardCode',
+    'card_code', 'creditCardCode',
   ];
   for (const name of credentials) {
     const el = makeElement('input', { id: 'f', name, type: 'text', value: 'hunter2' });
@@ -1479,6 +1482,7 @@ test('the DOM name guard matches the same credential names as background.js', as
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
     'spin', 'spinner', 'pinned',
+    'discardCode', 'backupEmail', 'recoveryEmail',
     // Near the new names, and not credentials.
     'accNumber', 'account_number', 'spincode',
     'className', 'classNames', 'businessName', 'addressName', 'witnessName',

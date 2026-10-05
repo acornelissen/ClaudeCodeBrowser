@@ -824,6 +824,9 @@ test('the credential-name list matches credentials and not ordinary words', () =
     // All-lowercase legacy forms, a prefixed card field, and plural cookies.
     'mfacode', 'verificationcode', 'securitycode', 'ccnumber', 'creditcard',
     'billingCcNumber', 'payment_cc_number', 'cookies', 'sessionCookie',
+    // Approved 2026-10-05: two-factor recovery codes, and the CVV as cardCode.
+    'recoveryCodes', 'recovery_code', 'backup_codes', 'backupCode', 'cardCode',
+    'card_code', 'creditCardCode',
   ];
   for (const name of credentials) {
     assert.ok(matches(name), `${name} must be treated as a credential`);
@@ -834,6 +837,7 @@ test('the credential-name list matches credentials and not ordinary words', () =
     'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
     'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
     'spin', 'spinner', 'pinned',
+    'discardCode', 'backupEmail', 'recoveryEmail',
     // Near the new names, and not credentials.
     'accNumber', 'account_number', 'spincode',
     // cla-SSN-ame: the single most common key in a React-shaped payload.

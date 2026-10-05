@@ -289,7 +289,7 @@ function redactHeaderList(headers) {
 //    anchoring it lost `SSNNumber` and `userssn`, which have no boundary.
 //  - `totp`, `hotp` and `sessid` have no boundary at all and are listed.
 const SECRET_KEY_RE =
-  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)|mfa[-_]?code|verification[-_]?code|security[-_]?code|(?:^|[^a-z])cc[-_]?number|credit[-_]?card|(?:^|[^a-z])pin[-_]?code|cookie)/i;
+  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)|mfa[-_]?code|verification[-_]?code|security[-_]?code|(?:^|[^a-z])cc[-_]?number|credit[-_]?card|(?:^|[^a-z])pin[-_]?code|cookie|recovery[-_]?codes?|backup[-_]?codes?|(?:^|[^a-z])card[-_]?code)/i;
 
 // A credential-shaped NAME, from a JSON key, a form field name or an id.
 //

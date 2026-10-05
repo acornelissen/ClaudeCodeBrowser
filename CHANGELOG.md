@@ -25,6 +25,9 @@ are his releases. 1.5.0 onwards are from the fork at
 ### Fixed
 - `data-type="password"` on an ordinary field no longer gets its value masked
   in captured HTML.
+- **More field names count as credentials:** `recoveryCodes`/`backup_codes`
+  (two-factor recovery codes) and `cardCode` (the CVV), in all three copies of
+  the pattern.
 
 ## [1.9.2]
 
