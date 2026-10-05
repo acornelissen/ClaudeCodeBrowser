@@ -562,14 +562,7 @@ class HttpAuthTests(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status, resp.headers, resp.read()
         except urllib.error.HTTPError as e:
-            try:
-                body = e.read()
-            except ConnectionError:
-                # A refused POST is answered before its body is read, so the
-                # close can arrive as a reset after the status line. The
-                # status is what these tests are about.
-                body = b''
-            return e.code, e.headers, body
+            return e.code, e.headers, e.read()
 
     def test_the_real_key_is_accepted(self):
         """Without this the refusals below could pass against a server that
@@ -625,6 +618,22 @@ class HttpAuthTests(unittest.TestCase):
                     self.assertEqual(status, 403)
         self.assertEqual(executed, [])
         self.assertEqual(forged, [])
+
+    def test_a_refused_post_still_delivers_its_error_body(self):
+        """The 403 was sent before the request body was read, so closing
+        with those bytes unread reset the connection - about four times in
+        ten the client lost the error body, and a caller with a stale token
+        saw "connection reset" rather than "Unauthorized"."""
+        body = b'{"tool": "browser_navigate", "arguments": {}}'
+        for attempt in range(50):
+            req = urllib.request.Request(self.base + '/mcp/call',
+                                         method='POST', data=body)
+            req.add_header('X-API-Key', 'wrong')
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(ctx.exception.code, 403)
+            self.assertIn(b'Unauthorized', ctx.exception.read(),
+                          f'attempt {attempt}')
 
     def test_a_cors_preflight_is_refused(self):
         """With a preflight allowed, any web page the user visits could try

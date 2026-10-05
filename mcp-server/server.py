@@ -167,6 +167,8 @@ WS_PORT = int(os.environ.get('CLAUDE_BROWSER_WS_PORT', '8766'))
 # Cap on a single request body. Nothing legitimate approaches this; without it
 # a bad Content-Length made the handler read unboundedly.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+# How much of an unauthenticated POST body is read so its 403 arrives cleanly.
+_REFUSED_BODY_DRAIN_BYTES = 64 * 1024
 
 # How long a queued browser command stays executable. Longer than the longest
 # human-in-the-loop wait (solveCaptcha, 200s) so a legitimately slow approval
@@ -1225,6 +1227,16 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         """Handle POST requests."""
         if not self._check_auth():
+            # Read a small body before refusing: closing with it unread sends
+            # a reset, and the client loses the 403's body - a stale token
+            # then looked like a connection fault. A large one is left unread
+            # rather than accepted from an unauthenticated caller.
+            try:
+                length = int(self.headers.get('Content-Length', 0) or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if 0 < length <= _REFUSED_BODY_DRAIN_BYTES:
+                self.rfile.read(length)
             self.send_json_response({'error': 'Unauthorized'}, 403)
             return
 
