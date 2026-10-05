@@ -376,7 +376,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_type",
-        description="Type text into an input field or editable element. Can target by selector, placeholder, name, or focus current element.",
+        description="Type text into an input field or editable element. Can target by selector, placeholder, name, or focus current element. Refused on a credential field (password, one-time code, card field, or a field whose name or id looks like a credential) unless allow_password_typing is set in ~/.claudecodebrowser/safety.json; an allow_password argument is ignored.",
         input_schema={
             "type": "object",
             "required": ["text"],
@@ -389,7 +389,7 @@ MCP_TOOLS: List[MCPTool] = [
                 "tab_id": {"type": "integer", "description": "Optional tab ID."},
                 "clear": {"type": "boolean", "description": "Clear existing content first.", "default": False},
                 "press_enter": {"type": "boolean", "description": "Press Enter after typing.", "default": False},
-                "delay": {"type": "integer", "description": "Delay between keystrokes in ms. Attended mode defaults to 50 and headless to none; either way it is lowered so the whole text is typed within about 25 seconds."}
+                "delay": {"type": "integer", "description": "Delay between keystrokes in ms. Attended mode defaults to 50 and headless to none; it is lowered so the whole text is typed within about 25 seconds in attended mode and 30 in headless."}
             }
         }
     ),
@@ -475,7 +475,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_execute_script",
-        description="Execute JavaScript code in the browser context.",
+        description="Execute JavaScript code in the browser context. The credential guard does not apply: a script can read any field, including a password. Refused when allow_script_execution is false, and on a protected URL while deny_scripts_on_protected_urls is on.",
         input_schema={
             "type": "object",
             "required": ["script"],
@@ -580,7 +580,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_value",
-        description="Get the value of an input element.",
+        description="Get the value of an input element. Credential and hidden fields read back as '***' with masked: true.",
         input_schema={
             "type": "object",
             "required": ["selector"],
@@ -762,7 +762,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Console and Network Logging Tools
     MCPTool(
         name="browser_start_logging",
-        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them. Network capture uses webRequest, so it sees fetch, XHR, WebSocket handshakes and beacons; console capture is per-page. Capture is off until you call this, and stops when you call browser_stop_logging or when the tab navigates to a different origin (so start it on the site you want to watch, not on about:blank); browser_get_network_logs then reports loggingEnabled: false.",
+        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them. Network capture uses webRequest, so it sees fetch, XHR, WebSocket handshakes and beacons; console capture sees page errors and the extension's own output, not the page's console.log (see browser_get_console_logs). Refused on a private-browsing tab. Not implemented in headless mode. Capture is off until you call this, and stops when you call browser_stop_logging or when the tab navigates to a different origin (so start it on the site you want to watch, not on about:blank); browser_get_network_logs then reports loggingEnabled: false.",
         input_schema={
             "type": "object",
             "properties": {
@@ -798,7 +798,7 @@ MCP_TOOLS: List[MCPTool] = [
     ),
     MCPTool(
         name="browser_get_network_logs",
-        description="Retrieve captured network requests and responses. Perfect for debugging API calls, seeing request/response data, and monitoring AI chat communications. Captured via webRequest, so fetch and XHR are both covered. Credential-bearing headers (Authorization, Cookie, Set-Cookie, X-API-Key and similar) are reported as '***'. Response bodies are captured for textual content types only, up to 5000 characters.",
+        description="Retrieve captured network requests and responses. Perfect for debugging API calls, seeing request/response data, and monitoring AI chat communications. Captured via webRequest, so fetch and XHR are both covered. Credential-bearing headers (Authorization, Cookie, Set-Cookie, X-API-Key and similar) are reported as '***'. Credential-shaped URL parameters (also in Location, Refresh and Referer) and credential fields in bodies are scrubbed too, as best effort: free page text and contenteditable content in a captured HTML body are not. Response bodies are captured for textual content types only, up to 5000 characters; request bodies up to 1000.",
         input_schema={
             "type": "object",
             "properties": {
@@ -928,7 +928,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Human approval, workflows, and page auditing
     MCPTool(
         name="browser_request_approval",
-        description="Ask the human at the browser to approve or deny an action. Shows an Approve/Deny banner on the current page plus an OS notification, and waits for their decision. Use before doing anything the user might want to veto. Unavailable in headless mode (no human present).",
+        description="Ask the human at the browser to approve or deny an action. Opens an Approve/Deny window from the extension, which the page cannot read or click, plus an OS notification, and waits for their decision. If no window can be opened it falls back to an in-page banner and marks the result degraded: true. Use before doing anything the user might want to veto. Unavailable in headless mode (no human present).",
         input_schema={
             "type": "object",
             "required": ["message"],
@@ -1009,7 +1009,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Safety
     MCPTool(
         name="browser_safety_status",
-        description="Show the active safety guard policy and which mode you are in (attended Firefox or headless Playwright), including which tools are headless-only. Call this first if a tool returns 'Unknown action'. Policy: read-only mode, script toggle, protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
+        description="Show the active safety guard policy and which mode you are in (attended Firefox or headless Playwright), including which tools are headless-only. Call this first if a tool returns 'Unknown action'. Policy: read-only mode, script toggle, credential guard state (enforced, enforced_except_scripts or advisory), protected/blocked/allowed URL patterns, rate-limit state, and audit log location. Configured in ~/.claudecodebrowser/safety.json.",
         input_schema={
             "type": "object",
             "properties": {}
