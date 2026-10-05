@@ -995,6 +995,45 @@ class CredentialGuardWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(order.index('eval_on_selector'), order.index('fill'))
 
 
+class TypeLocatorTests(unittest.IsolatedAsyncioTestCase):
+    """browser_type offers id, name and placeholder as well as selector. The
+    headless handler read only selector, so any of the others typed into
+    whatever had focus instead of the field the caller named."""
+
+    LOCATORS = {
+        'id': ({'id': 'q'}, '[id="q"]'),
+        'name': ({'name': 'q'}, '[name="q"]'),
+        'placeholder': ({'placeholder': 'Search'}, '[placeholder="Search"]'),
+    }
+
+    async def test_each_locator_fills_the_named_field(self):
+        for label, (locator, selector) in self.LOCATORS.items():
+            with self.subTest(locator=label):
+                browser, page = make_browser(elements={selector: Element()})
+                result = await browser._dispatch(
+                    'type', None, dict(locator, text='hello'))
+                self.assertTrue(result['success'], result)
+                self.assertEqual(calls_named(page, 'fill'),
+                                 [('fill', selector, 'hello')])
+                self.assertEqual(calls_named(page, 'keyboard.type'), [])
+
+    async def test_a_credential_field_found_by_name_is_refused(self):
+        browser, page = make_browser(
+            elements={'[name="pw"]': Element(input_type='password')})
+        with self.assertRaises(RuntimeError) as ctx:
+            await browser._dispatch('type', None, {'name': 'pw', 'text': 'x'})
+        self.assertIn('Refused', str(ctx.exception))
+        self.assertEqual(calls_named(page, 'fill'), [])
+        self.assertEqual(calls_named(page, 'keyboard.type'), [])
+
+    async def test_a_quote_in_the_locator_stays_inside_the_string(self):
+        browser, page = make_browser(
+            elements={'[name="a\\"]b"]': Element()})
+        await browser._dispatch('type', None, {'name': 'a"]b', 'text': 'x'})
+        self.assertEqual(calls_named(page, 'fill'),
+                         [('fill', '[name="a\\"]b"]', 'x')])
+
+
 class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
     """Typing with no selector goes to document.activeElement. This is the
     path that used to skip the guard entirely."""

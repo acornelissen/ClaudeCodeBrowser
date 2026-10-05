@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -106,6 +107,30 @@ def parse_number(value: Any, fallback: float) -> float:
 def parse_int(value: Any, fallback: int) -> int:
     """parse_number for arguments that must be whole (lengths, limits, ms)."""
     return int(parse_number(value, fallback))
+
+
+def css_string(value: Any) -> str:
+    """Quote a value for a CSS attribute selector, as cssString in content.js
+    does, so a quote in the value cannot close the string and add a
+    selector of its own."""
+    escaped = re.sub(r'[\\"]', lambda m: '\\' + m.group(0), str(value))
+    # A raw newline is not allowed inside a CSS string.
+    escaped = re.sub(r'[\n\r\f]', lambda m: f'\\{ord(m.group(0)):x} ', escaped)
+    return f'"{escaped}"'
+
+
+def type_target(args: Dict[str, Any]) -> Optional[str]:
+    """The selector browser_type names, in content.js's findElement order.
+
+    Only selector used to be read here, so id, name and placeholder - all in
+    the browser_type schema - fell through to typing into whatever had focus.
+    """
+    if args.get('selector'):
+        return args['selector']
+    for key in ('id', 'name', 'placeholder'):
+        if args.get(key):
+            return f'[{key}={css_string(args[key])}]'
+    return None
 
 
 class CredentialProbeFailed(RuntimeError):
@@ -698,7 +723,7 @@ class HeadlessBrowser:
             return {'success': True}
 
         elif action == 'type':
-            selector = args.get('selector')
+            selector = type_target(args)
             text = args.get('text', '')
             if selector:
                 await self._assert_not_password(page, selector, args)
