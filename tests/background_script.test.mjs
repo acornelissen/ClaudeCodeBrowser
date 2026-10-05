@@ -1478,6 +1478,30 @@ test('closing the window without answering is a denial', async () => {
   assert.equal(result.closedWithoutAnswering, true);
 });
 
+test('an approval decision is approved only by boolean true', async () => {
+  // The decision is a fail-closed switch like allow_password: only true opens
+  // it. A string "false" or any other truthy value must read as a denial.
+  // true is in the list so the check cannot pass by denying everything.
+  for (const [value, expected] of [
+    [true, true],
+    ['false', false], ['true', false], ['no', false],
+    [1, false], [{}, false], [[], false], [false, false],
+  ]) {
+    const ctx = loadBackground();
+    const pending = ctx.command('requestApproval', { message: 'x', timeout: 5000 }, 7);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const id = decodeURIComponent(
+      new URL(ctx.createdWindows[0].url).searchParams.get('id'));
+
+    await ctx.deliver({ target: 'approval', action: 'decide', requestId: id,
+                        approved: value }, ctx.extensionSender);
+
+    const result = await pending;
+    assert.equal(result.approved, expected,
+      `approved: ${JSON.stringify(value)} must decide ${expected}`);
+  }
+});
+
 test('with no window manager it falls back and says the prompt is degraded', async () => {
   const ctx = loadBackground();
   ctx.failWindowCreate();
