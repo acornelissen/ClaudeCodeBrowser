@@ -450,7 +450,11 @@ The server runs on:
 
 ### Headless Mode
 
-Run without any visible browser — ideal for CI, servers, and unattended tasks:
+Run without any visible browser — ideal for CI, servers, and unattended tasks.
+The installer can set it up: `./scripts/install.sh --headless` installs
+Playwright (pinned to the tested version) and Chromium into the Python the
+server runs under, and prints the two settings to add to the server's `env`.
+By hand:
 
 ```bash
 python3 -m pip install playwright
