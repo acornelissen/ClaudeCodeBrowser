@@ -947,6 +947,30 @@ test('a not-found error names the locator, never the text being typed', async ()
                'the locator must still be named, or the error is useless');
 });
 
+test('type finds its field by id, name or placeholder, not by the text being typed', async () => {
+  // findElement treats `text` as a locator, and checks it before id, name
+  // and placeholder. For type, `text` is the value to enter, so every one of
+  // the locators the browser_type schema offers was ignored: the lookup
+  // searched the page for an element containing the typed text instead.
+  const locators = {
+    id: ['#q', { id: 'q' }],
+    name: ['[name="q"]', { name: 'q' }],
+    placeholder: ['[placeholder="Search"]', { placeholder: 'Search' }],
+  };
+  for (const [label, [selector, locator]] of Object.entries(locators)) {
+    const field = makeElement('input', { id: 'q', name: 'q', value: '' });
+    const ctx = loadContentScript({ [selector]: field });
+
+    const result = await ctx.send({ action: 'type', ...locator,
+                                    text: 'hello', instant: true });
+
+    assert.notEqual(result.success, false, `${label}: ${result.error}`);
+    assert.equal(field.value, 'hello', `${label}: nothing was typed`);
+    assert.deepEqual([...ctx.xpathAsked], [],
+      `${label}: the typed text was used to look the field up`);
+  }
+});
+
 test('set_value reports a reformatted value as set, not as a failure', async () => {
   // The read-back happened AFTER the input/change events, and every input
   // mask on the web reformats inside the input listener - as does the browser

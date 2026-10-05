@@ -912,7 +912,10 @@
 
   // Type functionality
   async function performType(options) {
-    let element = findElement(options);
+    // `text` is the value to type here, not a locator. findElement checks it
+    // before id, name and placeholder, so passing it through ignored them and
+    // searched the page for the typed text instead.
+    let element = findElement({ ...options, text: undefined });
 
     if (!element && !parseFlag(options.focusFirst, true)) {
       // Type into currently focused element
