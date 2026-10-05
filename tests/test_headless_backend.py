@@ -2050,10 +2050,17 @@ const probe = eval('(' + input.script + ')');
 __ELEMENT_FACTORY__
 function focused(spec) {
   if (spec && spec.frame !== undefined) {
-    const frame = element({ tag: 'IFRAME' });
+    const frame = element({ tag: spec.frameTag || 'IFRAME' });
     frame.contentDocument = spec.frame === 'opaque'
       ? null : { activeElement: focused(spec.frame) };
     return frame;
+  }
+  if (spec && spec.shadow !== undefined) {
+    // A custom element host with nothing credential-shaped about it; what
+    // has focus is inside its shadow root.
+    const host = element({ tag: 'MY-LOGIN' });
+    host.shadowRoot = { activeElement: focused(spec.shadow) };
+    return host;
   }
   return element(spec);
 }
@@ -2097,6 +2104,27 @@ class FocusedFrameTests(unittest.TestCase):
             asyncio.run(HeadlessBrowser()._assert_focused_not_password(
                 OpaqueFramePage(), {}))
         self.assertIn('frame from another site', str(ctx.exception))
+
+    def test_a_credential_field_inside_a_shadow_root_is_seen(self):
+        """document.activeElement stops at the shadow host. A <my-login>
+        wrapping <input type=password> was judged by the host alone, while
+        the typing step follows the shadow root to the input and types
+        there."""
+        password = spec(tag='INPUT', input_type='password')
+        self.assertTrue(self.probe({'shadow': password}))
+        self.assertTrue(self.probe({'shadow': {'frame': password}}),
+                        'a frame inside a shadow root')
+        self.assertTrue(self.probe({'frame': {'shadow': password}}),
+                        'a shadow root inside a frame')
+        self.assertFalse(self.probe({'shadow': spec(tag='INPUT',
+                                                    input_type='text')}))
+
+    def test_a_frameset_frame_is_followed_too(self):
+        password = spec(tag='INPUT', input_type='password')
+        self.assertTrue(self.probe({'frame': password, 'frameTag': 'FRAME'}))
+
+    def test_a_frame_with_nothing_focused_is_not_a_credential(self):
+        self.assertFalse(self.probe({'frame': None}))
 
     def test_outside_a_frame_nothing_changes(self):
         self.assertTrue(self.probe(spec(tag='INPUT', input_type='password')))

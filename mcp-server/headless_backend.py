@@ -569,21 +569,31 @@ class HeadlessBrowser:
     def _focused_credential_js(cls) -> str:
         """Probe for "is the focused element a credential field".
 
-        document.activeElement is the <iframe> itself when focus is inside
-        one, so the probe follows it into the frame's document. A frame it
-        cannot read - cross-origin, which is where an embedded card or login
-        form lives - answers 'opaque', and the caller refuses: nothing can
-        tell what has focus in there.
+        document.activeElement stops at a boundary: it is the <iframe>
+        itself when focus is inside one, and the shadow host when focus is
+        inside a web component. The probe follows both, in any nesting
+        order, the way the keys do: a <my-login> wrapping <input
+        type=password> was judged by the host alone, and _prepare_typing_js,
+        which does follow the shadow root, then typed into the password
+        field. A frame it cannot read - cross-origin, which is where an
+        embedded card or login form lives - answers 'opaque', and the caller
+        refuses: nothing can tell what has focus in there.
         """
         predicate = cls._credential_js(include_hidden=False)
         return (
             "() => {\n"
             "let el = document.activeElement;\n"
-            "while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {\n"
-            "  let doc = null;\n"
-            "  try { doc = el.contentDocument; } catch (e) {}\n"
-            "  if (!doc) return 'opaque';\n"
-            "  el = doc.activeElement;\n"
+            "for (;;) {\n"
+            "  if (el && el.shadowRoot && el.shadowRoot.activeElement) {\n"
+            "    el = el.shadowRoot.activeElement;\n"
+            "  } else if (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {\n"
+            "    let doc = null;\n"
+            "    try { doc = el.contentDocument; } catch (e) {}\n"
+            "    if (!doc) return 'opaque';\n"
+            "    el = doc.activeElement;\n"
+            "  } else {\n"
+            "    break;\n"
+            "  }\n"
             "}\n"
             f"return ({predicate})(el);\n"
             "}")
