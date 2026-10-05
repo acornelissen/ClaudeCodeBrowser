@@ -667,11 +667,28 @@ class FramingTests(unittest.TestCase):
             host.read_message(io.BytesIO(framed(b'{"action": "ping"}')[:-5]))
 
     def test_an_oversized_length_prefix_is_refused_before_reading(self):
-        """A corrupt prefix claiming gigabytes must not be allocated."""
-        huge = struct.pack(host.NATIVE_LENGTH_FORMAT,
-                           host.MAX_INCOMING_MESSAGE_BYTES + 1)
+        """A corrupt prefix claiming gigabytes must not be allocated.
+
+        Asserted through what was asked of the stream. Expecting FramingError
+        alone could not fail: with only the prefix to read, a short body
+        raises FramingError too, so dropping the size bound kept it green.
+        """
+        class RecordingStream(io.BytesIO):
+            def __init__(self, data):
+                super().__init__(data)
+                self.requested = []
+
+            def read(self, count=-1):
+                self.requested.append(count)
+                return super().read(count)
+
+        stream = RecordingStream(struct.pack(
+            host.NATIVE_LENGTH_FORMAT, host.MAX_INCOMING_MESSAGE_BYTES + 1))
         with self.assertRaises(host.FramingError):
-            host.read_message(io.BytesIO(huge))
+            host.read_message(stream)
+        self.assertEqual(stream.requested, [4],
+                         'only the length prefix may be read before the '
+                         'claimed size is checked')
 
     def test_a_two_megabyte_screenshot_frame_is_accepted(self):
         """Inbound is not capped at Firefox's 1 MB outbound limit: one
