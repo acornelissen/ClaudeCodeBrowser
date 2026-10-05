@@ -157,7 +157,7 @@ def handle_initialize(msg):
             },
             "serverInfo": {
                 "name": "claudecodebrowser",
-                "version": "1.0.0"
+                "version": "1.9.4"
             }
         }
     }

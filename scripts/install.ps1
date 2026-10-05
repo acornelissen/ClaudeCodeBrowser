@@ -59,7 +59,7 @@ foreach ($sub in @("native-host", "mcp-server", "agent", "screenshots", "logs"))
 }
 
 Copy-Item (Join-Path $RepoRoot "native-host\claudecodebrowser_host.py") (Join-Path $InstallDir "native-host\")
-foreach ($f in @("server.py", "safety.py", "headless_backend.py", "stdio_wrapper.py", "mcp_config.json")) {
+foreach ($f in @("server.py", "safety.py", "headless_backend.py", "stdio_wrapper.py")) {
     Copy-Item (Join-Path $RepoRoot "mcp-server\$f") (Join-Path $InstallDir "mcp-server\")
 }
 Copy-Item (Join-Path $RepoRoot "agent\browser_agent.py") (Join-Path $InstallDir "agent\")

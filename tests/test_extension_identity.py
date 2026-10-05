@@ -179,6 +179,27 @@ class PackagingGuardTests(unittest.TestCase):
                       "-x '*/.*' only covers nested dotfiles, so a stray "
                       "extension/.env shipped")
 
+    def test_every_version_string_agrees(self):
+        """A release bumps the version in several files by hand, and the
+        MCP wrapper's serverInfo had been left at 1.0.0 since it was
+        written. The manifest is the version Firefox installs; everything
+        else that names a version has to match it."""
+        version = json.loads(
+            (ROOT / 'extension' / 'manifest.json').read_text())['version']
+        found = {
+            'README badge': re.findall(r'badge/version-([\d.]+)-',
+                                       (ROOT / 'README.md').read_text()),
+            'server.py': re.findall(r"'version': '([\d.]+)'|Server v([\d.]+)",
+                                    (ROOT / 'mcp-server' / 'server.py').read_text()),
+            'stdio_wrapper.py': re.findall(
+                r'"version": "([\d.]+)"',
+                (ROOT / 'mcp-server' / 'stdio_wrapper.py').read_text()),
+        }
+        for where, matches in found.items():
+            values = {v for m in matches for v in (m if isinstance(m, tuple) else (m,)) if v}
+            with self.subTest(where=where):
+                self.assertEqual(values, {version})
+
     def test_the_update_manifest_names_only_the_current_id(self):
         """Firefox refuses an update whose id differs from the installed one,
         so an entry for a retired id rescued nobody: those installs

@@ -94,7 +94,6 @@ cp "$SCRIPT_DIR/mcp-server/server.py" "$INSTALL_DIR/mcp-server/"
 cp "$SCRIPT_DIR/mcp-server/safety.py" "$INSTALL_DIR/mcp-server/"
 cp "$SCRIPT_DIR/mcp-server/headless_backend.py" "$INSTALL_DIR/mcp-server/"
 cp "$SCRIPT_DIR/mcp-server/stdio_wrapper.py" "$INSTALL_DIR/mcp-server/"
-cp "$SCRIPT_DIR/mcp-server/mcp_config.json" "$INSTALL_DIR/mcp-server/"
 chmod +x "$INSTALL_DIR/mcp-server/server.py"
 echo -e "${GREEN}✓ MCP server installed${NC}"
 
@@ -244,7 +243,7 @@ echo "    mise install                              # gets web-ext"
 echo "    cp mise.local.toml.example mise.local.toml && \$EDITOR mise.local.toml"
 echo "    mise run sign                             # writes a signed .xpi to dist/"
 echo "  Then open dist/*.xpi in Firefox (about:addons > gear >"
-echo "  'Install Add-on From File'). See 'Signing' in the README."
+echo "  'Install Add-on From File'). scripts/package-extension.sh explains signing."
 echo ""
 
 # Print Claude Code MCP configuration
