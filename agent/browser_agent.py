@@ -49,7 +49,10 @@ _SENSITIVE_ARGS = {'text', 'script', 'value', 'password', 'steps',
 # Also matched as result keys: browser_navigate answers with the url it was
 # asked for under `requestedUrl`, so the token the argument log just reduced
 # came straight back whole in the logged result.
-_URL_ARGS = {'url', 'requestedUrl'}
+#
+# href and protectedUrl are results only: get_elements lists each link's
+# href, and a protected-site denial names the page it refused.
+_URL_ARGS = {'url', 'requestedUrl', 'href', 'protectedUrl'}
 
 _LOOPBACK_HOSTS = {'127.0.0.1', 'localhost', '::1', '[::1]'}
 
@@ -90,8 +93,12 @@ def _reduce_url(value):
     not http(s) is a payload rather than a location, so only its scheme name
     is kept.
     """
-    if not isinstance(value, str) or not value:
+    if value is None or value == '':
         return value
+    if not isinstance(value, str):
+        # A URL key holding a dict or a list is unexpected, so it is masked
+        # rather than passed through unexamined.
+        return '***'
     try:
         parts = urllib.parse.urlsplit(value)
     except ValueError:

@@ -696,6 +696,24 @@ class ResultUrlTests(AgentTestCase):
         safe = browser_agent._redact_result({'url': self.RAW}, ())
         self.assert_reduced(json.dumps(safe))
 
+    def test_other_url_shaped_result_keys_are_reduced(self):
+        """get_elements lists each link's href, and a protected-site denial
+        names the page as protectedUrl. A link can carry a token as easily
+        as the page url can."""
+        result = {'elements': [{'tag': 'a', 'href': self.RAW}],
+                  'protectedUrl': self.RAW}
+        self.assert_reduced(
+            json.dumps(browser_agent._redact_result(result, ())))
+
+    def test_a_url_key_holding_something_else_is_not_kept_raw(self):
+        """_reduce_url passed non-strings through untouched, so a url key
+        holding a dict or a list was neither reduced nor scrubbed."""
+        for value in ({'href': self.RAW}, [self.RAW]):
+            with self.subTest(shape=type(value).__name__):
+                safe = browser_agent._redact_result({'url': value}, ())
+                for secret in ('S3CRET', 'EYJ'):
+                    self.assertNotIn(secret, json.dumps(safe))
+
     def test_a_url_nested_in_a_result_is_reduced(self):
         # One tab under a key, and a list of tabs: the two shapes the
         # extension uses, and the two branches of _scrub's recursion.
