@@ -1083,11 +1083,25 @@ test('a credential whose text starts with another is fully masked', async () => 
 
   const result = await ctx.send({ action: 'getText' });
 
-  assert.ok(!/4839/.test(result.text),
-            `a fragment of a credential survived: ${result.text}`);
+  // Exact, not "no 4839 left": without the longest-first sort the output is
+  // "codes *** and ***1 ok", which contains no "4839" at all and still
+  // counts two fields - so a looser check passed with the bug back in.
+  assert.equal(result.text, 'codes *** and *** ok');
   assert.equal(result.maskedFields, 2);
-  assert.ok(result.text.includes('codes') && result.text.includes('ok'),
-            'the surrounding page stays readable');
+});
+
+test('a three-character credential is masked in whole-page text', async () => {
+  // A CVV is three digits, so three is the shortest secret worth scrubbing
+  // page-wide. The cut-off is ">= 3"; one off and every CVV on the page
+  // comes back in clear.
+  const ta = makeElement('textarea', { id: 'cvv', value: '123' });
+  const ctx = loadContentScript({ 'textarea': [ta] });
+  ctx.document.body.innerText = 'card cvv 123 ok';
+
+  const result = await ctx.send({ action: 'getText' });
+
+  assert.equal(result.text, 'card cvv *** ok');
+  assert.equal(result.maskedFields, 1);
 });
 
 test('whole-page get_text leaves ordinary contenteditable text alone', async () => {
