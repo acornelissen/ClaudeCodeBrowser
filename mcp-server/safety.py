@@ -842,6 +842,9 @@ class SafetyGuard:
                 if self.config.get('allow_script_execution', True)
                 else 'enforced'),
             'credential_guard_note': (
+                'Script execution is disabled, so no tool can read a '
+                'credential field around the guard.'
+                if not self.config.get('allow_script_execution', True) else
                 'browser_execute_script can read any field, including password '
                 'fields, so the credential guard constrains the dedicated tools '
                 'but not arbitrary JavaScript. Set allow_script_execution: false '

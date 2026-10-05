@@ -718,6 +718,17 @@ class ScriptsOnProtectedSitesTests(unittest.TestCase):
                          deny_scripts_on_protected_urls=False).status()
         self.assertEqual(advisory['credential_guard'], 'advisory')
 
+    def test_the_note_matches_the_state_it_describes(self):
+        """With scripts off the note still said "Set allow_script_execution:
+        false to close that" - advice to do what was already done."""
+        enforced = guard(allow_script_execution=False).status()
+        self.assertNotIn('Set allow_script_execution: false',
+                         enforced['credential_guard_note'])
+        self.assertIn('disabled', enforced['credential_guard_note'])
+        partial = guard(allow_script_execution=True).status()
+        self.assertIn('allow_script_execution: false',
+                      partial['credential_guard_note'])
+
 
 class PolicyChoiceTests(unittest.TestCase):
     """protected_approval and unlisted_domains were compared with ==, so
