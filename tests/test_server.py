@@ -246,17 +246,24 @@ class ScreenshotFilenameSharingTests(unittest.TestCase):
         self.assertIs(headless_backend.screenshot_filename,
                       safety.screenshot_filename)
 
-    def test_neither_path_spells_the_rules_out_again(self):
-        """A second spelling is how the two drifted; this fails if one comes
-        back."""
-        import inspect
-        for name, source in (
-            ('server._save_screenshot',
-             inspect.getsource(server.MCPHTTPHandler._save_screenshot)),
-        ):
-            with self.subTest(where=name):
-                self.assertNotIn("with_suffix('.png')", source,
-                                 f'{name} must call screenshot_filename')
+    def test_the_attended_path_writes_under_the_shared_name(self):
+        """A second spelling is how the two drifted. This used to grep
+        _save_screenshot for with_suffix('.png'), which any other spelling of
+        the rule passed; check the file that is actually written instead."""
+        png = base64.b64encode(b'\x89PNG\r\n\x1a\x0a').decode()
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        stem = f'ccb-share-{os.getpid()}-{time.time_ns()}'
+        for requested in (f'{stem}.jpg', f'../{stem}', f'{stem}.PNG'):
+            with self.subTest(requested=requested):
+                out = handler._save_screenshot(
+                    {'success': True, 'data': png, 'tab': {'id': 1}},
+                    {'filename': requested})
+                written = Path(out['filepath'])
+                self.addCleanup(written.unlink, missing_ok=True)
+                self.assertEqual(written.parent, server.SCREENSHOTS_DIR)
+                self.assertEqual(
+                    written.name,
+                    safety.screenshot_filename(requested, 'unused.png'))
 
 
 class HeadlessDeadlineTests(unittest.TestCase):
@@ -1404,8 +1411,15 @@ class HeadlessConsoleDescriptionTests(unittest.TestCase):
         return next(t for t in server.MCP_TOOLS if t.name == name).description
 
     def test_headless_really_has_no_console_action(self):
-        source = (REPO_ROOT / 'mcp-server' / 'headless_backend.py').read_text()
-        self.assertNotIn("'getConsoleLogs'", source,
+        """Asked of the backend rather than grepped from its source, which a
+        renamed branch or a dispatch table would have fooled."""
+        import headless_backend
+        browser = headless_backend.HeadlessBrowser()
+        page = object()
+        browser._page, browser._tabs = page, {1: page}
+        result = asyncio.run(browser._dispatch('getConsoleLogs', None, {}))
+        self.assertEqual(result.get('error'),
+                         'Unsupported headless action: getConsoleLogs',
                          'headless implements it now: say so in the tool '
                          'descriptions instead of removing this test')
 
