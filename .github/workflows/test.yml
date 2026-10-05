@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+# Read-only: the suite needs nothing else, and a workflow token that can
+# write is one more thing a compromised dependency could use.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Pinned to commit SHAs, not tags: a tag can be moved to other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Run the Python and extension suites
+        run: mise run test
