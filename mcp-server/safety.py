@@ -98,6 +98,9 @@ _SAFE_URL_RE = re.compile(r'^(https?://|about:blank$)', re.IGNORECASE)
 # _normalise_url closes that gap: match what the browser will actually load.
 _C0_AND_SPACE = ''.join(chr(c) for c in range(0x21))
 _REMOVED_URL_CHARS = str.maketrans('', '', '\t\n\r')
+# For these schemes the browser reads any run of slashes after the colon,
+# including none, as "//": https:///evil.com/ loads evil.com.
+_SPECIAL_SCHEME_SLASHES_RE = re.compile(r'^(https?|wss?|ftp):/*', re.IGNORECASE)
 # Characters that end the authority or a path segment. A pattern that stops
 # anywhere else has only matched part of a name.
 _URL_DELIMITERS = ':/?#'
@@ -113,11 +116,15 @@ def _clean_url_text(url: str) -> str:
 
     Shared by _normalise_url and redact_url so both read the same string the
     browser does: leading and trailing C0 controls and spaces go, tabs and
-    line breaks go wherever they appear, and a backslash counts as a forward
-    slash.
+    line breaks go wherever they appear, a backslash counts as a forward
+    slash, and any run of slashes after http: or https: is read as "//".
+    Without that last step https:///evil.com/ had no host here, so anchored
+    patterns never matched the site the browser loaded.
     """
-    return url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS).replace(
+    cleaned = url.strip(_C0_AND_SPACE).translate(_REMOVED_URL_CHARS).replace(
         '\\', '/')
+    return _SPECIAL_SCHEME_SLASHES_RE.sub(
+        lambda m: m.group(1).lower() + '://', cleaned)
 
 
 def _strip_userinfo_text(url: str) -> str:

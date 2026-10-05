@@ -756,6 +756,41 @@ class AuditLogTests(unittest.TestCase):
         self.assertLessEqual(safety._AUDIT_MAX_BYTES, 10 * 1024 * 1024)
 
 
+class SlashRunTests(unittest.TestCase):
+    """The browser reads any run of slashes or backslashes after http: or
+    https: as "//" (the URL standard's "special authority ignore slashes"),
+    so https:///evil.com/ loads evil.com. The guard read it as a URL with
+    no host, so anchored patterns never matched it."""
+
+    VARIANTS = ('https:///{}/', 'https:////{}/', 'https:/\\/{}/',
+                'HTTPS:///{}/', 'https:{}/')
+
+    def test_an_anchored_blocklist_still_blocks(self):
+        g = guard(blocked_url_patterns=[r'^https?://(www\.)?evil\.com'])
+        for shape in self.VARIANTS:
+            url = shape.format('evil.com')
+            with self.subTest(url=url):
+                denial = g.check('browser_navigate', {'url': url})
+                self.assertIsNotNone(denial, 'navigated to a blocked site')
+                self.assertEqual(denial['safety_decision'], 'blocked_url')
+
+    def test_an_anchored_protected_site_still_asks(self):
+        g = guard(protected_url_patterns=[r'^https://([^/]*\.)?mybank\.com'])
+        for shape in self.VARIANTS:
+            url = shape.format('mybank.com') + 'transfer'
+            with self.subTest(url=url):
+                denial = g.check('browser_click',
+                                 {'url': url, 'selector': '#send'})
+                self.assertIsNotNone(denial, 'no confirmation asked')
+                self.assertEqual(denial['safety_decision'],
+                                 'confirmation_required')
+
+    def test_userinfo_after_extra_slashes_is_not_logged(self):
+        logged = safety.redact_url('https:///alice:hunter2@intranet.example/')
+        self.assertNotIn('hunter2', logged)
+        self.assertNotIn('alice', logged)
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""
