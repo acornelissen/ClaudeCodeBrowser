@@ -3755,6 +3755,63 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(playwright_browser.closed)
         self.assertTrue(driver.stopped)
 
+    async def test_a_failed_launch_stops_the_driver(self):
+        """start() left the Playwright driver running when the browser could
+        not launch - a missing executable, say - so every failed attempt
+        leaked a driver subprocess for the life of the server."""
+        driver = self._stub_playwright()
+
+        async def no_browser(**kwargs):
+            raise RuntimeError("Executable doesn't exist")
+        driver.firefox.launch = no_browser
+        browser = HeadlessBrowser()
+        with self.assertRaises(RuntimeError):
+            await browser.start()
+        self.assertTrue(driver.stopped, 'the driver was left running')
+        self.assertFalse(browser.is_ready())
+
+    async def test_a_failure_after_launch_closes_the_browser_too(self):
+        driver = self._stub_playwright()
+        launched = []
+
+        async def launch(**kwargs):
+            b = FakeBrowser()
+
+            async def broken_context(**kw):
+                raise RuntimeError('context failed')
+            b.new_context = broken_context
+            launched.append(b)
+            return b
+        driver.firefox.launch = launch
+        browser = HeadlessBrowser()
+        with self.assertRaises(RuntimeError):
+            await browser.start()
+        self.assertTrue(launched[0].closed, 'the browser was left running')
+        self.assertTrue(driver.stopped)
+        self.assertFalse(browser.is_ready())
+
+    async def test_the_install_hint_names_the_configured_engine(self):
+        self._install_modules({'playwright': None,
+                               'playwright.async_api': None})
+        with unittest.mock.patch.object(headless_backend, 'BROWSER_TYPE',
+                                        'chromium'):
+            with self.assertRaises(RuntimeError) as ctx:
+                await HeadlessBrowser().start()
+        self.assertIn('playwright install chromium', str(ctx.exception))
+        self.assertNotIn('firefox', str(ctx.exception))
+
+    async def test_stop_stops_the_driver_even_if_closing_the_browser_fails(self):
+        driver = self._stub_playwright()
+        browser = HeadlessBrowser()
+        await browser.start()
+
+        async def crashed():
+            raise RuntimeError('Target closed')
+        browser._browser.close = crashed
+        await browser.stop()
+        self.assertTrue(driver.stopped, 'the driver was left running')
+        self.assertFalse(browser.is_ready())
+
     async def test_stop_before_start_is_harmless(self):
         await HeadlessBrowser().stop()
 

@@ -9,6 +9,16 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Fixed
+- **A failed headless start no longer leaks the Playwright driver.** When the
+  browser could not launch (a missing executable, say), `start()` raised
+  without stopping the driver subprocess, so every failed attempt left one
+  running; `stop()` likewise skipped it if closing the browser failed. Both
+  now stop the driver. The install hint also names the configured engine
+  instead of always Firefox.
+
 ## [1.9.6]
 
 ### Changed

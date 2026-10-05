@@ -208,28 +208,46 @@ class HeadlessBrowser:
             from playwright.async_api import async_playwright
         except ImportError:
             raise RuntimeError(
-                "playwright not installed. Run: pip install playwright && playwright install firefox"
+                "playwright not installed. Run: python3 -m pip install "
+                f"playwright && python3 -m playwright install {BROWSER_TYPE}"
             )
 
         self._playwright = await async_playwright().start()
-        launcher = getattr(self._playwright, BROWSER_TYPE)
-        launch_kwargs = {'headless': True}
-        if EXECUTABLE_PATH:
-            launch_kwargs['executable_path'] = EXECUTABLE_PATH
-        self._browser = await launcher.launch(**launch_kwargs)
-        self._context = await self._browser.new_context(
-            viewport={'width': 1280, 'height': 800}
-        )
-        self._page = await self._context.new_page()
-        self._register_tab(self._page)
+        try:
+            launcher = getattr(self._playwright, BROWSER_TYPE)
+            launch_kwargs = {'headless': True}
+            if EXECUTABLE_PATH:
+                launch_kwargs['executable_path'] = EXECUTABLE_PATH
+            self._browser = await launcher.launch(**launch_kwargs)
+            self._context = await self._browser.new_context(
+                viewport={'width': 1280, 'height': 800}
+            )
+            self._page = await self._context.new_page()
+            self._register_tab(self._page)
+        except BaseException:
+            # The driver is a subprocess. Raising without stopping it - a
+            # missing browser executable, say - left one running for the
+            # life of the server on every failed attempt. stop() closes
+            # whatever got as far as starting.
+            try:
+                await self.stop()
+            except Exception as e:
+                logger.warning(f"Cleanup after a failed start also failed: {e}")
+            raise
 
         logger.info(f"Headless {BROWSER_TYPE} started")
 
     async def stop(self):
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        # The driver is stopped even when closing the browser fails - a
+        # crashed browser raises here - or its subprocess outlives us.
+        try:
+            if self._browser:
+                await self._browser.close()
+        except Exception as e:
+            logger.warning(f"Closing the headless browser failed: {e}")
+        finally:
+            if self._playwright:
+                await self._playwright.stop()
         # Forget the tabs as well. is_ready() still reported True after stop(),
         # so server.py went on dispatching commands onto a closed browser and
         # the caller got an error from deep inside Playwright instead of being
