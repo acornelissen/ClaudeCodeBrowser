@@ -9,6 +9,16 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Security
+- **Captured traffic still leaked three things,** found in a live check of
+  1.9.0: the OAuth code scrubbed from a redirect's `Location` came straight
+  back in the next request's `Referer`; a captured HTML page kept
+  `<input id="mfa" name="mfaCode" value="...">`, because only the first
+  `name`/`id` on a tag was judged; and a credential `<textarea>`'s contents
+  were never scrubbed.
+
 ## [1.9.0]
 
 ### Security
