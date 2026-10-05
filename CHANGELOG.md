@@ -9,10 +9,7 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
-## [Unreleased]
-
-Not yet released. Version strings are deliberately still on 1.8.0 — bumping
-them is part of releasing, and that is being held for approval.
+## [1.9.0]
 
 ### Security
 - **The agent could switch off credential masking itself.** The server set
@@ -444,8 +441,8 @@ for a browser that was never coming. All of them are cleared now.
 
 `headless_backend.py`, `agent/browser_agent.py`, `getText`,
 `getComputedStyles`, `_save_screenshot`, the native host's framing and the
-attended human-approval branch had no tests at all. The suite is now 421
-Python tests plus 189 JavaScript ones, with every fix above shown to fail
+attended human-approval branch had no tests at all. The suite is now 601
+Python tests plus 237 JavaScript ones, with every fix above shown to fail
 against the source it replaced. Several fixtures were found to be hiding the
 bugs they were meant to cover: `attachShadow()` discarded its argument, so
 changing the approval prompt's shadow root from `closed` to `open` — which
