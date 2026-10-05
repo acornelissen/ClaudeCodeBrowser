@@ -762,7 +762,7 @@ MCP_TOOLS: List[MCPTool] = [
     # Console and Network Logging Tools
     MCPTool(
         name="browser_start_logging",
-        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them. Network capture uses webRequest, so it sees fetch, XHR, WebSocket handshakes and beacons; console capture is per-page. Capture is off until you call this and stops when you call browser_stop_logging.",
+        description="Start capturing console logs and network requests from the browser. Use this before performing actions you want to monitor. Logs are accumulated until you retrieve them. Network capture uses webRequest, so it sees fetch, XHR, WebSocket handshakes and beacons; console capture is per-page. Capture is off until you call this, and stops when you call browser_stop_logging or when the tab navigates to a different origin (so start it on the site you want to watch, not on about:blank); browser_get_network_logs then reports loggingEnabled: false.",
         input_schema={
             "type": "object",
             "properties": {
