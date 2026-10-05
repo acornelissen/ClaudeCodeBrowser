@@ -62,6 +62,9 @@ Copy-Item (Join-Path $RepoRoot "native-host\claudecodebrowser_host.py") (Join-Pa
 foreach ($f in @("server.py", "safety.py", "headless_backend.py", "stdio_wrapper.py")) {
     Copy-Item (Join-Path $RepoRoot "mcp-server\$f") (Join-Path $InstallDir "mcp-server\")
 }
+# The one definition of a credential, shared with the extension; headless
+# runs it in the page and will not start without it.
+Copy-Item (Join-Path $RepoRoot "extension\credentials.js") (Join-Path $InstallDir "mcp-server\")
 Copy-Item (Join-Path $RepoRoot "agent\browser_agent.py") (Join-Path $InstallDir "agent\")
 Write-Host "[ok] Components installed"
 

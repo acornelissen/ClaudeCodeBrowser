@@ -55,19 +55,20 @@ from headless_backend import HeadlessBrowser  # noqa: E402
 logging.getLogger('ClaudeCodeBrowser.Headless').setLevel(logging.CRITICAL)
 
 CONTENT_JS = ROOT / 'extension' / 'content.js'
+# The one definition of a credential, which the extension and headless share.
+CREDENTIALS_JS = ROOT / 'extension' / 'credentials.js'
 
 SECRET = 'hunter2-correct-horse'
 
 
 # --------------------------------------------------------------------------
-# One fixture table, two implementations.
+# One fixture table, one implementation.
 #
-# The credential predicate exists twice: isPasswordField /
-# isConcealedValueField in extension/content.js, and the JavaScript
-# HeadlessBrowser._credential_js builds for Playwright. CREDENTIAL_FIXTURES
-# below is every element shape either of them has to decide about, and
-# CredentialPredicateParityTests runs BOTH implementations over all of it, in
-# node, and fails on any disagreement.
+# The credential predicate is defined once, in extension/credentials.js; the
+# extension loads it and HeadlessBrowser._credential_js runs it in the page.
+# CREDENTIAL_FIXTURES below is every element shape it has to decide about,
+# and CredentialPredicateParityTests runs the extension's entry and the
+# headless entry over all of it, in node, and fails on any disagreement.
 #
 # This replaces a "parity" test that compared the autocomplete token tuple
 # and nothing else. Every other dimension of the predicate could diverge
@@ -216,7 +217,7 @@ CREDENTIAL_FIXTURES = (
 # --------------------------------------------------------------------------
 
 _TOKEN_LIST_RE = re.compile(
-    r'const CREDENTIAL_AUTOCOMPLETE_TOKENS = \[([^\]]*)\]')
+    r'CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set\(\[([^\]]*)\]')
 
 _CAMEL_BOUNDARY_RE = re.compile(r'([a-z0-9])([A-Z])')
 
@@ -236,57 +237,29 @@ def credential_tokens(script: str) -> set:
 
 
 def extension_credential_tokens() -> set:
-    """CREDENTIAL_AUTOCOMPLETE_TOKENS from extension/content.js."""
-    src = CONTENT_JS.read_text()
-    start = src.index('const CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set([')
+    """CREDENTIAL_AUTOCOMPLETE_TOKENS from extension/credentials.js."""
+    src = CREDENTIALS_JS.read_text()
+    start = src.index('var CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set([')
     end = src.index('])', start)
     return set(re.findall(r"'([^']+)'", src[start:end]))
 
 
 def extension_name_pattern() -> str:
-    """CREDENTIAL_NAME_RE from extension/content.js, without its delimiters."""
-    src = CONTENT_JS.read_text()
-    m = re.search(r'^  const CREDENTIAL_NAME_RE =\n    /(.*)/i;$', src, re.M)
+    """CREDENTIAL_NAME_RE from extension/credentials.js, without delimiters."""
+    src = CREDENTIALS_JS.read_text()
+    m = re.search(r'^var CREDENTIAL_NAME_RE =\n  /(.*)/i;$', src, re.M)
     if m is None:
-        raise AssertionError(
-            'CREDENTIAL_NAME_RE is no longer where content.js kept it, so '
-            'the headless copy is no longer pinned to anything')
+        raise AssertionError('CREDENTIAL_NAME_RE is no longer where '
+                             'credentials.js kept it')
     return m.group(1)
 
 
-# The pieces of extension/content.js that make up its credential predicate,
-# in dependency order. Lifted rather than rewritten: a reimplementation of
-# the thing under comparison would agree with itself and prove nothing.
-_EXTENSION_GUARD_CHUNKS = (
-    r'^  const CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set\(\[[\s\S]*?\n  \]\);$',
-    r'^  const CREDENTIAL_NAME_RE =\n    /.*/i;$',
-    r'^  function attributeOf\(element, name\) \{[\s\S]*?\n  \}$',
-    r'^  function looksLikeCredentialName\(name\) \{[\s\S]*?\n  \}$',
-    r'^  function holdsEnteredValue\(element\) \{[\s\S]*?\n  \}$',
-    r'^  function isPasswordField\(element\) \{[\s\S]*?\n  \}$',
-    r'^  function isConcealedValueField\(element\) \{[\s\S]*?\n  \}$',
-)
-
-
 def extension_predicate_js(include_hidden: bool) -> str:
-    """The extension's own predicate, as an expression node can evaluate.
-
-    A chunk that stops matching - renamed, reindented, moved - raises here
-    rather than quietly dropping out of the comparison and leaving a parity
-    test that compares a predicate against a shorter version of itself.
-    """
-    src = CONTENT_JS.read_text()
-    parts = []
-    for pattern in _EXTENSION_GUARD_CHUNKS:
-        found = re.findall(pattern, src, re.M)
-        if len(found) != 1:
-            raise AssertionError(
-                f'expected one match in content.js for {pattern!r}, found '
-                f'{len(found)}: the extension guard has moved and this '
-                'comparison is no longer looking at it')
-        parts.append(found[0])
+    """The extension's predicate - all of credentials.js - as an expression
+    node can evaluate, entered the way content.js enters it."""
     entry = 'isConcealedValueField' if include_hidden else 'isPasswordField'
-    return '(() => {\n' + '\n'.join(parts) + f'\nreturn {entry};\n}})()'
+    return ('(() => {\n' + CREDENTIALS_JS.read_text() +
+            f'\nreturn {entry};\n}})()')
 
 
 class Element:
@@ -404,7 +377,8 @@ def eval_field_predicate(script: str, el) -> bool:
 # they declare. Both readers carry an ALLOW_PASSWORD literal; only the
 # getText reader scrubs nested fields, so only it mentions querySelectorAll.
 def is_guard_probe(script: str) -> bool:
-    return 'const ALLOW_PASSWORD =' not in script and '.includes(t)' in script
+    return ('const ALLOW_PASSWORD =' not in script
+            and 'function isPasswordField(' in script)
 
 
 def is_text_read(script: str) -> bool:
@@ -871,7 +845,8 @@ class FakePage:
         self.evaluate_count += 1
         if len(self.evaluate_scripts) < 500:
             self.evaluate_scripts.append(script)
-        if 'document.activeElement' in script and '.includes(t)' in script:
+        if ('document.activeElement' in script
+                and 'function isPasswordField(' in script):
             if self.focused_probe_error is not None:
                 raise self.focused_probe_error
             return eval_field_predicate(script, self.active_element)
@@ -1964,13 +1939,11 @@ class CredentialTextReadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GuardDefinitionMirrorTests(unittest.TestCase):
-    """The two constants this module copies out of the extension, pinned.
+    """Headless runs the extension's credentials.js, not a copy of it.
 
-    The predicates themselves are compared by behaviour, over the fixture
-    table, in CredentialPredicateParityTests - that is the test that catches
-    a divergence. These two pin the copied text, the way
-    background.js's SECRET_KEY_RE is pinned to content.js's
-    CREDENTIAL_NAME_RE: one definition, mirrored, pinned by a test."""
+    There used to be three hand-kept copies - this module, content.js and
+    background.js - pinned to each other by tests, and most leaks found were
+    one copy behind another. These check there is now only the one."""
 
     def scripts(self):
         """Both predicates the module builds: write guard and read mask."""
@@ -1979,26 +1952,20 @@ class GuardDefinitionMirrorTests(unittest.TestCase):
             'read': HeadlessBrowser._credential_js(include_hidden=True),
         }
 
-    def test_the_token_tuple_matches_the_extension(self):
+    def test_headless_runs_the_extensions_own_file(self):
+        """The three hand-kept copies are gone: what headless runs in the
+        page is credentials.js itself, byte for byte."""
+        self.assertEqual(HeadlessBrowser._credential_defs_js().rstrip('\n'),
+                         CREDENTIALS_JS.read_text().rstrip('\n'))
+
+    def test_the_values_python_reads_come_from_that_file(self):
         self.assertEqual(set(HeadlessBrowser.CREDENTIAL_AUTOCOMPLETE_TOKENS),
                          extension_credential_tokens())
-
-    def test_the_name_pattern_matches_the_extension(self):
-        """Character for character, not merely equivalent: the pattern is
-        the only part of the guard this file cannot lift from content.js at
-        runtime, so a change on either side has to be made on both."""
         self.assertEqual(HeadlessBrowser.CREDENTIAL_NAME_RE,
                          extension_name_pattern())
-
-    def test_the_scrub_cap_matches_the_extension(self):
-        """content.js raised its cap from 50 to 500 because 50 leaked the
-        rest of a busy page; this copy stayed at 50 and leaked the same
-        way. Pinned so the two cannot drift apart again."""
-        found = re.findall(r'^  const MAX_SCRUBBED_FIELDS = (\d+);$',
-                           CONTENT_JS.read_text(), re.M)
-        self.assertEqual(len(found), 1,
-                         'MAX_SCRUBBED_FIELDS has moved in content.js')
-        self.assertEqual(HeadlessBrowser.MAX_SCRUBBED_FIELDS, int(found[0]))
+        found = re.findall(r'^var MAX_SCRUBBED_FIELDS = (\d+);$',
+                           CREDENTIALS_JS.read_text(), re.M)
+        self.assertEqual([str(HeadlessBrowser.MAX_SCRUBBED_FIELDS)], found)
 
     def test_every_generated_predicate_carries_the_whole_token_list(self):
         for name, script in self.scripts().items():

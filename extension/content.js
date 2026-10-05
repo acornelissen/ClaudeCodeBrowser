@@ -353,39 +353,9 @@
   // Credential guard: credentials never pass through the AI — neither written
   // into a password field nor read back out of one — unless the safety config
   // explicitly allows it. They belong in the browser's own password manager.
-  // autocomplete is a space-separated token list and is case-insensitive, so
-  // "Current-Password", "current-password " and the spec-legal
-  // "section-login current-password" all have to match. Beyond passwords,
-  // one-time codes and card fields are credentials too: they are not
-  // type=password, so nothing else in here would have protected them.
-  const CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set([
-    'current-password', 'new-password', 'one-time-code',
-    'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year'
-  ]);
-
-  // A field's name or id is the third signal, and on real pages often the
-  // only one: <input type="text" name="passwd"> is a password field that
-  // says type="text", and a contenteditable <div id="otp-code"> is a
-  // credential with no type at all.
-  //
-  // This list must stay at least as strict as SECRET_KEY_RE in
-  // background.js, which scrubs the same names out of captured HTML and
-  // request bodies and whose comment calls them "exactly the thing the
-  // DOM-level guard masks". Change one, change the other. The extras here
-  // (pwd, ssn) are names background.js misses; a name the DOM guard misses
-  // hands a credential to the agent in clear, which is worse than masking a
-  // field that happens to be called "author".
-  const CREDENTIAL_NAME_RE =
-    /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)|mfa[-_]?code|verification[-_]?code|security[-_]?code|(?:^|[^a-z])cc[-_]?number|credit[-_]?card|(?:^|[^a-z])pin[-_]?code|cookie|recovery[-_]?codes?|backup[-_]?codes?|(?:^|[^a-z])card[-_]?code)/i;
-
-  // Matched through this, never directly: the anchors in the pattern only see
-  // a non-letter as a boundary, so without normalising camelCase first,
-  // otpCode, sessionValue, authData and pinCode do not match at all - and a
-  // field the DOM guard misses hands a credential to the agent in clear.
-  function looksLikeCredentialName(name) {
-    return CREDENTIAL_NAME_RE.test(
-      String(name == null ? '' : name).replace(/([a-z0-9])([A-Z])/g, '$1_$2'));
-  }
+  // What counts as a credential field (isPasswordField, isConcealedValueField,
+  // looksLikeCredentialName, holdsEnteredText) is defined once, in
+  // credentials.js, which the manifest loads ahead of this file.
 
   // The locator an element was looked up by, safe to put in an error.
   // These errors used to embed JSON.stringify(options), which carries the
@@ -409,68 +379,9 @@
     return parts.length ? parts.join(', ') : 'no locator given';
   }
 
-  function attributeOf(element, name) {
-    if (!element || typeof element.getAttribute !== 'function') return null;
-    return element.getAttribute(name);
-  }
-
-  function isPasswordField(element) {
-    if (!element) return false;
-    // Not restricted to <input>: Shoelace, Ionic and Vaadin wrap a real
-    // input in a shadow root, so <sl-input type="password"> is the only
-    // element an agent can target, and requiring tagName === 'INPUT' let
-    // those through in clear.
-    if (element.type === 'password') return true;
-    if ((attributeOf(element, 'type') || '').toLowerCase() === 'password') return true;
-
-    const autocomplete = attributeOf(element, 'autocomplete');
-    if (autocomplete && autocomplete
-          .toLowerCase()
-          .split(/\s+/)
-          .some(token => CREDENTIAL_AUTOCOMPLETE_TOKENS.has(token))) {
-      return true;
-    }
-
-    // The name/id rule is only for elements that hold a value somebody
-    // entered. Applied to everything, it would mask the text of any
-    // <div id="user-session-banner"> on the page.
-    if (!holdsEnteredValue(element)) return false;
-
-    // name can be a form path like user[password], which still names a
-    // credential, so this is a substring match rather than an equality test.
-    const name = element.name || attributeOf(element, 'name') || '';
-    const id = element.id || attributeOf(element, 'id') || '';
-    return looksLikeCredentialName(name) || looksLikeCredentialName(id);
-  }
-
-  function holdsEnteredValue(element) {
-    const tag = element.tagName || '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
-    if (element.isContentEditable === true) return true;
-    // A custom element - its tag name must contain a hyphen - is how a
-    // component library ships a field: <sl-input>, <ion-input>,
-    // <vaadin-password-field>.
-    return tag.includes('-');
-  }
-
-  // Hidden inputs routinely carry CSRF tokens, session ids and order ids.
-  // They are never something the agent needs the value of.
-  function isConcealedValueField(element) {
-    return isPasswordField(element) ||
-      (element && element.tagName === 'INPUT' && element.type === 'hidden');
-  }
-
   // The single place that decides what an element's value looks like to the
   // agent. Every reader goes through this so a new reader cannot reintroduce
   // the getPageInfo leak.
-  // Whether a credential field holds anything, without reading it out. A
-  // contenteditable has no .value, so judging by .value alone called a
-  // filled one empty.
-  function holdsEnteredText(element) {
-    const raw = 'value' in element ? element.value : element.textContent;
-    return raw !== undefined && raw !== null && String(raw).length > 0;
-  }
-
   function safeElementValue(element, limit, options) {
     if (element && isPasswordField(element) && !passwordAllowed(options)) {
       return holdsEnteredText(element) ? '***' : null;
@@ -2035,11 +1946,8 @@
   // prose with a regex is not something it could do honestly, and the note on
   // the result says how many fields were masked so a caller is not left
   // guessing.
-  // A cap on how many credential fields are masked in one page read. It is
-  // only here to bound the work; 50 was low enough that a page with more
-  // credential-named editable fields than that leaked the rest silently, so
-  // it is both higher and reported when it bites.
-  const MAX_SCRUBBED_FIELDS = 500;
+  // The cap on how many fields one read masks, MAX_SCRUBBED_FIELDS, is in
+  // credentials.js so headless applies the same one.
 
   function withoutNestedCredentialText(text, root, options) {
     if (!text || passwordAllowed(options)) return { text, masked: 0 };

@@ -154,6 +154,41 @@ class CredentialProbeFailed(RuntimeError):
             'credential.')
 
 
+
+def _load_credentials():
+    """Read extension/credentials.js: the one definition of a credential.
+
+    Installed, it sits next to this file (install.sh copies it); in the
+    repository it is in extension/. Missing, nothing here could tell a
+    password field from any other, so this fails loudly at import rather
+    than letting the first guard probe throw.
+    """
+    here = Path(__file__).resolve().parent
+    for candidate in (here / 'credentials.js',
+                      here.parent / 'extension' / 'credentials.js'):
+        if candidate.is_file():
+            source = candidate.read_text(encoding='utf-8')
+            break
+    else:
+        raise RuntimeError(
+            'credentials.js not found next to headless_backend.py or in '
+            '../extension/; reinstall with scripts/install.sh.')
+    tokens = re.search(
+        r'CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set\(\[([\s\S]*?)\]\)', source)
+    name_re = re.search(r'^var CREDENTIAL_NAME_RE =\n  /(.*)/i;$', source, re.M)
+    cap = re.search(r'^var MAX_SCRUBBED_FIELDS = (\d+);$', source, re.M)
+    if not (tokens and name_re and cap):
+        raise RuntimeError('credentials.js no longer has the shape '
+                           'headless_backend.py reads; update _load_credentials')
+    return source, {
+        'tokens': tuple(re.findall(r"'([^']+)'", tokens.group(1))),
+        'name_re': name_re.group(1),
+        'max_scrubbed': int(cap.group(1)),
+    }
+
+
+CREDENTIALS_JS, _CREDENTIALS = _load_credentials()
+
 class HeadlessBrowser:
     """Playwright-backed headless browser. One persistent context per server lifetime."""
 
@@ -251,122 +286,25 @@ class HeadlessBrowser:
             raise RuntimeError("Headless browser not started")
         return self._page
 
-    # ONE definition, mirroring CREDENTIAL_AUTOCOMPLETE_TOKENS in
-    # extension/content.js. There were previously three divergent copies in
-    # this file - the selector guard, the focused-element guard and the read
-    # mask - with different token lists, so whether a field counted as a
-    # credential depended on which code path reached it: cc-exp-month and
-    # cc-exp-year were missing everywhere, and cc-exp was missing from the
-    # focused path, meaning `type` with a selector refused a card-expiry field
-    # while `type` with no selector typed into the same focused field.
-    # tests/test_headless_backend.py asserts this list matches the extension's.
-    CREDENTIAL_AUTOCOMPLETE_TOKENS = (
-        'current-password', 'new-password', 'one-time-code',
-        'cc-number', 'cc-csc', 'cc-exp', 'cc-exp-month', 'cc-exp-year',
-    )
-
-    # Mirrors CREDENTIAL_NAME_RE in extension/content.js, character for
-    # character: it is a JavaScript pattern, interpolated into the probes
-    # below and compiled by the page. Change one, change the other - the
-    # tests lift the extension's copy and compare the two strings, the same
-    # way background.js's SECRET_KEY_RE is pinned to it.
-    #
-    # On real pages the name/id is the signal that matters most, and this
-    # file had none of it: it looked at type and autocomplete only, inside a
-    # tagName === 'INPUT' test. So <input type="text" name="passwd"> was not
-    # a credential here - headless read its value straight back to the agent
-    # and typed into it - while attended mode refused both. Eight shapes
-    # disagreed, every one of them in the leaking direction.
-    CREDENTIAL_NAME_RE = (
-        '(pass(?:word|wd|phrase|code|key)|userpass'
-        '|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential'
-        '|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization'
-        '|authenticat|auth(?:z|n)(?:[^a-z]|$)'
-        '|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)'
-        '|api[-_]?key|private[-_]?key'
-        '|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id'
-        '|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer'
-        '|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)'
-        '|mfa[-_]?code|verification[-_]?code|security[-_]?code'
-        '|(?:^|[^a-z])cc[-_]?number|credit[-_]?card'
-        '|(?:^|[^a-z])pin[-_]?code|cookie'
-        '|recovery[-_]?codes?|backup[-_]?codes?|(?:^|[^a-z])card[-_]?code)'
-    )
-
-    # How many nested credential fields a single getText will mask. See
-    # _get_text_js for why the cap is on how many are masked, not on how many
-    # are examined. Mirrors MAX_SCRUBBED_FIELDS in content.js, and the tests
-    # pin the two together: this copy stayed at 50 after content.js found
-    # that 50 leaked the rest of a busy page in clear, and it leaked the same
-    # way, without saying so. The cap only bounds the work, and the result
-    # now reports when it bites.
-    MAX_SCRUBBED_FIELDS = 500
+    # What counts as a credential comes from extension/credentials.js, the
+    # file the extension itself loads, so headless and Firefox answer from
+    # the same code. These were three hand-kept copies - here, content.js and
+    # background.js - and most leaks found were one copy behind another.
+    # Python needs only these three values; everything else runs in the page.
+    CREDENTIAL_AUTOCOMPLETE_TOKENS = _CREDENTIALS['tokens']
+    CREDENTIAL_NAME_RE = _CREDENTIALS['name_re']
+    MAX_SCRUBBED_FIELDS = _CREDENTIALS['max_scrubbed']
 
     @classmethod
     def _credential_defs_js(cls) -> str:
-        """The extension's credential predicates, as JS to run in the page.
+        """credentials.js, to run in the page ahead of a probe or reader.
 
-        A port of attributeOf / looksLikeCredentialName / holdsEnteredValue /
-        isPasswordField / isConcealedValueField in extension/content.js, kept
-        function for function so the two can be read side by side. The tests
-        run this and the extension's own copy over one fixture table and fail
-        if they disagree about any shape.
-
-        Not restricted to <input>: Shoelace, Ionic and Vaadin wrap a real
-        input in a shadow root, so <sl-input type="password"> is the only
-        element an agent can target, and a contenteditable <div id="otp-code">
-        is a credential with no type at all.
+        Its var and function declarations are valid inside the function body
+        it is interpolated into, and define attributeOf,
+        looksLikeCredentialName, holdsEnteredValue, isPasswordField,
+        isConcealedValueField and holdsEnteredText.
         """
-        tokens = ', '.join(f"'{t}'" for t in cls.CREDENTIAL_AUTOCOMPLETE_TOKENS)
-        return (
-            f"const CREDENTIAL_AUTOCOMPLETE_TOKENS = [{tokens}];\n"
-            f"const CREDENTIAL_NAME_RE = /{cls.CREDENTIAL_NAME_RE}/i;\n"
-            "const attributeOf = (element, name) =>\n"
-            "  (element && typeof element.getAttribute === 'function')\n"
-            "    ? element.getAttribute(name) : null;\n"
-            # camelCase is normalised first because the anchors in the
-            # pattern only see a non-letter as a boundary: otpCode, apiKey
-            # and privateKey do not match without it.
-            "const looksLikeCredentialName = (name) => CREDENTIAL_NAME_RE.test(\n"
-            "  String(name == null ? '' : name)"
-            ".replace(/([a-z0-9])([A-Z])/g, '$1_$2'));\n"
-            # The name/id rule is only for elements that hold a value
-            # somebody entered. Applied to everything it would mask the text
-            # of any <div id="user-session-banner"> on the page.
-            "const holdsEnteredValue = (element) => {\n"
-            "  const tag = element.tagName || '';\n"
-            "  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT')"
-            " return true;\n"
-            "  if (element.isContentEditable === true) return true;\n"
-            "  return tag.includes('-');\n"
-            "};\n"
-            "const isPasswordField = (element) => {\n"
-            "  if (!element) return false;\n"
-            "  if (element.type === 'password') return true;\n"
-            "  if ((attributeOf(element, 'type') || '').toLowerCase()"
-            " === 'password') return true;\n"
-            "  const autocomplete = attributeOf(element, 'autocomplete');\n"
-            "  if (autocomplete && autocomplete.toLowerCase().split(/\\s+/)\n"
-            "        .some(t => CREDENTIAL_AUTOCOMPLETE_TOKENS.includes(t)))"
-            " return true;\n"
-            "  if (!holdsEnteredValue(element)) return false;\n"
-            # name can be a form path like user[password], which still names
-            # a credential, so this is a substring match, not an equality
-            # test.
-            "  const name = element.name || attributeOf(element, 'name') || '';\n"
-            "  const id = element.id || attributeOf(element, 'id') || '';\n"
-            "  return looksLikeCredentialName(name)"
-            " || looksLikeCredentialName(id);\n"
-            "};\n"
-            # Hidden inputs routinely carry CSRF tokens, session ids and
-            # order ids. They are never something the agent needs the value
-            # of - but writing one is how a form carries state, so only the
-            # read mask includes them.
-            "const isConcealedValueField = (element) =>"
-            " isPasswordField(element) ||\n"
-            "  (!!element && element.tagName === 'INPUT'"
-            " && element.type === 'hidden');\n"
-        )
+        return CREDENTIALS_JS + "\n"
 
     @classmethod
     def _credential_js(cls, include_hidden: bool) -> str:
@@ -427,8 +365,8 @@ class HeadlessBrowser:
             "    ? Array.from(root.querySelectorAll('[contenteditable], textarea'))\n"
             "        .filter(el => el !== root && isPasswordField(el))\n"
             "    : [];\n"
-            f"  capped = all.length > {cls.MAX_SCRUBBED_FIELDS};\n"
-            f"  candidates = all.slice(0, {cls.MAX_SCRUBBED_FIELDS});\n"
+            "  capped = all.length > MAX_SCRUBBED_FIELDS;\n"
+            "  candidates = all.slice(0, MAX_SCRUBBED_FIELDS);\n"
             "} catch (e) { candidates = []; }\n"
             "const secrets = [];\n"
             "for (const field of candidates) {\n"

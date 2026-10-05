@@ -14,6 +14,8 @@ import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, '..', 'extension', 'background.js'), 'utf8');
+// Loaded ahead of SOURCE into the same context, as the manifest does.
+const CREDENTIALS = readFileSync(join(here, '..', 'extension', 'credentials.js'), 'utf8');
 
 /** A recordable webRequest event. Records the filter and extraInfoSpec too:
  *  filterResponseData() is only callable from a listener registered with
@@ -179,6 +181,7 @@ function loadBackground({ contentScriptReply = { success: true } } = {}) {
   sandbox.globalThis = sandbox;
 
   const context = createContext(sandbox);
+  runInContext(CREDENTIALS, context, { filename: 'credentials.js' });
   runInContext(SOURCE, context, { filename: 'background.js' });
 
   // handleCommand is the native host's entry point into the extension.
@@ -245,19 +248,13 @@ function fireRequest(webRequest, {
   }
 }
 
-// The real matcher, lifted from the source: the pattern alone is not the
+// The real matcher, from credentials.js: the pattern alone is not the
 // decision - looksLikeCredentialName normalises camelCase first, and testing
 // the pattern directly is what let a regression through.
 function loadNameMatcher() {
-  const parts = [
-    SOURCE.match(/const SECRET_KEY_RE =\n  \/.*\/i;/),
-    SOURCE.match(/function normaliseNameForMatching[\s\S]*?\n\}/),
-    SOURCE.match(/function looksLikeCredentialName[\s\S]*?\n\}/)
-  ];
-  for (const [i, m] of parts.entries()) {
-    assert.ok(m, `could not lift credential-name part ${i} from background.js`);
-  }
-  return eval(parts.map(m => m[0]).join('\n') + '\nlooksLikeCredentialName');
+  const context = createContext({});
+  runInContext(CREDENTIALS, context, { filename: 'credentials.js' });
+  return context.looksLikeCredentialName;
 }
 
 const tests = [];
@@ -924,25 +921,32 @@ test('the compound credential names with no word boundary are covered', () => {
   }
 });
 
-test('the DOM guard and the body scrubber use the same name list', () => {
-  // The two have to agree, or a field is *** in the network log and
-  // plaintext from browser_get_value - which is exactly what happened.
+test('there is one definition of a credential, and the scrubber uses it', async () => {
+  // There were three hand-kept copies - here, in content.js and in the
+  // headless backend - held together by tests that compared their text, and
+  // most of the leaks found were one copy behind another. Now no script may
+  // define its own, and a name the field guard treats as a credential is
+  // scrubbed from captured traffic because both call the same function.
   const contentSource = readFileSync(
     join(here, '..', 'extension', 'content.js'), 'utf8');
-  const fromBackground = SOURCE.match(/const SECRET_KEY_RE =\n  \/(.*)\/i;/)[1];
-  const fromContent = contentSource.match(
-    /const CREDENTIAL_NAME_RE =\n    \/(.*)\/i;/)[1];
-  assert.equal(fromContent, fromBackground,
-    'content.js CREDENTIAL_NAME_RE has drifted from background.js SECRET_KEY_RE');
-
-  // The pattern alone is not the decision: both sides must also normalise
-  // camelCase before testing, or the anchors silently stop matching otpCode,
-  // sessionValue and authData - which is exactly what happened once.
   for (const [where, src] of [['background.js', SOURCE],
                               ['content.js', contentSource]]) {
-    assert.match(src, /replace\(\/\(\[a-z0-9\]\)\(\[A-Z\]\)\/g, '\$1_\$2'\)/,
-      `${where} must normalise camelCase before matching a credential name`);
+    for (const own of [/CREDENTIAL_NAME_RE\s*=/, /SECRET_KEY_RE\s*=/,
+                       /CREDENTIAL_AUTOCOMPLETE_TOKENS\s*=/,
+                       /function looksLikeCredentialName\b/,
+                       /function isPasswordField\b/]) {
+      assert.doesNotMatch(src, own, `${where} defines its own ${own}`);
+    }
   }
+  const { command, webRequest } = loadBackground();
+  await command('startLogging', {}, 7);
+  fireRequest(webRequest, {
+    method: 'POST', url: 'https://app.test/save',
+    requestBody: { formData: { recoveryCodes: ['SHARED-DEF-1'], q: ['x'] } }
+  });
+  const entry = (await command('getNetworkLogs', {}, 7)).logs[0];
+  assert.ok(!JSON.stringify(entry).includes('SHARED-DEF-1'),
+            JSON.stringify(entry.requestBody));
 });
 
 test('a credential nested deeper than the walk limit is not logged', async () => {
@@ -1990,8 +1994,7 @@ test('the HTML scrub masks every autocomplete token the field guard knows', asyn
   // The two lists are kept by hand in two files, and the body scrub had
   // already fallen three card-expiry tokens behind. Read the field guard's
   // list and run each token through the real scrub.
-  const contentSource = readFileSync(
-    join(here, '..', 'extension', 'content.js'), 'utf8');
+  const contentSource = CREDENTIALS;
   const block = contentSource.match(
     /CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set\(\[([\s\S]*?)\]\)/);
   assert.ok(block, 'CREDENTIAL_AUTOCOMPLETE_TOKENS moved or was renamed');

@@ -14,6 +14,8 @@ import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, '..', 'extension', 'content.js'), 'utf8');
+// Loaded ahead of SOURCE into the same context, as the manifest does.
+const CREDENTIALS = readFileSync(join(here, '..', 'extension', 'credentials.js'), 'utf8');
 
 function makeElement(tag, props = {}) {
   // Only form controls have .value in a real DOM. Giving every element one
@@ -297,6 +299,7 @@ function loadContentScript(registry, { timers } = {}) {
   sandbox.globalThis = sandbox;
 
   const context = createContext(sandbox);
+  runInContext(CREDENTIALS, context, { filename: 'credentials.js' });
   runInContext(SOURCE, context, { filename: 'content.js' });
 
   assert.ok(messageListener, 'content.js must register a runtime.onMessage listener');
@@ -1311,10 +1314,10 @@ test('scroll_and_capture masks a credential field like get_page_info does', asyn
 // The credential guard, against the markup real pages ship.
 //
 // The guard used to look only at input[type=password] and the autocomplete
-// token list, which three normal patterns walk straight past. background.js
-// already scrubbed the same names out of captured HTML with SECRET_KEY_RE,
-// so the extension was masking a field in one result and printing it in
-// another.
+// token list, which three normal patterns walk straight past, while
+// background.js already scrubbed the same names out of captured HTML - so the
+// extension was masking a field in one result and printing it in another.
+// Both now use credentials.js.
 
 test('a shadow-DOM credential host is guarded, not just a bare <input>', async () => {
   // Shoelace, Ionic and Vaadin put the real input in a shadow root, so the

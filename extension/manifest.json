@@ -20,14 +20,14 @@
   ],
 
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["credentials.js", "background.js"],
     "persistent": true
   },
 
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["credentials.js", "content.js"],
       "css": ["content.css"],
       "run_at": "document_end",
       "all_frames": true

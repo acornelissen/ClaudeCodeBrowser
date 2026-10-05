@@ -266,47 +266,10 @@ function redactHeaderList(headers) {
 // verbatim one request earlier. This cannot be complete - a body is arbitrary
 // data - so bodies stay off by default for anything but textual responses and
 // can be disabled entirely with capture_bodies: false.
-// Names that mark a value as a credential. One list, mirrored in
-// extension/content.js's CREDENTIAL_NAME_RE - change one, change the other,
-// and a test pins them together. Match through looksLikeCredentialName(),
-// never directly: it handles camelCase boundaries, which this pattern cannot.
-//
-// Deliberately loose, because over-redacting a log costs less than
-// under-redacting one. The boundaries are the fiddly part and have been got
-// wrong in both directions, so they are spelt out:
-//
-//  - `otp`, `auth` and `session` need only a TRAILING boundary. That excludes
-//    `author`, `authority` and `notPublished`, where a letter follows, while
-//    still allowing `userauth` and `userotp`, where the name ends there.
-//    Requiring a leading boundary too lost exactly those.
-//  - `pass` and `pin` need BOTH, because `bypass`, `compass` and `spin` end
-//    in them. The credential compounds are therefore listed by hand:
-//    `passkey`, `userpass`.
-//  - `ssn` needs NEITHER, because the camelCase step already breaks the words
-//    that made it look dangerous (`className` becomes `class_Name`), while
-//    anchoring it lost `SSNNumber` and `userssn`, which have no boundary.
-//  - `totp`, `hotp` and `sessid` have no boundary at all and are listed.
-const SECRET_KEY_RE =
-  /(pass(?:word|wd|phrase|code|key)|userpass|(?:^|[^a-z])pass(?:[^a-z]|$)|pwd|secret|token|credential|one[-_]?time[-_]?code|[th]?otp(?:[^a-z]|$)|oauth|authorization|authenticat|auth(?:z|n)(?:[^a-z]|$)|auth[-_]?(?:token|key|code|header|secret|data)|auth(?:[^a-z]|$)|api[-_]?key|private[-_]?key|session[-_]?(?:id|token|key|secret|value)|sess[-_]?id|session(?:[^a-z]|$)|sessid|cvv|cvc|card[-_]?number|jwt|bearer|signature|ssn|(?:^|[^a-z])pin(?:[^a-z]|$)|mfa[-_]?code|verification[-_]?code|security[-_]?code|(?:^|[^a-z])cc[-_]?number|credit[-_]?card|(?:^|[^a-z])pin[-_]?code|cookie|recovery[-_]?codes?|backup[-_]?codes?|(?:^|[^a-z])card[-_]?code)/i;
-
-// A credential-shaped NAME, from a JSON key, a form field name or an id.
-//
-// Tested against a copy with camelCase boundaries turned into separators,
-// because the anchors below only recognise a non-letter as a boundary. Without
-// that step, anchoring `auth` to stop it matching `author` also stopped
-// `otpCode`, `sessionValue`, `authData` and `pinCode` matching at all - names
-// the unanchored version did catch. So the anchoring that fixed over-redaction
-// silently introduced ten under-redactions, which is the worse direction.
-// Compound lowercase names have no boundary to find, so the credential ones
-// are listed explicitly: passkey, userpass, authz, authn, oauth.
-function normaliseNameForMatching(name) {
-  return String(name == null ? '' : name)
-    .replace(/([a-z0-9])([A-Z])/g, '$1_$2');
-}
-
-function looksLikeCredentialName(name) {
-  return SECRET_KEY_RE.test(normaliseNameForMatching(name));
-}
+// Names that mark a value as a credential come from credentials.js, which the
+// manifest loads ahead of this file: looksLikeCredentialName() there is the
+// same test the field guard uses, so a name masked in the page is also
+// scrubbed from captured traffic.
 
 // Markup carries credentials in attributes, not just in JSON keys: a
 // server-rendered form with a prefilled password puts it in value="...",
@@ -316,10 +279,14 @@ function looksLikeCredentialName(name) {
 // field.
 // Anchored on the whitespace before the attribute, so data-type="password"
 // on an ordinary field is not read as type="password". The autocomplete
-// tokens are the field guard's (CREDENTIAL_AUTOCOMPLETE_TOKENS in content.js);
-// cc-exp also covers cc-exp-month and cc-exp-year, which were missing here.
-const SECRET_INPUT_RE =
-  /\stype\s*=\s*["']?(password|hidden)|\sautocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp)/i;
+// tokens are built from the field guard's own list: a hand-kept copy here had
+// fallen three card-expiry tokens behind it.
+const SECRET_INPUT_RE = new RegExp(
+  `\\stype\\s*=\\s*["']?(password|hidden)` +
+  `|\\sautocomplete\\s*=\\s*["'][^"']*(` +
+  [...CREDENTIAL_AUTOCOMPLETE_TOKENS]
+    .map(token => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") +
+  ")", "i");
 
 // Two readings of where an opening tag ends, and the scrub runs with both.
 // Stepping over quoted values catches a '>' inside one (data-x="a>b"), which
