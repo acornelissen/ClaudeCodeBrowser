@@ -315,9 +315,11 @@ function looksLikeCredentialName(name) {
 // while browser_get_page_info was correctly returning "***" for the same
 // field.
 // Anchored on the whitespace before the attribute, so data-type="password"
-// on an ordinary field is not read as type="password".
+// on an ordinary field is not read as type="password". The autocomplete
+// tokens are the field guard's (CREDENTIAL_AUTOCOMPLETE_TOKENS in content.js);
+// cc-exp also covers cc-exp-month and cc-exp-year, which were missing here.
 const SECRET_INPUT_RE =
-  /\stype\s*=\s*["']?(password|hidden)|\sautocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc)/i;
+  /\stype\s*=\s*["']?(password|hidden)|\sautocomplete\s*=\s*["'][^"']*(current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp)/i;
 
 // Two readings of where an opening tag ends, and the scrub runs with both.
 // Stepping over quoted values catches a '>' inside one (data-x="a>b"), which

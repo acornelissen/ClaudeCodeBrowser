@@ -1953,6 +1953,11 @@ test('the HTML scrub holds up against ordinary variations in markup', async () =
     // stop the tag being matched at all.
     'unbalanced quote': ['<input name="otp value="S-NINE">', 'S-NINE'],
     'unbalanced quote, textarea': ['<textarea name="otp x="y>S-TEN</textarea>', 'S-TEN'],
+    // Card expiry, by autocomplete token only: the DOM guard knew these
+    // three and the body scrub did not.
+    'cc-exp': ['<input name="e" autocomplete="cc-exp" value="EXP-ONE">', 'EXP-ONE'],
+    'cc-exp-month': ['<input name="m" autocomplete="cc-exp-month" value="EXP-TWO">', 'EXP-TWO'],
+    'cc-exp-year': ['<input name="y" autocomplete="billing cc-exp-year" value="EXP-THREE">', 'EXP-THREE'],
   };
   const ordinary = {
     'data-name is not a name': ['<input data-name="password" name="q" value="ORD-ONE">', 'ORD-ONE'],
@@ -1978,6 +1983,33 @@ test('the HTML scrub holds up against ordinary variations in markup', async () =
   for (const [label, [html, value]] of Object.entries(ordinary)) {
     const body = await scrub(html);
     assert.ok(body.includes(value), `${label} was masked: ${body}`);
+  }
+});
+
+test('the HTML scrub masks every autocomplete token the field guard knows', async () => {
+  // The two lists are kept by hand in two files, and the body scrub had
+  // already fallen three card-expiry tokens behind. Read the field guard's
+  // list and run each token through the real scrub.
+  const contentSource = readFileSync(
+    join(here, '..', 'extension', 'content.js'), 'utf8');
+  const block = contentSource.match(
+    /CREDENTIAL_AUTOCOMPLETE_TOKENS = new Set\(\[([\s\S]*?)\]\)/);
+  assert.ok(block, 'CREDENTIAL_AUTOCOMPLETE_TOKENS moved or was renamed');
+  const tokens = [...block[1].matchAll(/'([^']+)'/g)].map(m => m[1]);
+  assert.ok(tokens.length >= 8, `only found ${tokens.length} tokens`);
+  for (const token of tokens) {
+    const { command, webRequest, filters } = loadBackground();
+    await command('startLogging', { includeAllTypes: true }, 7);
+    fireRequest(webRequest, {
+      responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+      complete: false
+    });
+    filters[0].ondata({ data: new TextEncoder().encode(
+      `<input name="f" autocomplete="${token}" value="TOKEN-SECRET">`) });
+    filters[0].onstop();
+    webRequest.onCompleted.fire({ requestId: '1', tabId: 7, statusCode: 200 });
+    const body = (await command('getNetworkLogs', {}, 7)).logs[0].responseBody;
+    assert.ok(!body.includes('TOKEN-SECRET'), `${token} was not scrubbed: ${body}`);
   }
 });
 
