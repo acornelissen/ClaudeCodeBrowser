@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -731,6 +732,46 @@ class AuditLogTests(unittest.TestCase):
         mode = safety._AUDIT_FILE.stat().st_mode & 0o777
         self.assertEqual(mode & 0o077, 0,
                          f'audit log is a browsing history: {oct(mode)}')
+
+    def test_the_audit_file_rotates_at_its_cap(self):
+        """It had no cap of any kind, and every tool call writes a line."""
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = Path(tmp) / 'audit.jsonl'
+            with unittest.mock.patch.object(safety, '_AUDIT_FILE', audit), \
+                    unittest.mock.patch.object(safety, '_AUDIT_MAX_BYTES', 2000):
+                g = guard()
+                for _ in range(100):
+                    g.check('browser_get_text', {})
+                backup = audit.with_suffix('.jsonl.1')
+                self.assertTrue(backup.exists(), 'nothing was rotated')
+                for path in (audit, backup):
+                    with self.subTest(file=path.name):
+                        # One entry may land after the size check.
+                        self.assertLess(path.stat().st_size, 2000 + 1000)
+                        self.assertEqual(path.stat().st_mode & 0o077, 0)
+
+    def test_the_audit_cap_is_a_few_megabytes(self):
+        """The test above shrinks the cap to see it work, so it cannot tell
+        whether the real one is a cap at all."""
+        self.assertLessEqual(safety._AUDIT_MAX_BYTES, 10 * 1024 * 1024)
+
+
+class PendingTokenCapTests(unittest.TestCase):
+    """Every protected call the agent makes issues a token. Without a cap the
+    table grows for as long as the agent keeps asking."""
+
+    def test_the_table_never_holds_more_than_the_cap(self):
+        # A fixed count, not one derived from the cap: a cap raised to a
+        # billion should fail this test, not make it loop a billion times.
+        g = guard()
+        tokens = [g._issue_token('browser_click', f'fp{i}')
+                  for i in range(40)]
+        self.assertEqual(len(g._pending_tokens), 32)
+        self.assertFalse(g._consume_token(tokens[0], 'fp0'),
+                         'the oldest token should have been dropped')
+        last = len(tokens) - 1
+        self.assertTrue(g._consume_token(tokens[last], f'fp{last}'),
+                        'the newest token must still work')
 
 
 if __name__ == '__main__':

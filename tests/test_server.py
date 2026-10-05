@@ -89,6 +89,38 @@ class CredentialGuardPlumbingTests(unittest.TestCase):
         handler.execute_tool(tool_name, {'selector': '#pw'})
         return captured.get('arguments', {})
 
+    def test_the_flag_survives_the_trip_to_the_extension(self):
+        """The extension reads camelCase. A flag lost on the way fails
+        closed, but silently: allow_password_typing: true just stops
+        working, with nothing to say why."""
+        sent = []
+
+        async def fake_send(command, timeout=30.0):
+            sent.append(command)
+            return {'success': True}
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(loop.call_soon_threadsafe, loop.stop)
+        guard = server.get_safety_guard()
+        handler = server.MCPHTTPHandler.__new__(server.MCPHTTPHandler)
+        with unittest.mock.patch.dict(guard.config,
+                                      {'allow_password_typing': True}), \
+                unittest.mock.patch.object(server, 'HEADLESS_MODE', False), \
+                unittest.mock.patch.object(server, 'MAIN_EVENT_LOOP', loop), \
+                unittest.mock.patch.object(
+                    server.connection_manager, 'get_active_browser',
+                    lambda: object()), \
+                unittest.mock.patch.object(
+                    server.connection_manager, 'send_command', fake_send):
+            handler.execute_tool('browser_type',
+                                 {'selector': '#pw', 'text': 'x'})
+
+        self.assertEqual(len(sent), 1)
+        self.assertIs(sent[0].data.get('allowPassword'), True, sent[0].data)
+
     def test_read_and_write_tools_all_carry_the_password_flag(self):
         for tool in self.PASSWORD_AWARE_TOOLS:
             with self.subTest(tool=tool):
@@ -862,6 +894,19 @@ class ScreenshotSaveFlagTests(unittest.TestCase):
             {'success': True, 'data': self.PNG, 'tab': {'id': 1}},
             {'filename': self.name})
         self.assertTrue(self.path.exists())
+
+    def test_a_written_screenshot_is_private_to_the_user(self):
+        """The directory is 0700, but the file asks for 0600 as well, so a
+        copy or a looser directory does not expose what was on screen. Set a
+        permissive umask, or the umask alone would make this pass."""
+        old_umask = os.umask(0o022)
+        try:
+            self.handler._save_screenshot(
+                {'success': True, 'data': self.PNG, 'tab': {'id': 1}},
+                {'filename': self.name})
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(self.path.stat().st_mode & 0o077, 0)
 
     def test_a_filename_of_only_directory_components_is_replaced(self):
         """Path('..').name is '..', so this resolved to the parent directory
