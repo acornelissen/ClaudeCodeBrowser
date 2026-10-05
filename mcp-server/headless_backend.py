@@ -387,7 +387,7 @@ class HeadlessBrowser:
 
         The whole read happens in the page, including the decision, so the
         unscrubbed text never crosses into this process - the same reason the
-        read mask asks `!!el.value` instead of pulling the value out. This
+        read mask asks whether the field is filled instead of pulling the value out. This
         used to be a bare page.inner_text() with no guard of any kind, so
         browser_get_text on a contenteditable credential returned the code in
         clear where attended mode returns '***'.
@@ -565,6 +565,15 @@ class HeadlessBrowser:
                     'no element' in message.lower():
                 return False
             raise CredentialProbeFailed(message) from e
+
+    # Whether a credential field holds anything, asked in the page so the
+    # value never crosses into this process. .value when the element has
+    # one, its text otherwise: a contenteditable credential has no .value,
+    # so asking !!el.value called a filled one empty. Mirrors
+    # holdsEnteredText in content.js.
+    _FILLED_JS = ("el => { const raw = ('value' in el) ? el.value : "
+                  "el.textContent; return raw !== undefined && raw !== null "
+                  "&& String(raw).length > 0; }")
 
     @classmethod
     def _focused_credential_js(cls) -> str:
@@ -1014,7 +1023,7 @@ class HeadlessBrowser:
                 # emptiness test runs in the page, so the credential itself
                 # never crosses into this process.
                 filled = bool(await page.eval_on_selector(
-                    selector, 'el => !!el.value'))
+                    selector, self._FILLED_JS))
                 return {
                     'success': True,
                     'value': '***' if filled else None,
@@ -1195,7 +1204,8 @@ class HeadlessBrowser:
                 'success': True,
                 'text': text[:max_length],
                 'truncated': len(text) > max_length,
-                'total_length': len(text),
+                # The extension's name for it, so one caller reads both modes.
+                'totalLength': len(text),
                 'source': read.get('source'),
                 'url': page.url
             }

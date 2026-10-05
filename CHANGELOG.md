@@ -11,6 +11,19 @@ are his releases. 1.5.0 onwards are from the fork at
 
 ## [Unreleased]
 
+### Fixed
+- **A masked read says whether the field is filled again.** In Firefox,
+  `browser_get_value` answered `***` for an empty credential field too, and
+  in both modes a filled contenteditable credential read as empty, because
+  only `.value` was checked. Filled now reads `***`, empty reads `null`.
+- **Context-menu screenshots fall under retention.** The native host created
+  a custom screenshots directory without the marker the server prunes by,
+  and kept non-`.png` names, so those files were never removed.
+- Headless `browser_get_text` reports `totalLength`, as Firefox does, instead
+  of `total_length`.
+- The MCP wrapper reported version 1.0.0; a test now holds every version
+  string to the manifest. The unused `mcp_config.json` is gone.
+
 ### Security
 - **Old installs keep an old, weaker `.gov` pattern.** `safety.json` is
   written once, at first run, so the `\.gov(/|$)` default that shipped from

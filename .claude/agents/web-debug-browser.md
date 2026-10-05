@@ -72,8 +72,8 @@ You have access to the ClaudeCodeBrowser MCP tooling at localhost:8765, which pr
 - **browser_highlight**: Visually highlight an element on the page
 - **browser_wait_for_element**: Wait for an element to appear
 - **browser_get_value**: Get input/select values. Credential and hidden
-  fields come back as `***` with `masked: true` — the guard covers reads, not
-  just writes
+  fields come back as `***` (or `null` when empty) with `masked: true` — the
+  guard covers reads, not just writes
 - **browser_set_value**: Set input values directly (refuses password fields)
 
 ### Tab Management
@@ -259,12 +259,13 @@ You serve as a delegate for browser operations. When called by other agents:
 - `browser_navigate` resolves when the load completes, whatever the HTTP
   status; a 404 or an error page is still "success". Confirm the content.
 - Results are truncated: `browser_get_text` reports `truncated` and
-  `totalLength` (`total_length` in headless), `browser_get_page_info` reports
+  `totalLength`, `browser_get_page_info` reports
   `interactiveElementsTruncated`, and captured bodies are capped. Do not
   conclude something is absent from a truncated result.
-- Password, one-time-code, card and hidden fields read back as `***`. That is
-  the guard working; in Firefox `browser_get_value` returns it whether or not
-  the field is filled. It also covers a field whose `name` or `id` looks like
+- Password, one-time-code, card and hidden fields read back as `***` when
+  filled and `null` when empty, with `masked: true` either way. That is the
+  guard working, and it still tells you whether the field is filled. It also
+  covers a field whose `name` or `id` looks like
   a credential (`passwd`, `cvv`, `otp`, `ssn`, `mfaCode`, `recoveryCodes`,
   `cardCode`) and a custom element with `type="password"`, so `***` can come
   from an ordinary text input.

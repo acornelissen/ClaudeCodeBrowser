@@ -463,12 +463,20 @@
   // The single place that decides what an element's value looks like to the
   // agent. Every reader goes through this so a new reader cannot reintroduce
   // the getPageInfo leak.
+  // Whether a credential field holds anything, without reading it out. A
+  // contenteditable has no .value, so judging by .value alone called a
+  // filled one empty.
+  function holdsEnteredText(element) {
+    const raw = 'value' in element ? element.value : element.textContent;
+    return raw !== undefined && raw !== null && String(raw).length > 0;
+  }
+
   function safeElementValue(element, limit, options) {
     if (element && isPasswordField(element) && !passwordAllowed(options)) {
-      return element.value ? '***' : null;
+      return holdsEnteredText(element) ? '***' : null;
     }
     if (element && isConcealedValueField(element) && !passwordAllowed(options)) {
-      return element.value ? '***' : null;
+      return holdsEnteredText(element) ? '***' : null;
     }
     // .value is not always a string: it is an IDL number on <li>, <progress>
     // and <meter> (0 for an <li> outside an <ol>) and on custom elements
@@ -1723,7 +1731,9 @@
     // contenteditable field is just as much a credential holder as an input.
     if (isConcealedValueField(element) && !passwordAllowed(options)) {
       return {
-        value: '***',
+        // null for an empty field, as headless and safeElementValue answer:
+        // '***' for both made an empty field look filled.
+        value: holdsEnteredText(element) ? '***' : null,
         masked: true,
         note: 'Credential field value withheld (password, one-time code, card ' +
               'or hidden field). Set "allow_password_typing": true in ' +

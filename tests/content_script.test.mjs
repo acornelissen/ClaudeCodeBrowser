@@ -16,12 +16,17 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SOURCE = readFileSync(join(here, '..', 'extension', 'content.js'), 'utf8');
 
 function makeElement(tag, props = {}) {
+  // Only form controls have .value in a real DOM. Giving every element one
+  // made a contenteditable <div> look like it had an empty value, so code
+  // that reads .value when it exists and text otherwise was never tested.
+  const hasValue = ['input', 'textarea', 'select'].includes(tag.toLowerCase())
+    || 'value' in props;
   const el = {
+    ...(hasValue ? { value: props.value } : {}),
     tagName: tag.toUpperCase(),
     id: props.id || '',
     name: props.name || '',
     type: props.type,
-    value: props.value,
     className: props.className || '',
     classList: props.className ? props.className.split(/\s+/) : [],
     textContent: props.textContent || '',
@@ -1003,6 +1008,28 @@ test('typing is paced to finish inside the server\'s wait', async () => {
   await ctx.send({ action: 'type', selector: '#q', text: 'abc' });
   assert.equal(waits.filter(ms => ms === 50).length, 3,
     `expected three 50ms keystrokes, waited ${JSON.stringify(waits)}`);
+});
+
+test('a masked read still says whether the field is filled', async () => {
+  // Masking rather than refusing exists so the caller can tell a filled
+  // credential field from an empty one. getValue answered '***' for an
+  // empty one too, and the filled test looked only at .value, which a
+  // contenteditable credential does not have.
+  const cases = {
+    'empty password': [makeElement('input', { id: 'f', type: 'password', value: '' }), null],
+    'filled password': [makeElement('input', { id: 'f', type: 'password', value: 'hunter2' }), '***'],
+    'filled contenteditable': [Object.assign(makeElement('div', { id: 'otp-code', contenteditable: 'true' }), { textContent: '482913', isContentEditable: true }), '***'],
+    'empty contenteditable': [Object.assign(makeElement('div', { id: 'otp-code', contenteditable: 'true' }), { textContent: '', isContentEditable: true }), null],
+  };
+  for (const [label, [element, expected]] of Object.entries(cases)) {
+    const selector = '#' + element.id;
+    const { send } = loadContentScript({ [selector]: element });
+    const result = await send({ action: 'getValue', selector });
+    assert.equal(result.masked, true, `${label}: not masked`);
+    assert.equal(result.value, expected, `${label}: ${JSON.stringify(result.value)}`);
+    assert.ok(!JSON.stringify(result).includes('hunter2') &&
+              !JSON.stringify(result).includes('482913'), `${label} leaked`);
+  }
 });
 
 test('set_value reports a reformatted value as set, not as a failure', async () => {

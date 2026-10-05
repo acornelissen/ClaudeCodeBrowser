@@ -927,7 +927,7 @@ class FakePage:
             return el.value
         # The read mask asks whether a credential field is filled without
         # pulling the value out of the page, so the fake answers that too.
-        if script == 'el => !!el.value':
+        if script == HeadlessBrowser._FILLED_JS:
             return bool(el.value)
         return None
 
@@ -2129,6 +2129,33 @@ class FocusedFrameTests(unittest.TestCase):
     def test_outside_a_frame_nothing_changes(self):
         self.assertTrue(self.probe(spec(tag='INPUT', input_type='password')))
         self.assertFalse(self.probe(spec(tag='INPUT', input_type='text')))
+
+
+@requires_node
+class FilledCheckTests(unittest.TestCase):
+    """A masked getValue answers '***' for a filled credential field and
+    null for an empty one, so the caller can tell them apart. The check
+    asked !!el.value, and a contenteditable credential has no .value - so a
+    filled one read as empty."""
+
+    def run_check(self, spec):
+        harness = (
+            "const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+            "const check = eval('(' + input.script + ')');"
+            "process.stdout.write(JSON.stringify(check(input.el)));")
+        return _run_node(harness, {'script': HeadlessBrowser._FILLED_JS,
+                                   'el': spec})
+
+    def test_filled_and_empty_are_told_apart(self):
+        cases = {
+            'filled input': ({'value': 'hunter2'}, True),
+            'empty input': ({'value': ''}, False),
+            'filled contenteditable': ({'textContent': '482913'}, True),
+            'empty contenteditable': ({'textContent': ''}, False),
+        }
+        for label, (spec, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertIs(self.run_check(spec), expected)
 
 
 @requires_node
@@ -3396,7 +3423,9 @@ class SimpleActionTests(unittest.IsolatedAsyncioTestCase):
                                          {'selector': '#p', 'max_length': 10})
         self.assertEqual(len(result['text']), 10)
         self.assertTrue(result['truncated'])
-        self.assertEqual(result['total_length'], 50)
+        self.assertEqual(result['totalLength'], 50)
+        self.assertNotIn('total_length', result,
+                         'the extension calls it totalLength; one name for both modes')
 
     async def test_get_text_untruncated(self):
         browser, page = make_browser(elements={'#p': Element(value='short')})
