@@ -712,6 +712,21 @@ class AuditLogTests(unittest.TestCase):
         self.assertEqual(entry['url'],
                          'https://intranet.example.com/wiki/Home')
 
+    def test_the_tracked_page_is_redacted_when_the_call_names_no_url(self):
+        """Most calls (click, type, read) carry no url argument, so the
+        entry's url field is the tracked current page. That is a URL the
+        browser reported, reset token and all, and it needs the same
+        reduction as one the agent sent."""
+        g = guard()
+        g.note_url({'url': 'https://x.test/reset'
+                           '?token=TRACKED-RESET-T0KEN#frag-T0KEN'})
+        g.check('browser_click', {'selector': '#a'})
+        self.assertEqual(self._last_entry()['url'],
+                         'https://x.test/reset?***#***')
+        written = safety._AUDIT_FILE.read_text()
+        self.assertNotIn('TRACKED-RESET-T0KEN', written)
+        self.assertNotIn('frag-T0KEN', written)
+
     def test_a_query_and_a_fragment_are_reduced_to_a_marker(self):
         g = guard()
         g.check('browser_navigate',
