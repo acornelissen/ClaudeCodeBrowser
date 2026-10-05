@@ -99,7 +99,13 @@ def describe_message(message):
         parts.append('error=yes')
     data = message.get('data')
     if isinstance(data, dict):
-        parts.append(f'data_keys={sorted(data.keys())}')
+        # A command's keys are our own argument names. A response's come from
+        # the page (a script can return a copy of localStorage), so only count
+        # them.
+        if 'action' in message:
+            parts.append(f'data_keys={sorted(data.keys())}')
+        else:
+            parts.append(f'data_keys={len(data)}')
     for key in ('data', 'result', 'text', 'logs', 'elements'):
         value = message.get(key)
         if isinstance(value, str):

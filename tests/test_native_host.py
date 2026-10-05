@@ -269,6 +269,17 @@ class DescribeMessageTests(unittest.TestCase):
         self.assertIn("'text'", summary)
         self.assertIn("'selector'", summary)
 
+    def test_a_response_data_dict_is_logged_as_a_count(self):
+        """A command's data keys are our own argument names. A response's
+        come from the page - a script returning a copy of localStorage makes
+        every key a stored name, and some of those are secrets."""
+        summary = host.describe_message({
+            'requestId': 'r1', 'success': True,
+            'data': {self.SECRET: 'x', 'session_token_name': 'y'}})
+        self.assertNoSecret(summary)
+        self.assertNotIn('session_token_name', summary)
+        self.assertIn('data_keys=2', summary)
+
     def test_page_text_is_logged_as_a_length(self):
         body = f'<page body with {self.SECRET}>'
         summary = host.describe_message(
