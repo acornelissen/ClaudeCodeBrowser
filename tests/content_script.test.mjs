@@ -1228,6 +1228,75 @@ test('ordinary fields are not swept up by the name guard', async () => {
   }
 });
 
+test('the DOM name guard matches the same credential names as background.js', async () => {
+  // background.js pins its copy of this name rule with a list taken from
+  // names real systems use; this one only had a source grep, so a change
+  // that lowercased the name before splitting camelCase (otpCode -> otpcode,
+  // which the anchored otp rule no longer sees) passed every test here while
+  // get_value read the field in clear. The lists mirror the ones in
+  // background_script.test.mjs - change one, change the other.
+  const credentials = [
+    'password', 'passwd', 'passphrase', 'passcode', 'pass', 'pwd',
+    'user[password]', 'userpass',
+    'passkey', 'passKey',
+    'one-time-code', 'otp', 'otp_code', 'otpCode', 'otpValue',
+    'authorization', 'Authorization', 'authentication', 'auth', 'x-auth',
+    'auth_token', 'authToken', 'authData', 'authz', 'authn',
+    'oauth', 'oauth_verifier',
+    'secret', 'client_secret', 'token', 'access_token', 'refresh_token',
+    'credential', 'api_key', 'apiKey', 'private_key', 'jwt', 'bearer',
+    'signature',
+    'session', 'session_id', 'sessionToken', 'sessionValue',
+    'JSESSIONID', 'PHPSESSID',
+    'cvv', 'cvc', 'card_number', 'cardNumber', 'ssn', 'pin', 'PIN', 'pinCode'
+  ];
+  for (const name of credentials) {
+    const el = makeElement('input', { id: 'f', name, type: 'text', value: 'hunter2' });
+    const { send } = loadContentScript({ '#f': el });
+    const result = await send({ action: 'getValue', selector: '#f' });
+    assert.equal(result.value, '***', `name="${name}" must be masked`);
+    assert.ok(!JSON.stringify(result).includes('hunter2'),
+      `name="${name}" leaked its value`);
+  }
+
+  // The ordinary side matters as much: without the camelCase split,
+  // className and businessName read as cla-SSN-ame and get masked.
+  const ordinary = [
+    'author', 'authors', 'authored', 'passed', 'passenger', 'bypass',
+    'bypassCache', 'compass', 'notPublished', 'shipping', 'mapping',
+    'spinner', 'pinned',
+    'className', 'classNames', 'businessName', 'addressName', 'witnessName',
+    'accessName', 'guessNumber',
+    'email', 'username', 'title', 'views', 'published', 'tags', 'id', 'name',
+    'search'
+  ];
+  for (const name of ordinary) {
+    const el = makeElement('input', { id: 'f', name, type: 'text', value: 'plain' });
+    const { send } = loadContentScript({ '#f': el });
+    const result = await send({ action: 'getValue', selector: '#f' });
+    assert.equal(result.value, 'plain', `name="${name}" is not a credential`);
+    assert.notEqual(result.masked, true);
+  }
+});
+
+test('writing to a camelCase credential name is refused', async () => {
+  // The write side goes through the same rule. These are the names that
+  // only match once camelCase is split, so they are the ones a regression
+  // in the normalisation would let an agent type a credential into.
+  for (const name of ['otpCode', 'otpValue', 'pinCode']) {
+    const field = makeElement('input', { id: 'f', name, type: 'text', value: '' });
+    const { send } = loadContentScript({ '#f': field });
+
+    const typed = await send({ action: 'type', selector: '#f', text: '482913' });
+    assert.equal(typed.success, false, `typing into name="${name}" must be refused`);
+    assert.match(typed.error, /password field/i);
+
+    const set = await send({ action: 'setValue', selector: '#f', value: '482913' });
+    assert.equal(set.success, false, `setValue on name="${name}" must be refused`);
+    assert.equal(field.value, '', `name="${name}" was written to`);
+  }
+});
+
 test('ordinary page text is not masked by the name guard', async () => {
   // The name/id rule is for fields, not for every element that happens to
   // have "session" or "auth" in its id.
