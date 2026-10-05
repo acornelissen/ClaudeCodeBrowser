@@ -1123,6 +1123,27 @@ class CredentialGuardFocusedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Refused', str(ctx.exception))
         self.assertEqual(calls_named(page, 'keyboard.press'), [])
 
+    async def test_press_key_allow_password_must_be_exactly_true(self):
+        """The same fail-closed rule as type and get_value. A truthy check
+        here would let "false" from a hand-written config enter a credential
+        one key at a time, on both the selector and the focused path."""
+        for value in ['true', 'True', 'yes', 1, 1.0, {}, [1], 'false', object()]:
+            with self.subTest(allow_password=value, path='selector'):
+                browser, page = make_browser(
+                    elements={'#pw': Element(input_type='password')})
+                with self.assertRaises(RuntimeError):
+                    await browser._dispatch('pressKey', None, {
+                        'selector': '#pw', 'key': 'a',
+                        'allow_password': value})
+                self.assertEqual(calls_named(page, 'keyboard.press'), [])
+            with self.subTest(allow_password=value, path='focused'):
+                browser, page = make_browser(
+                    active=Element(input_type='password'))
+                with self.assertRaises(RuntimeError):
+                    await browser._dispatch('pressKey', None, {
+                        'key': 'a', 'allow_password': value})
+                self.assertEqual(calls_named(page, 'keyboard.press'), [])
+
     async def test_press_key_allows_navigation_keys(self):
         browser, page = make_browser(elements={'#q': Element()})
         result = await browser._dispatch(
