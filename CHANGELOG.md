@@ -9,6 +9,23 @@ ClaudeCodeBrowser was created by Andre Watson
 are his releases. 1.5.0 onwards are from the fork at
 <https://github.com/acornelissen/ClaudeCodeBrowser>.
 
+## [Unreleased]
+
+### Security
+- **Headless typed into password fields inside web components.** The
+  focused-field check stopped at the shadow host, so a `<my-login>` wrapping
+  `<input type=password>` passed it, and `browser_type` and
+  `browser_press_key` with no selector typed into the password field
+  (confirmed in real Chromium). The check now follows shadow roots and frames.
+- **Captured traffic:** a relative redirect's path parameters
+  (`Location: /cb;code=...`) were logged in clear, and a `>` inside a quoted
+  attribute (`data-x="a>b"`) hid the rest of a tag, including the `name` that
+  marks it as a credential, from the HTML scrub.
+
+### Fixed
+- `data-type="password"` on an ordinary field no longer gets its value masked
+  in captured HTML.
+
 ## [1.9.2]
 
 ### Fixed
