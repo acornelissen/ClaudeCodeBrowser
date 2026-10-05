@@ -1010,6 +1010,28 @@ class SlashRunTests(unittest.TestCase):
         self.assertNotIn('alice', logged)
 
 
+class NonStringUrlTests(unittest.TestCase):
+    """The schema says url is a string, but the agent writes the JSON. A
+    dict or list was not judged as a target at all - the guard checked the
+    current page instead - and was then forwarded to the browser unchecked."""
+
+    def test_a_non_string_url_is_refused(self):
+        g = guard(blocked_url_patterns=[r'evil\.com'])
+        g.note_url({'url': 'https://example.com/'})
+        for value in ({'href': 'https://evil.com/'}, ['https://evil.com/'], 7):
+            with self.subTest(url=value):
+                denial = g.check('browser_navigate', {'url': value})
+                self.assertIsNotNone(denial, 'judged against the current page')
+                self.assertEqual(denial['safety_decision'], 'invalid_url')
+
+    def test_no_url_still_means_the_current_page(self):
+        g = guard()
+        g.note_url({'url': 'https://example.com/'})
+        self.assertIsNone(g.check('browser_click', {'selector': '#a'}))
+        self.assertIsNone(g.check('browser_click',
+                                  {'selector': '#a', 'url': None}))
+
+
 class PendingTokenCapTests(unittest.TestCase):
     """Every protected call the agent makes issues a token. Without a cap the
     table grows for as long as the agent keeps asking."""

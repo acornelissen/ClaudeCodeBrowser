@@ -750,6 +750,16 @@ class SafetyGuard:
         """
         target_url = self._target_url(arguments)
 
+        # The schema says string, but the agent writes the JSON. A dict or a
+        # list was not judged as a target at all - the current page was
+        # judged instead - and was then forwarded to the browser unchecked.
+        url_arg = arguments.get('url')
+        if url_arg is not None and not isinstance(url_arg, str):
+            denial = self._deny('invalid_url',
+                                f'{tool_name} refused: "url" must be a string.')
+            self._audit(tool_name, arguments, None, 'invalid_url')
+            return denial
+
         # enabled: false turns off policy, not the scheme allowlist. Letting
         # one config key re-enable file:// and javascript: navigation is not a
         # policy choice anyone would make deliberately.
