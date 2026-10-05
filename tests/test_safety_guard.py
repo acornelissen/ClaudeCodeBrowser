@@ -1004,6 +1004,16 @@ class SlashRunTests(unittest.TestCase):
                 self.assertEqual(denial['safety_decision'],
                                  'confirmation_required')
 
+    def test_only_the_scheme_at_the_start_is_rewritten(self):
+        """Unanchored, the rewrite also hit "http:" inside the userinfo:
+        https://x:http:pw@evil.com/ became https://x://pw@evil.com/, whose
+        host reads as x - past an anchored blocklist, password in the log."""
+        url = 'https://x:http:pw@evil.com/'
+        g = guard(blocked_url_patterns=[r'^https?://(www\.)?evil\.com'])
+        self.assertEqual(g.check('browser_navigate', {'url': url})
+                         ['safety_decision'], 'blocked_url')
+        self.assertNotIn('pw', safety.redact_url(url))
+
     def test_userinfo_after_extra_slashes_is_not_logged(self):
         logged = safety.redact_url('https:///alice:hunter2@intranet.example/')
         self.assertNotIn('hunter2', logged)
@@ -1023,6 +1033,30 @@ class NonStringUrlTests(unittest.TestCase):
                 denial = g.check('browser_navigate', {'url': value})
                 self.assertIsNotNone(denial, 'judged against the current page')
                 self.assertEqual(denial['safety_decision'], 'invalid_url')
+
+    def test_empty_and_falsy_non_strings_are_refused_too(self):
+        g = guard()
+        g.note_url({'url': 'https://example.com/'})
+        for value in ({}, [], 0, False):
+            with self.subTest(url=value):
+                denial = g.check('browser_navigate', {'url': value})
+                self.assertIsNotNone(denial)
+                self.assertEqual(denial['safety_decision'], 'invalid_url')
+
+    def test_refused_even_with_the_guard_disabled(self):
+        """enabled: false turns off policy, not the checks that keep a
+        malformed target away from the browser."""
+        g = guard(enabled=False)
+        denial = g.check('browser_navigate', {'url': ['javascript:alert(1)']})
+        self.assertIsNotNone(denial)
+        self.assertEqual(denial['safety_decision'], 'invalid_url')
+
+    def test_the_refusal_is_audited(self):
+        g = guard()
+        g.check('browser_navigate', {'url': {'href': 'https://x.test/'}})
+        last = json.loads(
+            safety._AUDIT_FILE.read_text().strip().splitlines()[-1])
+        self.assertEqual(last['decision'], 'invalid_url')
 
     def test_no_url_still_means_the_current_page(self):
         g = guard()
