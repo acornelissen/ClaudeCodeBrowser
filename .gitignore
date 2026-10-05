@@ -42,3 +42,10 @@ mise.local.toml
 
 # web-ext build state (AMO upload UUID)
 extension/.amo-upload-uuid
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
