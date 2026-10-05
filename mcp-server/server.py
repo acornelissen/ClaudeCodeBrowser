@@ -1139,8 +1139,10 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
         if not provided:
             return False
         # compare_digest, as the WebSocket handshake already uses: == leaks the
-        # position of the first differing byte.
-        return secrets.compare_digest(provided, API_TOKEN)
+        # position of the first differing byte. Bytes, not str: on a non-ASCII
+        # str it raises TypeError, which dropped the connection with no 403.
+        return secrets.compare_digest(provided.encode('utf-8'),
+                                      API_TOKEN.encode('utf-8'))
 
     def do_OPTIONS(self):
         """Reject CORS preflight: no cross-origin access is needed or allowed."""

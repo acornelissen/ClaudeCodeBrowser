@@ -16,6 +16,8 @@ import threading
 import time
 import unittest
 import unittest.mock
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Point HOME at a throwaway directory before importing the server: it creates
@@ -445,6 +447,191 @@ class WebSocketOriginTests(unittest.TestCase):
 
         self.assertEqual(captured.get('origins'), origins,
                          'the handshake check is only real if serve() gets it')
+
+
+def _wrong_keys():
+    token = server.API_TOKEN
+    return {
+        'missing': None,
+        'empty': '',
+        'last character changed': token[:-1] + ('1' if token[-1] == '0' else '0'),
+        'prefix': token[:10],
+        'token plus a suffix': token + '0',
+        # http.server decodes headers as latin-1, and compare_digest raises
+        # TypeError on a non-ASCII str rather than returning False.
+        'non-ascii': '\xff' * len(token),
+    }
+
+
+class HttpAuthTests(unittest.TestCase):
+    """The token is full control of the user's browser. Every other HTTP test
+    stubs _check_auth out, so a mutation run found the suite stayed green with
+    authentication switched off, and with the token reduced to a prefix
+    oracle. These drive the real handler over a real socket."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.httpd = server.ThreadingHTTPServer(('127.0.0.1', 0),
+                                               server.MCPHTTPHandler)
+        cls.httpd.daemon_threads = True
+        cls.base = f'http://127.0.0.1:{cls.httpd.server_address[1]}'
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def request(self, method, path, key=None, body=None):
+        req = urllib.request.Request(self.base + path, method=method, data=body)
+        if key is not None:
+            req.add_header('X-API-Key', key)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except ConnectionError:
+                # A refused POST is answered before its body is read, so the
+                # close can arrive as a reset after the status line. The
+                # status is what these tests are about.
+                body = b''
+            return e.code, e.headers, body
+
+    def test_the_real_key_is_accepted(self):
+        """Without this the refusals below could pass against a server that
+        refuses everyone."""
+        status, _, body = self.request('GET', '/mcp/tools', server.API_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertIn(b'"tools"', body)
+
+    def test_a_wrong_key_is_refused_on_every_get_endpoint(self):
+        for label, key in _wrong_keys().items():
+            for path in ('/mcp/tools', '/screenshots', '/browser/poll'):
+                with self.subTest(key=label, path=path):
+                    status, _, body = self.request('GET', path, key)
+                    self.assertEqual(status, 403)
+                    self.assertNotIn(b'"tools"', body)
+                    self.assertNotIn(b'"screenshots"', body)
+
+    def test_a_refused_poll_does_not_take_a_queued_command(self):
+        """A process that could poll without the token would read every
+        command meant for the browser, and the browser would never run it."""
+        command = {'action': 'click', 'queuedAt': time.time()}
+        with server._PENDING_COMMANDS_LOCK:
+            self.httpd._pending_commands = [command]
+        try:
+            for label, key in _wrong_keys().items():
+                with self.subTest(key=label):
+                    status, _, body = self.request('GET', '/browser/poll', key)
+                    self.assertEqual(status, 403)
+                    self.assertNotIn(b'click', body)
+            self.assertEqual(self.httpd._pending_commands, [command])
+        finally:
+            with server._PENDING_COMMANDS_LOCK:
+                self.httpd._pending_commands = []
+
+    def test_a_wrong_key_cannot_run_a_tool_or_forge_a_response(self):
+        executed, forged = [], []
+        with unittest.mock.patch.object(
+                server.MCPHTTPHandler, 'execute_tool',
+                lambda self, name, args: executed.append(name) or {}), \
+                unittest.mock.patch.object(
+                    server.connection_manager, 'handle_response',
+                    forged.append):
+            for label, key in _wrong_keys().items():
+                with self.subTest(key=label):
+                    status, _, _ = self.request(
+                        'POST', '/mcp/call', key,
+                        b'{"tool": "browser_navigate", '
+                        b'"arguments": {"url": "https://example.com"}}')
+                    self.assertEqual(status, 403)
+                    status, _, _ = self.request(
+                        'POST', '/browser/response', key,
+                        b'{"requestId": "1", "success": true}')
+                    self.assertEqual(status, 403)
+        self.assertEqual(executed, [])
+        self.assertEqual(forged, [])
+
+    def test_a_cors_preflight_is_refused(self):
+        """With a preflight allowed, any web page the user visits could try
+        keys against the API from their browser."""
+        status, headers, _ = self.request('OPTIONS', '/mcp/call')
+        self.assertEqual(status, 403)
+        self.assertFalse([h for h in headers.keys()
+                          if h.lower().startswith('access-control-')])
+
+    def test_health_answers_without_a_key_and_reveals_no_token(self):
+        """The one deliberate exception: the native host probes it before it
+        has read the token."""
+        status, _, body = self.request('GET', '/health')
+        self.assertEqual(status, 200)
+        self.assertNotIn(server.API_TOKEN.encode(), body)
+
+
+@unittest.skipUnless(server.HAS_WEBSOCKETS, 'websockets is not installed')
+class WebSocketAuthTests(unittest.IsolatedAsyncioTestCase):
+    """Whoever passes the handshake is "the browser": it receives every
+    automation command and can forge the results. The suite only covered the
+    Origin list, never the token frame."""
+
+    async def asyncSetUp(self):
+        self.registered = []
+        for name, fake in (
+                ('register_browser',
+                 lambda browser_id, ws: self.registered.append(browser_id)),
+                ('unregister_browser', lambda browser_id: None)):
+            patcher = unittest.mock.patch.object(
+                server.connection_manager, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ws_server = await server.websockets.serve(
+            server.websocket_handler, '127.0.0.1', 0)
+        port = next(iter(self.ws_server.sockets)).getsockname()[1]
+        self.url = f'ws://127.0.0.1:{port}'
+
+    async def asyncTearDown(self):
+        self.ws_server.close()
+        await self.ws_server.wait_closed()
+
+    async def close_code_after(self, first_frame):
+        async with server.websockets.connect(self.url) as ws:
+            await ws.send(first_frame)
+            try:
+                await asyncio.wait_for(ws.recv(), timeout=5)
+            except server.websockets.exceptions.ConnectionClosed as e:
+                return e.rcvd.code if e.rcvd else None
+        self.fail('the server neither closed the connection nor stayed silent')
+
+    async def test_a_bad_first_frame_is_closed_and_never_registered(self):
+        token = server.API_TOKEN
+        frames = {
+            'wrong token': '{"token": "wrong"}',
+            'prefix of the token': '{"token": "%s"}' % token[:10],
+            'token plus a suffix': '{"token": "%s0"}' % token,
+            'non-ascii token': '{"token": "\\u00ff\\u00ff"}',
+            'no token': '{}',
+            'null token': '{"token": null}',
+            'not json': 'not json',
+            'a list': '["%s"]' % token,
+            'token at the wrong key': '{"key": "%s"}' % token,
+        }
+        for label, frame in frames.items():
+            with self.subTest(frame=label):
+                self.assertEqual(await self.close_code_after(frame), 1008)
+        self.assertEqual(self.registered, [])
+
+    async def test_the_real_token_is_registered(self):
+        """Without this the refusals above could pass against a handler that
+        refuses everyone."""
+        async with server.websockets.connect(self.url) as ws:
+            await ws.send('{"token": "%s"}' % server.API_TOKEN)
+            for _ in range(100):
+                if self.registered:
+                    break
+                await asyncio.sleep(0.02)
+        self.assertEqual(len(self.registered), 1)
 
 
 class DeprecatedEndpointTests(unittest.TestCase):
